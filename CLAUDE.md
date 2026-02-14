@@ -74,8 +74,9 @@ This is the main deliverable. It is a comprehensive design spec (~3100 lines) co
 - **Schedd**: HTCondor scheduler daemon — manages job queues
 - **SUBDAG EXTERNAL**: DAGMan feature where a node in one DAG is itself another DAG
 - **Pilot**: A test job that measures performance before the full production DAG
-- **Merge group**: A set of processing nodes whose outputs feed one merge job, executed as a self-contained sub-DAG at a single site
-- **Landing node**: A trivial `/bin/true` job per merge group that lets HTCondor pick the site via normal negotiation
+- **Work unit**: The atomic unit of progress in WMS2 — a self-contained set of processing jobs whose outputs feed a single merge job. Implemented as a merge group SUBDAG. Used for progress tracking, partial production fractions, and clean stop granularity
+- **Merge group**: The SUBDAG EXTERNAL implementation of a work unit — a set of processing nodes whose outputs feed one merge job, executed as a self-contained sub-DAG at a single site
+- **Landing node**: A trivial `/bin/true` job per work unit that lets HTCondor pick the site via normal negotiation
 - **AAA (Any data, Anytime, Anywhere)**: CMS xrootd federation for remote data access
 - **GLIDEIN_CMSSite**: HTCondor classad identifying which CMS site a worker node belongs to
 - **DBS**: CMS Data Bookkeeping System — catalog of datasets and files

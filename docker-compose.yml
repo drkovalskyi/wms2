@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: wms2
+      POSTGRES_PASSWORD: wms2pass
+      POSTGRES_DB: wms2
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wms2"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  wms2:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      WMS2_DATABASE_URL: postgresql+asyncpg://wms2:wms2pass@db:5432/wms2
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

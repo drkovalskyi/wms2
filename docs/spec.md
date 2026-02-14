@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.3.0 |
+| **Spec Version** | 2.4.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-13 |
+| **Date** | 2026-02-14 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -153,6 +153,8 @@ on the worker node.
 
 The sandbox/wrapper is part of the WMS2 system but its development is decoupled — it can be improved independently without changes to WMS2 core or DAGMan.
 
+**Work unit**: The atomic unit of progress in WMS2. A work unit is a self-contained set of processing jobs whose outputs feed a single merge job, producing one usable merged output. Each work unit is implemented as a merge group — a SUBDAG EXTERNAL containing a landing node, processing nodes, a merge node, and a cleanup node. WMS2 measures progress, calculates partial production fractions, and reports completion in terms of work units. A DAG consists of many work units running concurrently (throttled by `MAXJOBS`).
+
 ### 2.4 Capacity Planning
 
 Expected operating parameters:
@@ -224,6 +226,14 @@ class Request(BaseModel):
     priority: int = 100000
     urgent: bool = False            # Skip pilot if True
 
+    # Partial Production — fair-share scheduling: produce a fraction of work
+    # units at each priority level before yielding to other requests.
+    # Steps are consumed front-to-back. After the last step triggers, the
+    # request runs to completion at that step's priority.
+    # Example: [{"fraction": 0.1, "priority": 80000}, {"fraction": 0.5, "priority": 50000}]
+    #   → first 10% of work units at original priority, next 40% at 80k, rest at 50k
+    production_steps: List[ProductionStep] = []
+
     # Payload Configuration
     payload_config: Dict[str, Any]  # Opaque to WMS2, passed to sandbox
 
@@ -254,6 +264,14 @@ class RequestStatus(str, Enum):
     PARTIAL = "partial"            # DAG finished with some failures, recoverable
     FAILED = "failed"              # Catastrophic failure or retries exhausted
     ABORTED = "aborted"            # Manually cancelled
+
+
+class ProductionStep(BaseModel):
+    """A single step in the partial production schedule."""
+    fraction: float    # Cumulative fraction of work units to complete (0.0, 1.0)
+    priority: int      # Priority for the remainder after this step triggers
+    # Validation: fractions must be strictly increasing across steps;
+    # priorities must be strictly decreasing. Mutually exclusive with urgent=True.
 
 
 class CleanupPolicy(str, Enum):
@@ -411,9 +429,9 @@ class DAG(BaseModel):
     nodes_failed: int = 0
     nodes_held: int = 0
 
-    # Merge group tracking — set of SUBDAG node names already reported
-    # as completed. Used by DAG Monitor to avoid re-reporting.
-    reported_merge_groups: List[str] = []
+    # Work unit tracking
+    total_work_units: int = 0                    # Total work units in this DAG
+    completed_work_units: List[str] = []         # SUBDAG node names reported as completed
 
     # DAG-level state
     status: DAGStatus
@@ -601,6 +619,7 @@ CREATE TABLE requests (
     campaign VARCHAR(100),
     priority INTEGER DEFAULT 100000,
     urgent BOOLEAN DEFAULT FALSE,
+    production_steps JSONB DEFAULT '[]',
     status VARCHAR(50) NOT NULL DEFAULT 'new',
     status_transitions JSONB DEFAULT '[]',
     -- Version linkage (catastrophic failure recovery)
@@ -655,7 +674,8 @@ CREATE TABLE dags (
     nodes_done INTEGER DEFAULT 0,
     nodes_failed INTEGER DEFAULT 0,
     nodes_held INTEGER DEFAULT 0,
-    reported_merge_groups JSONB DEFAULT '[]',
+    total_work_units INTEGER DEFAULT 0,
+    completed_work_units JSONB DEFAULT '[]',
     status VARCHAR(50) NOT NULL DEFAULT 'planning',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     submitted_at TIMESTAMPTZ,
@@ -891,7 +911,7 @@ class RequestLifecycleManager:
         await self.transition(request, RequestStatus.QUEUED)
 
     async def _handle_queued(self, request: Request):
-        """Check admission capacity and start pilot or planning."""
+        """Check admission capacity and start pilot, planning, or rescue DAG."""
         if not await self.admission_controller.has_capacity():
             return  # Wait for capacity
 
@@ -900,6 +920,20 @@ class RequestLifecycleManager:
             return  # Not this request's turn
 
         workflow = await self.db.get_workflow_by_request(request.request_name)
+
+        # Rescue DAG re-admission: pilot metrics already exist, skip pilot
+        dag = await self.db.get_dag(workflow.dag_id) if workflow.dag_id else None
+        if dag and dag.rescue_dag_path and dag.status == DAGStatus.READY:
+            dagman_id, schedd = await self.dag_planner.submit_rescue_dag(dag)
+            await self.db.update_dag(dag.id,
+                dagman_cluster_id=dagman_id, schedd_name=schedd,
+                status=DAGStatus.SUBMITTED, submitted_at=datetime.utcnow(),
+            )
+            await self.db.update_workflow(workflow.id, status=WorkflowStatus.ACTIVE)
+            await self.transition(request, RequestStatus.ACTIVE)
+            return
+
+        # Fresh submission
         if request.urgent:
             await self.dag_planner.plan_and_submit(workflow)
             await self.transition(request, RequestStatus.ACTIVE)
@@ -920,7 +954,7 @@ class RequestLifecycleManager:
             await self.transition(request, RequestStatus.ACTIVE)
 
     async def _handle_active(self, request: Request):
-        """Poll DAG status, register/protect outputs as merge groups complete."""
+        """Poll DAG status, register/protect outputs as work units complete."""
         workflow = await self.db.get_workflow_by_request(request.request_name)
         dag = await self.db.get_dag(workflow.dag_id)
         if not dag:
@@ -931,17 +965,30 @@ class RequestLifecycleManager:
             result = await self.dag_monitor.poll_dag(dag)
 
             if result.status == DAGStatus.RUNNING:
-                for merge_info in result.newly_completed_merges:
+                for work_unit in result.newly_completed_work_units:
                     await self.output_manager.handle_merge_completion(
-                        workflow.id, merge_info
+                        workflow.id, work_unit
                     )
+
+                # Partial production: auto-stop when next step's fraction threshold reached
+                if request.production_steps and dag.status == DAGStatus.RUNNING:
+                    fraction_done = len(dag.completed_work_units) / max(dag.total_work_units, 1)
+                    next_step = request.production_steps[0]
+                    if fraction_done >= next_step.fraction:
+                        await self.initiate_clean_stop(
+                            request.request_name,
+                            reason=f"Partial production step: {fraction_done:.1%} complete, "
+                                   f"deprioritizing remainder to {next_step.priority}"
+                        )
+                        return
+
             elif result.status == DAGStatus.PARTIAL:
                 await self.transition(request, RequestStatus.PARTIAL)
             elif result.status == DAGStatus.FAILED:
                 await self.transition(request, RequestStatus.FAILED)
 
         # Process outputs every cycle — don't wait for DAG to finish.
-        # As each merge group completes, its output needs DBS registration
+        # As each work unit completes, its output needs DBS registration
         # and Rucio source protection immediately to prevent data loss.
         await self.output_manager.process_outputs_for_workflow(workflow.id)
 
@@ -1017,12 +1064,24 @@ class RequestLifecycleManager:
             total_nodes=dag.total_nodes,
             total_edges=dag.total_edges,
             node_counts=dag.node_counts,
+            total_work_units=dag.total_work_units,
+            completed_work_units=dag.completed_work_units,
             status=DAGStatus.READY,
         )
         await self.db.create_dag(new_dag)
         await self.db.update_workflow(workflow.id,
             dag_id=new_dag.id, status=WorkflowStatus.RESUBMITTING
         )
+
+        # Partial production: consume step, demote priority
+        if request.production_steps:
+            step = request.production_steps[0]
+            remaining_steps = request.production_steps[1:]
+            await self.db.update_request(request.request_name,
+                priority=step.priority,
+                production_steps=remaining_steps,
+            )
+
         await self.transition(request, RequestStatus.RESUBMITTING)
 
     # ── Catastrophic Failure Recovery ───────────────────────────
@@ -1406,6 +1465,7 @@ class DAGPlanner:
                 "Cleanup": len(merge_groups),
                 "Landing": len(merge_groups),
             },
+            total_work_units=len(merge_groups),
             status=DAGStatus.READY,
         )
         await self.db.create_dag(dag)
@@ -1426,8 +1486,8 @@ class DAGPlanner:
     def _plan_merge_groups(self, processing_nodes, workflow, output_size_per_event_kb,
                            target_merged_size_kb=4_000_000) -> List[MergeGroup]:
         """
-        Group processing nodes into merge groups based on expected output size.
-        Each merge group becomes a SUBDAG EXTERNAL containing:
+        Group processing nodes into work units based on expected output size.
+        Each work unit becomes a SUBDAG EXTERNAL (merge group) containing:
           landing node → processing nodes → merge node → cleanup node
         Group composition is fixed at planning time (from pilot metrics).
         Site assignment is deferred to runtime (landing node mechanism).
@@ -1458,7 +1518,7 @@ class DAGPlanner:
 
 
 class MergeGroup(BaseModel):
-    """A self-contained group of processing nodes + merge + cleanup."""
+    """A work unit — a self-contained merge group implementing one unit of progress."""
     group_index: int
     processing_nodes: List[DAGNodeSpec]
     estimated_output_kb: int
@@ -1666,6 +1726,18 @@ queue 1
         return await self.condor_adapter.submit_dag(
             dag_file=dag.dag_file_path, submit_dir=dag.submit_dir,
         )
+
+    async def submit_rescue_dag(self, dag: DAG) -> Tuple[str, str]:
+        """
+        Submit a rescue DAG for a previously stopped DAG. Thin wrapper
+        over condor_submit_dag — the rescue DAG file already exists
+        (written by DAGMan on clean stop). DAGMan automatically skips
+        nodes marked as done in the rescue file.
+        """
+        return await self.condor_adapter.submit_dag(
+            dag_file=dag.dag_file_path, submit_dir=dag.submit_dir,
+            rescue_dag=dag.rescue_dag_path,
+        )
 ```
 
 #### 4.5.1 Splitting Algorithms
@@ -1752,7 +1824,7 @@ class DAGPollResult(BaseModel):
     nodes_done: int = 0
     nodes_failed: int = 0
     nodes_held: int = 0
-    newly_completed_merges: List[Dict] = []
+    newly_completed_work_units: List[Dict] = []
 
 
 class DAGMonitor:
@@ -1760,11 +1832,12 @@ class DAGMonitor:
     Polls DAGMan status for a single DAG and returns results.
     Called by the Request Lifecycle Manager — not an independent loop.
 
-    Merge group detection: each merge group is a SUBDAG EXTERNAL node in the
+    Work unit detection: each work unit is a SUBDAG EXTERNAL node in the
     top-level DAG. When a SUBDAG node status changes to STATUS_DONE, the
-    group's merge output is ready. The monitor compares current SUBDAG node
-    completions against a DB-stored set (dag.reported_merge_groups) to find
-    newly completed groups, avoiding duplicate reports across polling cycles.
+    work unit's merge output is ready. The monitor compares current SUBDAG
+    node completions against a DB-stored set (dag.completed_work_units) to
+    find newly completed work units, avoiding duplicate reports across
+    polling cycles.
     """
 
     async def poll_dag(self, dag: DAG) -> DAGPollResult:
@@ -1792,42 +1865,42 @@ class DAGMonitor:
             nodes_running=summary.running, nodes_queued=summary.idle,
         )
 
-        # Detect merge groups that completed since the last poll
-        newly_completed_merges = await self._detect_completed_merges(dag, summary)
+        # Detect work units that completed since the last poll
+        newly_completed_work_units = await self._detect_completed_work_units(dag, summary)
 
         return DAGPollResult(
             dag_id=dag.id, status=DAGStatus.RUNNING,
             nodes_idle=summary.idle, nodes_running=summary.running,
             nodes_done=summary.done, nodes_failed=summary.failed,
             nodes_held=summary.held,
-            newly_completed_merges=newly_completed_merges,
+            newly_completed_work_units=newly_completed_work_units,
         )
 
-    async def _detect_completed_merges(self, dag: DAG,
-                                       summary: NodeSummary) -> List[Dict]:
+    async def _detect_completed_work_units(self, dag: DAG,
+                                           summary: NodeSummary) -> List[Dict]:
         """
-        Compare current per-node statuses against the set of merge groups
-        already reported as completed (stored in dag.reported_merge_groups).
+        Compare current per-node statuses against the set of work units
+        already reported as completed (stored in dag.completed_work_units).
 
-        SUBDAG EXTERNAL nodes are named "MergeGroup_<N>" by the DAG Planner
+        SUBDAG EXTERNAL nodes are named "mg_<N>" by the DAG Planner
         (see Section 4.5). When such a node reaches STATUS_DONE, we read its
-        sub-DAG's output manifest to get the dataset name and site, then
-        record it as reported so it's not re-emitted on the next cycle.
+        output manifest to get the dataset name and site, then record it as
+        completed so it's not re-emitted on the next cycle.
 
         Returns a list of dicts suitable for OutputManager.handle_merge_completion().
         """
-        already_reported = set(dag.reported_merge_groups or [])
+        already_completed = set(dag.completed_work_units or [])
         newly_completed = []
 
         for node_name, status in summary.node_statuses.items():
-            if not node_name.startswith("MergeGroup_"):
+            if not node_name.startswith("mg_"):
                 continue
             if status != "STATUS_DONE":
                 continue
-            if node_name in already_reported:
+            if node_name in already_completed:
                 continue
 
-            # Read the merge group's output manifest written by its cleanup node.
+            # Read the work unit's output manifest written by its cleanup node.
             # The manifest contains the dataset name and site where the merged
             # output was produced (written by POST script of the merge node).
             manifest = await self._read_merge_manifest(dag, node_name)
@@ -1838,12 +1911,12 @@ class DAGMonitor:
                     "site": manifest["site"],
                     "merge_output_lfn": manifest.get("output_lfn"),
                 })
-            already_reported.add(node_name)
+            already_completed.add(node_name)
 
         # Persist so we don't re-report on the next poll cycle
         if newly_completed:
             await self.db.update_dag(dag.id,
-                reported_merge_groups=list(already_reported),
+                completed_work_units=list(already_completed),
             )
 
         return newly_completed
@@ -2392,6 +2465,54 @@ Admission Controller admits, DAG Planner submits rescue DAG
 
 The `STOPPED` DAG status is distinct from `FAILED` — it indicates a controlled shutdown that is eligible for rescue DAG recovery without going through the Error Handler's failure ratio evaluation.
 
+#### 6.2.1 Partial Production Flow
+
+Partial production is a fair-share scheduling mechanism: when many requests compete for resources, every request gets at least a bare-minimum fraction of its results quickly, then the remainder is deprioritized so other requests get their share. This prevents a single large request from monopolizing the system while others wait.
+
+The mechanism reuses the clean stop + rescue DAG flow (Section 6.2) — no new states, no new DAG types. The `production_steps` field on the request defines a list of fraction thresholds with corresponding demoted priorities. As the DAG runs, the Lifecycle Manager checks the fraction of completed work units against the next step's threshold. When the threshold is reached, a clean stop is triggered automatically.
+
+**Multi-step example**: A request with priority 100000 and `production_steps = [{"fraction": 0.1, "priority": 80000}, {"fraction": 0.5, "priority": 50000}]` runs as follows:
+
+1. First 10% of work units execute at priority 100000 (original)
+2. At 10% complete → auto clean stop → priority demoted to 80000 → step consumed
+3. Next 40% of work units (10%→50%) execute at priority 80000
+4. At 50% complete → auto clean stop → priority demoted to 50000 → step consumed
+5. Remaining 50% of work units execute at priority 50000 → run to completion
+
+```
+Request submitted with production_steps = [{0.1, 80000}, {0.5, 50000}]
+  │
+  ▼
+ACTIVE at priority 100000
+  │  work units complete...
+  │  fraction_done >= 0.1
+  ▼
+Auto clean stop (same as operator stop)
+  ├── STOPPING → RESUBMITTING → QUEUED
+  ├── _prepare_recovery(): consume step, set priority=80000
+  │
+  ▼
+ACTIVE at priority 80000 (rescue DAG, skips pilot)
+  │  work units complete...
+  │  fraction_done >= 0.5
+  ▼
+Auto clean stop
+  ├── STOPPING → RESUBMITTING → QUEUED
+  ├── _prepare_recovery(): consume step, set priority=50000
+  │
+  ▼
+ACTIVE at priority 50000 (rescue DAG, skips pilot)
+  │  production_steps is now empty → run to completion
+  ▼
+COMPLETED
+```
+
+**Pilot skip on rescue DAG**: When a request re-enters QUEUED after a clean stop, the rescue DAG already has pilot metrics from the original submission. The `_handle_queued()` handler detects the existing rescue DAG and submits it directly, bypassing the pilot phase.
+
+**In-flight waste**: When the clean stop triggers, work units already in flight continue briefly until `condor_rm` takes effect. The waste is bounded by `MAXJOBS MergeGroup` (typically ~10 work units) — the actual fraction may slightly overshoot the requested threshold.
+
+**Output continuity**: Work units that completed before the stop already have their outputs registered in DBS and protected in Rucio (per DD-4). The rescue DAG skips these completed work units. No outputs are lost or duplicated across stops.
+
 ### 6.3 Catastrophic Failure Recovery
 
 When a schedd is permanently lost (hardware failure, unrecoverable corruption), the DAG and all its in-flight state are gone. The recovery path uses **dataset versioning**: increment `processing_version` and resubmit from scratch.
@@ -2609,6 +2730,41 @@ Response:
     "previous_status": "active",
     "stop_reason": "Schedd maintenance window",
     "message": "Clean stop initiated. DAG will be stopped and a rescue DAG prepared for re-admission."
+}
+
+# Submit with partial production (single step: 10% at full priority, rest at 80k)
+POST /api/v1/requests
+{
+    "request_name": "user_Run2024B_v1_250210_654321",
+    "source": "reqmgr2",
+    "production_steps": [
+        {"fraction": 0.1, "priority": 80000}
+    ]
+}
+
+# Submit with multi-step partial production
+POST /api/v1/requests
+{
+    "request_name": "user_Run2024C_v1_250211_111111",
+    "source": "reqmgr2",
+    "production_steps": [
+        {"fraction": 0.1, "priority": 80000},
+        {"fraction": 0.5, "priority": 50000}
+    ]
+}
+
+Response:
+{
+    "request_name": "user_Run2024C_v1_250211_111111",
+    "status": "submitted",
+    "production_steps": [
+        {"fraction": 0.1, "priority": 80000},
+        {"fraction": 0.5, "priority": 50000}
+    ],
+    "workflow": {
+        "id": "770e8400-e29b-41d4-a716-446655440002",
+        "status": "new"
+    }
 }
 
 # Get version history
@@ -2853,6 +3009,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 | Silent request stalling | High | Medium | Lifecycle Manager timeout detection alerts when any request exceeds its expected duration in a given status; no request can be "forgotten" |
 | Schedd permanent loss | High | Low | Dataset versioning: increment processing_version, resubmit from scratch, invalidate or preserve partial outputs based on cleanup policy |
 | DAG stop leaves orphaned state | Medium | Low | Clean stop flow ensures DAGMan writes rescue DAG before exit; new DAG record created with recovery linkage; request re-enters admission queue |
+| Partial production fraction overshoot | Low | Medium | Actual fraction may slightly exceed requested threshold because in-flight work units complete after clean stop triggers; bounded by `MAXJOBS MergeGroup` (~10 work units) |
 
 ---
 
@@ -2871,6 +3028,8 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 11. **Concurrent Version Limit**: Should there be a maximum number of version increments for a single request (e.g., max 3 retries) to prevent infinite retry loops from catastrophic infrastructure issues?
 12. **Merge Group Stagger Depth**: How many merge groups should run concurrently (`MAXJOBS MergeGroup`)? Too few underutilizes the pool; too many causes landing nodes to cluster on the same site before processing backpressure takes effect. Needs tuning with real pool behavior.
 13. **Landing Node Site Discovery**: Is `MATCH_GLIDEIN_CMSSite` reliably set across all CMS glidein configurations? Are there worker node environments where this classad is missing or named differently?
+14. **Work Unit Granularity**: With few work units (e.g., a workflow with only 5 merge groups), the actual fraction may differ significantly from the requested fraction. A `production_steps` entry of `{"fraction": 0.1}` cannot be honored — the closest achievable step is 20% (1 out of 5). Should WMS2 warn at submission time or silently round?
+15. **Partial Production on ACTIVE Requests**: Can `production_steps` be set via `PATCH /api/v1/requests/{name}` on an already-ACTIVE request? This could trigger an immediate clean stop on the next Lifecycle Manager cycle if the fraction threshold is already met. Should this be allowed, or should `production_steps` be immutable after submission?
 
 ---
 
@@ -2886,11 +3045,11 @@ This section captures significant design decisions and the reasoning behind them
 
 **Rejected alternative**: Event-driven architecture where components emit events and subscribe to each other. Too complex for the number of components; harder to reason about ordering; WMS2's scale (hundreds of workflows, not millions) doesn't justify it.
 
-### DD-2: Merge groups as SUBDAG EXTERNAL with landing nodes
+### DD-2: Work units implemented as merge group SUBDAGs with landing nodes
 
-**Decision**: Each merge group (processing nodes + merge + cleanup) is a self-contained sub-DAG declared via `SUBDAG EXTERNAL`. A trivial `/bin/true` landing node per group lets HTCondor pick the site; POST script reads `MATCH_GLIDEIN_CMSSite` and writes it to a file; PRE scripts on remaining nodes read that file and set `+DESIRED_Sites`.
+**Decision**: Each work unit (processing nodes + merge + cleanup) is a self-contained sub-DAG declared via `SUBDAG EXTERNAL`. A trivial `/bin/true` landing node per work unit lets HTCondor pick the site; POST script reads `MATCH_GLIDEIN_CMSSite` and writes it to a file; PRE scripts on remaining nodes read that file and set `+DESIRED_Sites`. The work unit is the atomic unit of progress — WMS2 measures completion, calculates partial production fractions, and reports progress in terms of work units.
 
-**Why**: Processing jobs feeding a merge job must run on the same site to avoid cross-site transfers before merging. But WMS2 should not do site selection — that's HTCondor's job. The landing node lets HTCondor's negotiator pick the site through normal matchmaking, and then pins the group. SUBDAG EXTERNAL keeps the sub-DAG internal to DAGMan; WMS2 sees only one top-level DAG.
+**Why**: Processing jobs feeding a merge job must run on the same site to avoid cross-site transfers before merging. But WMS2 should not do site selection — that's HTCondor's job. The landing node lets HTCondor's negotiator pick the site through normal matchmaking, and then pins the work unit. SUBDAG EXTERNAL keeps the sub-DAG internal to DAGMan; WMS2 sees only one top-level DAG.
 
 **Rejected alternatives**:
 - *WMS2 assigns sites at planning time*: Prevents HTCondor from load balancing. WMS2 would need to replicate the negotiator's logic.
@@ -2905,13 +3064,13 @@ This section captures significant design decisions and the reasoning behind them
 
 **Rejected alternative**: No throttling, rely on HTCondor. Risk of poor site distribution is too high for merge-heavy workflows.
 
-### DD-4: Output processing starts immediately as merge groups complete
+### DD-4: Output processing starts immediately as work units complete
 
-**Decision**: The Lifecycle Manager calls `process_outputs_for_workflow()` every cycle for ACTIVE requests, not just after the DAG finishes. When a merge group completes, its output enters the pipeline immediately for DBS registration and Rucio source protection.
+**Decision**: The Lifecycle Manager calls `process_outputs_for_workflow()` every cycle for ACTIVE requests, not just after the DAG finishes. When a work unit completes, its output enters the pipeline immediately for DBS registration and Rucio source protection.
 
-**Why**: Merge group outputs sit on the source site's scratch space. If we wait until the entire DAG completes (which could be hours or days later), the source site may clean up that scratch space. DBS registration and Rucio source protection are urgent — they must happen as soon as the merge output exists.
+**Why**: Work unit outputs sit on the source site's scratch space. If we wait until the entire DAG completes (which could be hours or days later), the source site may clean up that scratch space. DBS registration and Rucio source protection are urgent — they must happen as soon as the merge output exists. This also ensures that partial production stops do not lose already-completed outputs.
 
-**Rejected alternative**: Process outputs only after DAG completion. Simpler but risks data loss for early-completing merge groups.
+**Rejected alternative**: Process outputs only after DAG completion. Simpler but risks data loss for early-completing work units.
 
 ### DD-5: Priority-tiered output processing with transfer polling cooldown
 
@@ -2952,6 +3111,19 @@ This section captures significant design decisions and the reasoning behind them
 **Decision**: `_handle_stuck()` takes different actions based on which status the request is stuck in. Fast internal operations (SUBMITTED, PLANNING) are failed immediately. Slow external operations (ACTIVE with unreachable schedd) escalate to the operator rather than auto-triggering catastrophic recovery.
 
 **Why**: A request stuck in PLANNING for an hour is a bug — fail fast and alert. A request stuck in ACTIVE for 30 days may just be a large workflow — don't abort it. A request stuck in ACTIVE with an unreachable schedd may be catastrophic — but auto-recovery could destroy data if the schedd is temporarily down (network blip). The operator must confirm before triggering version increment and output invalidation.
+
+### DD-11: Partial production as fair-share scheduling via clean stop
+
+**Decision**: Partial production uses the existing clean stop + rescue DAG mechanism to implement fair-share scheduling. A `production_steps` list on the request defines fraction thresholds; when the Lifecycle Manager detects that enough work units have completed, it auto-triggers a clean stop, consumes the step, demotes the request's priority, and re-enters the admission queue. The rescue DAG skips the pilot phase since metrics already exist.
+
+**Why**: Computing resources cannot sit idle, and users should request their full needs to maximize utilization. But when many requests compete, one large request can monopolize the system while others wait. Partial production ensures every request gets at least a bare-minimum fraction of its results quickly (e.g., 10% for validation), then the remainder is deprioritized so other requests get their share. This is a fairness mechanism, not a scheduling optimization.
+
+The design reuses the clean stop flow entirely — no new request states, no new DAG types, no new components. The `production_steps` list is extensible: adding more steps or changing thresholds requires no schema migration (JSONB). Work units are the natural fraction unit because they are already tracked by the DAG Monitor as SUBDAG EXTERNAL completions.
+
+**Rejected alternatives**:
+- *DAG partitioning at planning time* (split workflow into multiple smaller DAGs per priority tier): Complex, inflexible — the fraction boundary is hard-coded at planning time and can't adapt. Also requires managing multiple DAGs per workflow, violating the one-DAG-per-workflow invariant.
+- *New request status (e.g., DEPRIORITIZED)*: Unnecessary — the existing STOPPING → RESUBMITTING → QUEUED → ACTIVE flow handles everything. Adding states increases the state machine complexity for no benefit.
+- *Separate partial production queue*: Over-engineering. The admission queue already handles priority ordering; demoting the request's priority achieves the same effect.
 
 ---
 
