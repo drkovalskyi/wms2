@@ -1,4 +1,4 @@
-# WMS2 Phase 1 — Implementation Log
+# WMS2 — Implementation Log
 
 **Date**: 2026-02-14
 **Spec Version**: 2.4.0
@@ -161,3 +161,169 @@ Mock implementations in `adapters/mock.py` with call history tracking for test a
 - Error Handler — failure classification, rescue DAG decisions
 - Site Manager — CRIC sync
 - Real CondorAdapter (htcondor Python bindings)
+
+---
+
+# Phase 2 — Pilot + DAG Planning Pipeline
+
+**Date**: 2026-02-14
+**Spec Version**: 2.4.0
+**Phase**: 2 — Request → Pilot → DAG File Generation
+
+---
+
+## What Was Built
+
+### Config Expansion (`config.py`)
+New settings for external services and DAG submission:
+- `reqmgr2_url`, `dbs_url`, `rucio_url`, `rucio_account` — External service endpoints
+- `agent_name` — WMS2 instance identity in ReqMgr2
+- `submit_base_dir` — Root directory for DAG file output
+- `target_merged_size_kb` — Target merged output size (default 4 GB)
+- `cert_file`, `key_file` — X.509 certificate paths (None = use mock adapters)
+
+### Adapter Signature Updates (`adapters/base.py`, `adapters/mock.py`)
+- `ReqMgrAdapter.get_assigned_requests(agent_name)` — Fetch requests assigned to agent
+- `DBSAdapter.get_files()` — Added `run_whitelist` and `lumi_mask` optional params
+- `RucioAdapter.get_replicas(lfns: list[str]) -> dict[str, list[str]]` — Changed from dataset-level to per-LFN replica lookup
+- All mock adapters updated to match new signatures
+
+### Real Adapters (3 new files)
+
+**ReqMgr2Client** (`adapters/reqmgr2.py`):
+- httpx async client with X.509 cert auth
+- `get_request(name)` — GET single request, unwraps ReqMgr2 response envelope
+- `get_assigned_requests(agent_name)` — GET requests with status=assigned&team=agent
+- 3 retries with exponential backoff on HTTP/transport errors
+
+**DBSClient** (`adapters/dbs.py`):
+- httpx async client with X.509 cert auth
+- `get_files(dataset, limit, run_whitelist, lumi_mask)` — GET /files?dataset=&detail=1
+- `inject_dataset()`, `invalidate_dataset()` — POST/PUT endpoints
+- 3 retries with exponential backoff
+
+**RucioClient** (`adapters/rucio.py`):
+- httpx async client with X-Rucio-Account header
+- `get_replicas(lfns)` — POST /replicas/list, returns {LFN → [site_name]}
+- RSE name normalization: strips `_Disk`/`_Tape`/`_Test`/`_Temp` suffixes, excludes tape-only
+- `create_rule()`, `get_rule_status()`, `delete_rule()` — Rucio rule management
+- 3 retries with exponential backoff
+
+### Workflow Manager (`core/workflow_manager.py`)
+- `import_request(request_name)` — Fetches from ReqMgr2, validates required fields (InputDataset, SplittingAlgo, SandboxUrl), creates workflow row
+- `get_workflow_status(workflow_id)` — Builds progress summary (workflow + DAG + outputs)
+- Called by lifecycle manager `_handle_submitted`
+
+### Splitters (`core/splitters.py`)
+Data classes:
+- `InputFile` — LFN, size, event count, replica locations
+- `DAGNodeSpec` — Node index, input files, event range, primary location
+
+Splitter implementations (pure stateless computation):
+- **FileBasedSplitter** — Groups files by primary location for data locality, chunks into batches of `files_per_job`
+- **EventBasedSplitter** — Splits across files by event count, handles files spanning multiple jobs
+- `get_splitter(algo, params)` — Factory function, maps FileBased/LumiBased → FileBasedSplitter, EventBased/EventAwareLumiBased → EventBasedSplitter
+
+### DAG Planner (`core/dag_planner.py`)
+
+**Data classes**:
+- `PilotMetrics` — events_per_second, memory_peak_mb, output_size_per_event_kb, time_per_event_sec, cpu_efficiency; parses from JSON
+- `PlanningMergeGroup` — group_index, processing_nodes, estimated_output_kb
+
+**Pilot phase**:
+- `submit_pilot(workflow)` — Fetches 5 sample files, writes `pilot.sub` to submit_dir/pilot/
+- `_parse_pilot_report(path)` — Reads JSON → PilotMetrics
+- `handle_pilot_completion(workflow, path)` — Parses metrics, calls plan_production_dag()
+
+**Production DAG** (`plan_production_dag`):
+1. Resource params from pilot metrics or defaults
+2. Fetch all input files from DBS
+3. Get replica locations from Rucio
+4. Convert to InputFile objects with locations
+5. Split via appropriate splitter
+6. Plan merge groups by output size accumulation
+7. Generate DAG files (Appendix C format)
+8. Create DAG row with status=READY
+
+**Merge group planning** (`_plan_merge_groups`):
+- Accumulates processing nodes into groups by estimated output size
+- Starts new group when adding a node would exceed `target_merged_size_kb`
+
+**DAG file generation** (Appendix C format):
+- Outer `workflow.dag`: CONFIG + SUBDAG EXTERNAL per group + CATEGORY + MAXJOBS MergeGroup 10
+- Per-group `mg_NNNNNN/group.dag`:
+  - JOB: landing, proc_NNNNNN (×N), merge, cleanup
+  - SCRIPT POST landing → elect_site.sh
+  - SCRIPT PRE proc/merge/cleanup → pin_site.sh
+  - SCRIPT POST proc → post_script.sh
+  - RETRY: proc×3, merge×2, cleanup×1 (UNLESS-EXIT 2)
+  - PARENT/CHILD: landing→all_proc→merge→cleanup
+  - CATEGORY: Processing, Merge, Cleanup with MAXJOBS throttles
+- Submit files: landing.sub, proc_NNNNNN.sub, merge.sub, cleanup.sub (vanilla universe)
+- Scripts: elect_site.sh (reads MATCH_GLIDEIN_CMSSite), pin_site.sh (sed DESIRED_Sites), post_script.sh
+
+### Component Wiring
+
+**`main.py`** — `_build_adapters(settings)`:
+- If `cert_file` and `key_file` set → real ReqMgr2Client, DBSClient, RucioClient
+- Otherwise → mock adapters
+- Instantiates WorkflowManager + DAGPlanner, passes to lifecycle manager
+
+**`lifecycle_manager.py`** — Updated handlers:
+- `_handle_submitted` → `workflow_manager.import_request()` → QUEUED
+- `_handle_queued` → `dag_planner.plan_production_dag()` (urgent) or `dag_planner.submit_pilot()` (normal)
+- `_handle_pilot_running` → checks for pilot_metrics.json, calls `handle_pilot_completion()` or `plan_production_dag()` with defaults → ACTIVE
+
+### API Endpoints (replaced 501 stubs)
+
+| Route | Method | Description |
+|---|---|---|
+| /workflows | GET | List workflows (filter by status, paginate) |
+| /workflows/{id} | GET | Full workflow detail |
+| /dags | GET | List DAGs (filter by status, workflow_id, paginate) |
+| /dags/{id} | GET | Full DAG detail |
+
+### Repository Additions (`db/repository.py`)
+- `list_workflows(status, limit, offset)` — ORDER BY created_at DESC
+- `list_dags(status, workflow_id, limit, offset)` — ORDER BY created_at DESC
+
+### Tests
+
+**35 new tests (all passing)**:
+
+| File | Tests | What |
+|---|---|---|
+| `test_splitters.py` | 11 | File grouping, partial batches, single file, empty, files_per_job=1, site grouping, event splitting |
+| `test_merge_groups.py` | 5 | Single group, multiple groups, exact boundaries, empty, sequential indices |
+| `test_dag_generator.py` | 8 | Outer DAG, group DAG, submit files, site scripts, dagman.config, Appendix C structure verification |
+| `test_workflow_manager.py` | 5 | Workflow creation, field validation, splitting params, missing workflow, status summary |
+| `test_pilot_metrics.py` | 4 | Complete JSON, defaults, partial, file parsing |
+| `test_dag_planner.py` (integration) | 3 | End-to-end: plan → files on disk, DAG structure, pilot submit |
+
+**Total: 70 tests passing** (67 unit + 3 integration)
+
+---
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/unit/ -v` — 67 tests pass
+3. `pytest tests/integration/test_dag_planner.py -v` — 3 tests pass
+4. `pytest tests/unit/ tests/integration/test_dag_planner.py -v` — 70 tests pass
+
+## Design Decisions
+
+- **Real adapters use httpx with X.509 certs**: Same async HTTP client as test dependencies, consistent retry logic across all external services
+- **Mock-by-default**: When no cert configured, all adapters are mocks — enables local development and testing without CMS infrastructure
+- **Splitters are pure functions**: No DB or IO access; take InputFiles, return DAGNodeSpecs. Easy to test and reason about
+- **Merge group planning by output size**: Accumulates nodes until estimated output exceeds target_merged_size_kb, then starts new group. Simple greedy algorithm
+- **DAG file generation follows Appendix C exactly**: Outer DAG with SUBDAG EXTERNAL per merge group, inner DAGs with landing→proc→merge→cleanup chain, site election via scripts
+- **Per-LFN replica lookup**: Changed Rucio adapter from dataset-level to per-LFN to enable file-level data locality in splitters
+
+## What's Next (Phase 3)
+
+- Real CondorAdapter — condor_submit_dag, condor_q, condor_rm via htcondor Python bindings
+- DAG Monitor — Poll DAGMan status, parse .dagman.out, update node counts
+- DAG Submission — Move DAGs from READY → SUBMITTED → RUNNING
+- Output Manager — Detect completed merge groups, DBS registration, Rucio transfers
+- Error Handler — Failure classification, rescue DAG decisions

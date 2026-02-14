@@ -23,6 +23,23 @@ class Settings(BaseSettings):
     timeout_stopping: int = 3600
     timeout_resubmitting: int = 600
 
+    # External services
+    reqmgr2_url: str = "https://cmsweb.cern.ch/reqmgr2"
+    dbs_url: str = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader"
+    rucio_url: str = "https://cms-rucio.cern.ch"
+    rucio_account: str = "�wms2"
+
+    # Agent identity
+    agent_name: str = "wms2-agent"
+
+    # DAG submission
+    submit_base_dir: str = "/data/wms2/submit"
+    target_merged_size_kb: int = 4 * 1024 * 1024  # 4 GB in KB
+
+    # X.509 certificates
+    cert_file: str | None = None
+    key_file: str | None = None
+
     # API
     api_prefix: str = "/api/v1"
 

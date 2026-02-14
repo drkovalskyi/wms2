@@ -87,6 +87,19 @@ class Repository:
         )
         return result.scalar_one_or_none()
 
+    async def list_workflows(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[WorkflowRow]:
+        stmt = select(WorkflowRow)
+        if status:
+            stmt = stmt.where(WorkflowRow.status == status)
+        stmt = stmt.order_by(WorkflowRow.created_at.desc()).limit(limit).offset(offset)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_workflow_by_request(self, request_name: str) -> WorkflowRow | None:
         result = await self.session.execute(
             select(WorkflowRow).where(WorkflowRow.request_name == request_name)
@@ -122,6 +135,22 @@ class Repository:
         self.session.add(row)
         await self.session.flush()
         return row
+
+    async def list_dags(
+        self,
+        status: str | None = None,
+        workflow_id: UUID | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[DAGRow]:
+        stmt = select(DAGRow)
+        if status:
+            stmt = stmt.where(DAGRow.status == status)
+        if workflow_id:
+            stmt = stmt.where(DAGRow.workflow_id == workflow_id)
+        stmt = stmt.order_by(DAGRow.created_at.desc()).limit(limit).offset(offset)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
 
     async def get_dag(self, dag_id: UUID) -> DAGRow | None:
         result = await self.session.execute(

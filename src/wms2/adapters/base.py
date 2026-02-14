@@ -33,10 +33,20 @@ class ReqMgrAdapter(ABC):
     async def get_request(self, request_name: str) -> dict[str, Any]:
         """Fetch a request from ReqMgr2."""
 
+    @abstractmethod
+    async def get_assigned_requests(self, agent_name: str) -> list[dict[str, Any]]:
+        """Fetch requests assigned to the given agent."""
+
 
 class DBSAdapter(ABC):
     @abstractmethod
-    async def get_files(self, dataset: str, limit: int = 0) -> list[dict[str, Any]]:
+    async def get_files(
+        self,
+        dataset: str,
+        limit: int = 0,
+        run_whitelist: list[int] | None = None,
+        lumi_mask: dict[str, list[list[int]]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Get files for a dataset from DBS."""
 
     @abstractmethod
@@ -50,8 +60,8 @@ class DBSAdapter(ABC):
 
 class RucioAdapter(ABC):
     @abstractmethod
-    async def get_replicas(self, dataset: str) -> list[dict[str, Any]]:
-        """Get replica locations for a dataset."""
+    async def get_replicas(self, lfns: list[str]) -> dict[str, list[str]]:
+        """Get replica locations per LFN. Returns {lfn: [site_name, ...]}."""
 
     @abstractmethod
     async def create_rule(self, dataset: str, destination: str, **kwargs: Any) -> str:

@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from wms2.adapters.mock import MockCondorAdapter
+from wms2.adapters.mock import (
+    MockCondorAdapter,
+    MockDBSAdapter,
+    MockReqMgrAdapter,
+    MockRucioAdapter,
+)
 from wms2.config import Settings
 from wms2.db.repository import Repository
 
@@ -18,14 +23,34 @@ def mock_repository():
     repo.create_request = AsyncMock()
     repo.update_request = AsyncMock()
     repo.get_workflow_by_request = AsyncMock(return_value=None)
+    repo.get_workflow = AsyncMock(return_value=None)
     repo.get_dag = AsyncMock(return_value=None)
     repo.count_active_dags = AsyncMock(return_value=0)
     repo.get_queued_requests = AsyncMock(return_value=[])
     repo.create_dag = AsyncMock()
     repo.update_dag = AsyncMock()
+    repo.create_workflow = AsyncMock()
     repo.update_workflow = AsyncMock()
+    repo.list_workflows = AsyncMock(return_value=[])
+    repo.list_dags = AsyncMock(return_value=[])
+    repo.get_output_datasets = AsyncMock(return_value=[])
     repo.count_requests_by_status = AsyncMock(return_value={})
     return repo
+
+
+@pytest.fixture
+def mock_reqmgr():
+    return MockReqMgrAdapter()
+
+
+@pytest.fixture
+def mock_dbs():
+    return MockDBSAdapter()
+
+
+@pytest.fixture
+def mock_rucio():
+    return MockRucioAdapter()
 
 
 @pytest.fixture

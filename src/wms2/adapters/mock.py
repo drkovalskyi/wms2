@@ -43,14 +43,38 @@ class MockReqMgrAdapter(ReqMgrAdapter):
             "SplittingAlgo": "FileBased",
             "SplittingParams": {"files_per_job": 10},
             "SandboxUrl": "https://example.com/sandbox.tar.gz",
+            "Requestor": "testuser",
+            "Campaign": "TestCampaign",
+            "Priority": 100000,
         }
+
+    async def get_assigned_requests(self, agent_name: str) -> list[dict[str, Any]]:
+        self.calls.append(("get_assigned_requests", (agent_name,), {}))
+        return [
+            {
+                "RequestName": "test-request-001",
+                "InputDataset": "/TestPrimary/TestProcessed/RECO",
+                "SplittingAlgo": "FileBased",
+                "SplittingParams": {"files_per_job": 10},
+                "SandboxUrl": "https://example.com/sandbox.tar.gz",
+                "Requestor": "testuser",
+                "Campaign": "TestCampaign",
+                "Priority": 100000,
+            }
+        ]
 
 
 class MockDBSAdapter(DBSAdapter):
     def __init__(self):
         self.calls: list[tuple[str, tuple, dict]] = []
 
-    async def get_files(self, dataset: str, limit: int = 0) -> list[dict[str, Any]]:
+    async def get_files(
+        self,
+        dataset: str,
+        limit: int = 0,
+        run_whitelist: list[int] | None = None,
+        lumi_mask: dict[str, list[list[int]]] | None = None,
+    ) -> list[dict[str, Any]]:
         self.calls.append(("get_files", (dataset,), {"limit": limit}))
         return [
             {
@@ -72,9 +96,9 @@ class MockRucioAdapter(RucioAdapter):
     def __init__(self):
         self.calls: list[tuple[str, tuple, dict]] = []
 
-    async def get_replicas(self, dataset: str) -> list[dict[str, Any]]:
-        self.calls.append(("get_replicas", (dataset,), {}))
-        return [{"rse": "T1_US_FNAL_Disk", "state": "AVAILABLE"}]
+    async def get_replicas(self, lfns: list[str]) -> dict[str, list[str]]:
+        self.calls.append(("get_replicas", (lfns,), {}))
+        return {lfn: ["T1_US_FNAL", "T2_US_MIT"] for lfn in lfns}
 
     async def create_rule(self, dataset: str, destination: str, **kwargs: Any) -> str:
         self.calls.append(("create_rule", (dataset, destination), kwargs))

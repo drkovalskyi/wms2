@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 
 from wms2.adapters.base import CondorAdapter
@@ -130,8 +131,11 @@ class RequestLifecycleManager:
                 return
 
         if request.urgent:
+            # Skip pilot, go straight to production DAG
+            await self.dag_planner.plan_production_dag(workflow)
             await self.transition(request, RequestStatus.ACTIVE)
         else:
+            await self.dag_planner.submit_pilot(workflow)
             await self.transition(request, RequestStatus.PILOT_RUNNING)
 
     async def _handle_pilot_running(self, request):
@@ -148,6 +152,14 @@ class RequestLifecycleManager:
             workflow.pilot_cluster_id, workflow.pilot_schedd
         )
         if completed:
+            report_path = os.path.join(
+                workflow.pilot_output_path or "", "pilot_metrics.json"
+            )
+            if os.path.exists(report_path):
+                await self.dag_planner.handle_pilot_completion(workflow, report_path)
+            else:
+                # No pilot metrics — plan with defaults
+                await self.dag_planner.plan_production_dag(workflow)
             await self.transition(request, RequestStatus.ACTIVE)
 
     async def _handle_active(self, request):
