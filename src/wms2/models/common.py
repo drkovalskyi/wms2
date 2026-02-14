@@ -1,7 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class StatusTransition(BaseModel):
-    from_status: str
-    to_status: str
+    model_config = {"populate_by_name": True}
+
+    from_status: str = Field(alias="from")
+    to_status: str = Field(alias="to")
     timestamp: str

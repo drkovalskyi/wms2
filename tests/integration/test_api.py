@@ -6,18 +6,7 @@ from wms2.db.base import Base
 from wms2.db.engine import create_engine, create_session_factory
 from wms2.main import create_app
 
-TEST_DB_URL = "postgresql+asyncpg://wms2test:wms2test@localhost:5433/wms2test"
-
-pytestmark = pytest.mark.skipif(
-    True,
-    reason="Integration tests require PostgreSQL on port 5433",
-)
-
-try:
-    import asyncpg  # noqa: F401
-    pytestmark = []
-except ImportError:
-    pass
+TEST_DB_URL = "postgresql+asyncpg://wms2test:wms2test@localhost:5432/wms2test"
 
 
 @pytest.fixture

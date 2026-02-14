@@ -198,10 +198,13 @@ class Repository:
         stmt = pg_insert(SiteRow).values(**kwargs)
         update_cols = {k: v for k, v in kwargs.items() if k != "name"}
         stmt = stmt.on_conflict_do_update(index_elements=["name"], set_=update_cols)
-        stmt = stmt.returning(SiteRow)
-        result = await self.session.execute(stmt)
+        await self.session.execute(stmt)
         await self.session.flush()
-        return result.scalar_one()
+        # Expire any cached version so we get the updated values
+        existing = await self.session.get(SiteRow, kwargs["name"])
+        if existing:
+            await self.session.refresh(existing)
+        return existing
 
     async def get_site(self, name: str) -> SiteRow | None:
         result = await self.session.execute(

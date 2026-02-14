@@ -4,21 +4,6 @@ from datetime import datetime, timezone
 import pytest
 
 
-pytestmark = pytest.mark.skipif(
-    True,  # Will be overridden by the conftest when DB is available
-    reason="Integration tests require PostgreSQL on port 5433",
-)
-
-# To run these tests: docker compose -f docker-compose.test.yml up -d
-# Then: pytest tests/integration/ -v
-
-try:
-    import asyncpg  # noqa: F401
-    pytestmark = []  # DB driver available, try to run
-except ImportError:
-    pass
-
-
 async def test_create_and_get_request(repo):
     now = datetime.now(timezone.utc)
     row = await repo.create_request(

@@ -17,6 +17,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # pgcrypto needed for gen_random_uuid() on PostgreSQL < 14
+    op.execute('CREATE EXTENSION IF NOT EXISTS "pgcrypto"')
+
     # requests
     op.create_table(
         "requests",
