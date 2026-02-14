@@ -13,6 +13,7 @@ from wms2.adapters.mock import (
 )
 from wms2.api.router import api_router
 from wms2.config import Settings
+from wms2.core.dag_monitor import DAGMonitor
 from wms2.core.dag_planner import DAGPlanner
 from wms2.core.lifecycle_manager import RequestLifecycleManager
 from wms2.core.workflow_manager import WorkflowManager
@@ -22,14 +23,24 @@ from wms2.db.repository import Repository
 logger = logging.getLogger(__name__)
 
 
+def _build_condor(settings: Settings):
+    """Build HTCondor adapter: real if condor_host is set, mock otherwise."""
+    if settings.condor_host:
+        from wms2.adapters.condor import HTCondorAdapter
+
+        return HTCondorAdapter(settings.condor_host, settings.schedd_name)
+    return MockCondorAdapter()
+
+
 def _build_adapters(settings: Settings):
     """Build adapters: real if cert is configured, mock otherwise."""
+    condor = _build_condor(settings)
+
     if settings.cert_file and settings.key_file:
         from wms2.adapters.dbs import DBSClient
         from wms2.adapters.reqmgr2 import ReqMgr2Client
         from wms2.adapters.rucio import RucioClient
 
-        condor = MockCondorAdapter()  # Real condor adapter is Phase 3
         reqmgr = ReqMgr2Client(settings.reqmgr2_url, settings.cert_file, settings.key_file)
         dbs = DBSClient(settings.dbs_url, settings.cert_file, settings.key_file)
         rucio = RucioClient(
@@ -37,7 +48,6 @@ def _build_adapters(settings: Settings):
             settings.cert_file, settings.key_file,
         )
     else:
-        condor = MockCondorAdapter()
         reqmgr = MockReqMgrAdapter()
         dbs = MockDBSAdapter()
         rucio = MockRucioAdapter()
@@ -65,10 +75,12 @@ async def lifespan(app: FastAPI):
             repo = Repository(session)
             wm = WorkflowManager(repo, reqmgr)
             dp = DAGPlanner(repo, dbs, rucio, condor, settings)
+            dm = DAGMonitor(repo, condor)
             lm = RequestLifecycleManager(
                 repo, condor, settings,
                 workflow_manager=wm,
                 dag_planner=dp,
+                dag_monitor=dm,
             )
             app.state.lifecycle_manager = lm
             await lm.main_loop()

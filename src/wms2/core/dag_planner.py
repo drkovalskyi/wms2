@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -90,12 +91,20 @@ class DAGPlanner:
         pilot_path = os.path.join(submit_dir, "pilot.sub")
         _write_file(pilot_path, pilot_sub)
 
+        # Submit pilot to HTCondor
+        cluster_id, schedd = await self.condor.submit_job(pilot_path)
+
         await self.db.update_workflow(
             workflow.id,
             status=WorkflowStatus.PILOT_RUNNING.value,
             pilot_output_path=submit_dir,
+            pilot_cluster_id=cluster_id,
+            pilot_schedd=schedd,
         )
-        logger.info("Pilot submit file written for workflow %s at %s", workflow.id, pilot_path)
+        logger.info(
+            "Pilot submitted for workflow %s: cluster=%s schedd=%s",
+            workflow.id, cluster_id, schedd,
+        )
 
     def _parse_pilot_report(self, path: str) -> PilotMetrics:
         """Parse pilot JSON report from disk."""
@@ -199,6 +208,17 @@ class DAGPlanner:
             },
             total_work_units=len(merge_groups),
             status=DAGStatus.READY.value,
+        )
+
+        # 10. Submit DAG to HTCondor
+        cluster_id, schedd = await self.condor.submit_dag(dag_file_path)
+        now = datetime.now(timezone.utc)
+        await self.db.update_dag(
+            dag.id,
+            dagman_cluster_id=cluster_id,
+            schedd_name=schedd,
+            status=DAGStatus.SUBMITTED.value,
+            submitted_at=now,
         )
 
         await self.db.update_workflow(

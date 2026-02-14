@@ -41,6 +41,7 @@ def mock_repo():
     dag_row = MagicMock()
     dag_row.id = uuid.uuid4()
     repo.create_dag = AsyncMock(return_value=dag_row)
+    repo.update_dag = AsyncMock()
     repo.update_workflow = AsyncMock()
     return repo
 

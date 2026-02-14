@@ -6,25 +6,35 @@ from .base import CondorAdapter, CRICAdapter, DBSAdapter, ReqMgrAdapter, RucioAd
 class MockCondorAdapter(CondorAdapter):
     def __init__(self):
         self.calls: list[tuple[str, tuple, dict]] = []
+        self._next_cluster_id = 12345
+        self.completed_jobs: set[str] = set()
+        self.removed_jobs: set[str] = set()
 
     async def submit_job(self, submit_file: str) -> tuple[str, str]:
         self.calls.append(("submit_job", (submit_file,), {}))
-        return ("12345.0", "schedd.example.com")
+        cluster_id = str(self._next_cluster_id)
+        self._next_cluster_id += 1
+        return (cluster_id, "schedd.example.com")
 
     async def submit_dag(self, dag_file: str) -> tuple[str, str]:
         self.calls.append(("submit_dag", (dag_file,), {}))
-        return ("12346.0", "schedd.example.com")
+        cluster_id = str(self._next_cluster_id)
+        self._next_cluster_id += 1
+        return (cluster_id, "schedd.example.com")
 
     async def query_job(self, schedd_name: str, cluster_id: str) -> dict[str, Any] | None:
         self.calls.append(("query_job", (schedd_name, cluster_id), {}))
+        if cluster_id in self.completed_jobs or cluster_id in self.removed_jobs:
+            return None
         return {"ClusterId": cluster_id, "JobStatus": 2}
 
     async def check_job_completed(self, cluster_id: str, schedd_name: str) -> bool:
         self.calls.append(("check_job_completed", (cluster_id, schedd_name), {}))
-        return True
+        return cluster_id in self.completed_jobs
 
     async def remove_job(self, schedd_name: str, cluster_id: str) -> None:
         self.calls.append(("remove_job", (schedd_name, cluster_id), {}))
+        self.removed_jobs.add(cluster_id)
 
     async def ping_schedd(self, schedd_name: str) -> bool:
         self.calls.append(("ping_schedd", (schedd_name,), {}))

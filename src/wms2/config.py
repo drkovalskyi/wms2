@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # Agent identity
     agent_name: str = "wms2-agent"
 
+    # HTCondor
+    condor_host: str = ""  # collector address (e.g. "localhost:9618")
+    schedd_name: str | None = None  # explicit schedd; auto-discovered if None
+
     # DAG submission
     submit_base_dir: str = "/data/wms2/submit"
     target_merged_size_kb: int = 4 * 1024 * 1024  # 4 GB in KB

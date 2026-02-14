@@ -177,8 +177,18 @@ class RequestLifecycleManager:
             return
 
         if dag.status in (DAGStatus.SUBMITTED.value, DAGStatus.RUNNING.value):
-            # DAG still active — would poll via dag_monitor in Phase 2
-            pass
+            result = await self.dag_monitor.poll_dag(dag)
+            if result.status == DAGStatus.COMPLETED:
+                await self.transition(request, RequestStatus.COMPLETED)
+                return
+            elif result.status == DAGStatus.PARTIAL:
+                await self.transition(request, RequestStatus.PARTIAL)
+                return
+            elif result.status == DAGStatus.FAILED:
+                await self.transition(request, RequestStatus.FAILED)
+                return
+            # RUNNING — no transition, will poll again next cycle
+            return
 
         if dag.status == DAGStatus.COMPLETED.value:
             await self.transition(request, RequestStatus.COMPLETED)
