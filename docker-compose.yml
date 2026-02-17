@@ -15,6 +15,21 @@ services:
       timeout: 5s
       retries: 5
 
+  condor:
+    image: htcondor/mini:latest
+    hostname: condor
+    ports:
+      - "9618:9618"   # shared port (collector + schedd)
+    volumes:
+      - condor-submit:/home/submituser/submit  # shared submit dir
+      - ./condor/config:/etc/condor/config.d/99-wms2.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "condor_q >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   wms2:
     build: .
     ports:
@@ -27,3 +42,4 @@ services:
 
 volumes:
   pgdata:
+  condor-submit:

@@ -1,0 +1,20 @@
+# WMS2 dev overrides for HTCondor mini container
+# Fast negotiation for testing
+NEGOTIATOR_INTERVAL = 10
+NEGOTIATOR_CYCLE_DELAY = 5
+SCHEDD_INTERVAL = 10
+
+# Allow connections from host (any IP)
+ALLOW_WRITE = *
+ALLOW_READ = *
+ALLOW_ADMINISTRATOR = *
+ALLOW_NEGOTIATOR = *
+
+# Allow unauthenticated access (dev/test only)
+SEC_DEFAULT_AUTHENTICATION = OPTIONAL
+SEC_WRITE_AUTHENTICATION = OPTIONAL
+SEC_ADMINISTRATOR_AUTHENTICATION = OPTIONAL
+
+# DAGMan settings
+DAGMAN_USE_DIRECT_SUBMIT = True
+DAGMAN_MAX_RESCUE_NUM = 10
