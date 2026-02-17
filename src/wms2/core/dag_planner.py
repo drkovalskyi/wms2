@@ -138,7 +138,8 @@ class DAGPlanner:
             metrics = PilotMetrics()  # defaults
 
         # 2. Fetch input files from DBS
-        raw_files = await self.dbs.get_files(workflow.input_dataset)
+        limit = self.settings.max_input_files if self.settings.max_input_files > 0 else 0
+        raw_files = await self.dbs.get_files(workflow.input_dataset, limit=limit)
         if not raw_files:
             raise ValueError(
                 f"No input files for dataset {workflow.input_dataset}"
@@ -146,7 +147,11 @@ class DAGPlanner:
 
         # 3. Get replica locations from Rucio
         lfns = [f["logical_file_name"] for f in raw_files]
-        replica_map = await self.rucio.get_replicas(lfns)
+        try:
+            replica_map = await self.rucio.get_replicas(lfns)
+        except Exception as exc:
+            logger.warning("Rucio replica lookup failed (%s), using empty locations", exc)
+            replica_map = {}
 
         # 4. Convert to InputFile objects
         input_files = [
@@ -176,6 +181,11 @@ class DAGPlanner:
         # 7. Generate DAG files on disk
         submit_dir = os.path.join(self.settings.submit_base_dir, str(workflow.id))
         os.makedirs(submit_dir, exist_ok=True)
+        executables = {
+            "processing": self.settings.processing_executable,
+            "merge": self.settings.merge_executable,
+            "cleanup": self.settings.cleanup_executable,
+        }
         dag_file_path = _generate_dag_files(
             submit_dir=submit_dir,
             workflow_id=str(workflow.id),
@@ -184,6 +194,7 @@ class DAGPlanner:
             category_throttles=workflow.category_throttles or {
                 "Processing": 5000, "Merge": 100, "Cleanup": 50,
             },
+            executables=executables,
         )
 
         # 8. Count totals
@@ -276,6 +287,7 @@ def _generate_dag_files(
     merge_groups: list[PlanningMergeGroup],
     sandbox_url: str,
     category_throttles: dict[str, int],
+    executables: dict[str, str] | None = None,
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -310,6 +322,7 @@ def _generate_dag_files(
             merge_group=mg,
             sandbox_url=sandbox_url,
             category_throttles=category_throttles,
+            executables=executables,
         )
 
     # Category throttling for merge groups
@@ -330,8 +343,14 @@ def _generate_group_dag(
     merge_group: PlanningMergeGroup,
     sandbox_url: str,
     category_throttles: dict[str, int],
+    executables: dict[str, str] | None = None,
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
+    exe = executables or {}
+    proc_exe = exe.get("processing", "run_payload.sh")
+    merge_exe = exe.get("merge", "run_merge.sh")
+    cleanup_exe = exe.get("cleanup", "run_cleanup.sh")
+
     proc_nodes = merge_group.processing_nodes
     lines: list[str] = [
         f"# Merge group {merge_group.group_index}",
@@ -357,7 +376,7 @@ def _generate_group_dag(
         input_lfns = ",".join(f.lfn for f in node.input_files)
         _write_submit_file(
             str(group_dir / f"{node_name}.sub"),
-            executable="run_payload.sh",
+            executable=proc_exe,
             arguments=f"--sandbox {sandbox_url} --input {input_lfns}",
             description=f"processing node {node.node_index}",
             desired_sites=node.primary_location,
@@ -374,7 +393,7 @@ def _generate_group_dag(
     # Merge node
     _write_submit_file(
         str(group_dir / "merge.sub"),
-        executable="run_merge.sh",
+        executable=merge_exe,
         arguments=f"--sandbox {sandbox_url}",
         description="merge node",
     )
@@ -387,7 +406,7 @@ def _generate_group_dag(
     # Cleanup node
     _write_submit_file(
         str(group_dir / "cleanup.sub"),
-        executable="run_cleanup.sh",
+        executable=cleanup_exe,
         arguments="",
         description="cleanup node",
     )

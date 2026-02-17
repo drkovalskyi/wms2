@@ -15,11 +15,11 @@ BACKOFF_BASE = 1.0
 
 
 class ReqMgr2Client(ReqMgrAdapter):
-    def __init__(self, base_url: str, cert_file: str, key_file: str):
+    def __init__(self, base_url: str, cert_file: str, key_file: str, verify=True):
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             cert=(cert_file, key_file),
-            verify=True,
+            verify=verify,
             timeout=30.0,
         )
 
@@ -47,16 +47,21 @@ class ReqMgr2Client(ReqMgrAdapter):
         raise last_exc  # type: ignore[misc]
 
     async def get_request(self, request_name: str) -> dict[str, Any]:
-        data = await self._get(f"/reqmgr2/data/request/{request_name}")
-        # ReqMgr2 wraps the response in {"result": [{...}]}
+        data = await self._get(f"/data/request/{request_name}")
+        # ReqMgr2 wraps the response in {"result": [{request_name: {fields}}]}
         results = data.get("result", [])
-        if not results:
+        if not results or not results[0]:
             raise ValueError(f"Request {request_name} not found in ReqMgr2")
-        return results[0]
+        row = results[0]
+        # Unwrap: {request_name: {fields}} → {fields}
+        if request_name in row:
+            return row[request_name]
+        # Fallback: return first (and presumably only) value
+        return next(iter(row.values()))
 
     async def get_assigned_requests(self, agent_name: str) -> list[dict[str, Any]]:
         data = await self._get(
-            "/reqmgr2/data/request",
+            "/data/request",
             params={"status": "assigned", "team": agent_name},
         )
         results = data.get("result", [])

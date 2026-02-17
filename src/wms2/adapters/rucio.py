@@ -18,11 +18,11 @@ _RSE_SUFFIX_RE = re.compile(r"_(Disk|Tape|Test|Temp)$")
 
 
 class RucioClient(RucioAdapter):
-    def __init__(self, base_url: str, account: str, cert_file: str, key_file: str):
+    def __init__(self, base_url: str, account: str, cert_file: str, key_file: str, verify=True):
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             cert=(cert_file, key_file),
-            verify=True,
+            verify=verify,
             timeout=60.0,
             headers={"X-Rucio-Account": account},
         )

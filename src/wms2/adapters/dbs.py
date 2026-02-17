@@ -14,11 +14,11 @@ BACKOFF_BASE = 1.0
 
 
 class DBSClient(DBSAdapter):
-    def __init__(self, base_url: str, cert_file: str, key_file: str):
+    def __init__(self, base_url: str, cert_file: str, key_file: str, verify=True):
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             cert=(cert_file, key_file),
-            verify=True,
+            verify=verify,
             timeout=60.0,
         )
 
@@ -53,13 +53,14 @@ class DBSClient(DBSAdapter):
         lumi_mask: dict[str, list[list[int]]] | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"dataset": dataset, "detail": 1}
-        if limit:
-            params["limit"] = limit
         if run_whitelist:
             params["run_num"] = run_whitelist
         data = await self._get("/files", params=params)
         # DBS returns a flat list of file dicts
-        return data if isinstance(data, list) else []
+        result = data if isinstance(data, list) else []
+        if limit and limit > 0:
+            result = result[:limit]
+        return result
 
     async def inject_dataset(self, dataset_info: dict[str, Any]) -> None:
         url = f"{self._base_url}/datasets"

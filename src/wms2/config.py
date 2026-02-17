@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     reqmgr2_url: str = "https://cmsweb.cern.ch/reqmgr2"
     dbs_url: str = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader"
     rucio_url: str = "https://cms-rucio.cern.ch"
-    rucio_account: str = "�wms2"
+    rucio_account: str = "wms2"
 
     # Agent identity
     agent_name: str = "wms2-agent"
@@ -40,9 +40,18 @@ class Settings(BaseSettings):
     submit_base_dir: str = "/data/wms2/submit"
     target_merged_size_kb: int = 4 * 1024 * 1024  # 4 GB in KB
 
+    # Job executables (override to /bin/true for local testing)
+    processing_executable: str = "run_payload.sh"
+    merge_executable: str = "run_merge.sh"
+    cleanup_executable: str = "run_cleanup.sh"
+
+    # Input file limit (0 = no limit, >0 = cap DBS file query)
+    max_input_files: int = 0
+
     # X.509 certificates
     cert_file: str | None = None
     key_file: str | None = None
+    ssl_ca_path: str = "/etc/grid-security/certificates"
 
     # API
     api_prefix: str = "/api/v1"
