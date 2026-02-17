@@ -194,9 +194,9 @@ def _print_output_files(output_base_dir: str) -> None:
     """Find and display merged output files on disk."""
     import glob
 
-    # Look for both text and ROOT merged outputs
+    # Look for all output files (text and ROOT)
     txt_files = sorted(glob.glob(os.path.join(output_base_dir, "**", "merged.txt"), recursive=True))
-    root_files = sorted(glob.glob(os.path.join(output_base_dir, "**", "merged_*.root"), recursive=True))
+    root_files = sorted(glob.glob(os.path.join(output_base_dir, "**", "*.root"), recursive=True))
     files = txt_files + root_files
     if not files:
         print("[5/5] No merged output files found on disk")

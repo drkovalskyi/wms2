@@ -7,7 +7,12 @@
       "Bash(condor_submit_dag *)",
       "Bash(condor_hold *)",
       "Bash(condor_release *)",
-      "Bash(condor_rm *)"
+      "Bash(condor_rm *)",
+      "Bash(rm -rf /mnt/shared/wms2_submit/*)",
+      "Bash(rm -rf /mnt/shared/store/*)",
+      "Bash(rm -rf /tmp/wms2*)",
+      "Bash(PGPASSWORD=* psql *)",
+      "Bash(su - wms2 *)"
     ]
   }
 }

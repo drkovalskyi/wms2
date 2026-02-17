@@ -913,17 +913,19 @@ run_synthetic_mode() {
     echo "size/event(KB): $SIZE_PER_EVENT_KB"
     echo "time/event(s):  $TIME_PER_EVENT_SEC"
 
-    # Calculate output size in bytes
-    OUTPUT_BYTES=$(python3 -c "print(int($EVENTS * $SIZE_PER_EVENT_KB * 1024))")
+    # Calculate output size in KB (capped at 10 MB for dev/testing)
+    MAX_OUTPUT_KB=10240
+    OUTPUT_KB=$(python3 -c "print(min($MAX_OUTPUT_KB, int($EVENTS * $SIZE_PER_EVENT_KB)))")
 
-    # Simulate processing time (capped at 300s for testing)
-    SLEEP_TIME=$(python3 -c "print(min(300, $EVENTS * $TIME_PER_EVENT_SEC))")
+    # Simulate processing time (capped at 10s for testing)
+    SLEEP_TIME=$(python3 -c "print(min(10, $EVENTS * $TIME_PER_EVENT_SEC))")
+    echo "output_kb:      $OUTPUT_KB (capped at ${MAX_OUTPUT_KB} KB)"
     echo "sleep_time:     ${SLEEP_TIME}s"
     sleep "$SLEEP_TIME"
 
     # Create synthetic output file
     OUTPUT_FILE="proc_${NODE_INDEX}_output.root"
-    dd if=/dev/urandom of="$OUTPUT_FILE" bs=1024 count="$(python3 -c "print(int($EVENTS * $SIZE_PER_EVENT_KB))")" 2>/dev/null
+    dd if=/dev/urandom of="$OUTPUT_FILE" bs=1024 count="$OUTPUT_KB" 2>/dev/null
     ACTUAL_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo 0)
     echo "output_file:    $OUTPUT_FILE ($ACTUAL_SIZE bytes)"
 
