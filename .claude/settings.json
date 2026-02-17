@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(alembic *)",
+      "Bash(uvicorn *)",
+      "Bash(httpx *)",
+      "Bash(condor_submit_dag *)",
+      "Bash(condor_hold *)",
+      "Bash(condor_release *)",
+      "Bash(condor_rm *)"
+    ]
+  }
+}

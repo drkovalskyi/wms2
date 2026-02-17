@@ -7,10 +7,30 @@ WMS2 is the next-generation CMS Workload Management System, replacing WMCore/WMA
 ## Project structure
 
 ```
-docs/spec.md    — The specification document (the primary artifact)
-README.md       — Project readme
-LICENSE         — License file
+docs/spec.md                    — The specification document (the primary artifact)
+scripts/check-env.sh            — Environment verification script
+README.md                       — Project readme
+LICENSE                         — License file
+.claude/environment.md          — Required services, tools, packages (committed)
+.claude/environment.local.md    — This machine's setup (gitignored)
+.claude/settings.json           — Project-specific tool permissions (committed)
 ```
+
+## Development environment
+
+**At the start of every session**, do this before any other work:
+
+1. Read `.claude/environment.local.md` — it tells you what's installed, where services are, connection details, and known limitations. Do NOT run discovery commands if this file exists and is recent.
+2. If the file is **missing** (fresh clone), run `scripts/check-env.sh` to see what's available, then generate `.claude/environment.local.md` from the template in `.claude/environment.md`.
+3. If the file is **stale** (>30 days or after known changes), re-run `scripts/check-env.sh` and update it.
+
+**Key paths on current dev VM:**
+- Python venv: `.venv/` (activate with `source .venv/bin/activate`)
+- Always use the venv Python, never system Python 3.9
+- HTCondor Python bindings: `import htcondor2` (v2 API), not `import htcondor`
+- PostgreSQL: local, db=`wms2`, user=`wms2`, password in environment.local.md
+
+See `.claude/environment.md` for full project requirements.
 
 ## The spec document (`docs/spec.md`)
 
