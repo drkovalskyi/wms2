@@ -37,6 +37,7 @@ def mock_repository():
     repo.create_output_dataset = AsyncMock()
     repo.update_output_dataset = AsyncMock()
     repo.count_requests_by_status = AsyncMock(return_value={})
+    repo.create_dag_history = AsyncMock()
     return repo
 
 

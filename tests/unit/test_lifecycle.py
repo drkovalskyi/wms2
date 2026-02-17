@@ -341,6 +341,108 @@ async def test_handle_active_no_output_manager_skips(mock_repository, mock_condo
     await lm.evaluate_request(request)
 
 
+# ── Error Handler Integration ────────────────────────────────
+
+
+async def test_active_partial_with_rescue(mock_repository, mock_condor, settings):
+    """PARTIAL + error_handler returns 'rescue' → request RESUBMITTING."""
+    from wms2.core.dag_monitor import DAGPollResult
+
+    mock_error_handler = AsyncMock()
+    mock_error_handler.handle_dag_partial_failure.return_value = "rescue"
+
+    dag = _make_dag(status="submitted", nodes_done=19, nodes_failed=1)
+    workflow = _make_workflow(dag_id=dag.id)
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.PARTIAL,
+        nodes_done=19, nodes_failed=1,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+        error_handler=mock_error_handler,
+    )
+
+    request = make_request_row(status="active")
+    await lm.evaluate_request(request)
+
+    mock_error_handler.handle_dag_partial_failure.assert_called_once_with(
+        dag, request, workflow
+    )
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.RESUBMITTING.value
+
+
+async def test_active_partial_without_error_handler(mock_repository, mock_condor, settings):
+    """PARTIAL without error_handler → request PARTIAL (backward compat)."""
+    from wms2.core.dag_monitor import DAGPollResult
+
+    dag = _make_dag(status="submitted", nodes_done=19, nodes_failed=1)
+    workflow = _make_workflow(dag_id=dag.id)
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.PARTIAL,
+        nodes_done=19, nodes_failed=1,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+        # No error_handler
+    )
+
+    request = make_request_row(status="active")
+    await lm.evaluate_request(request)
+
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.PARTIAL.value
+
+
+async def test_active_failed_with_error_handler(mock_repository, mock_condor, settings):
+    """FAILED + error_handler called → request FAILED."""
+    from wms2.core.dag_monitor import DAGPollResult
+
+    mock_error_handler = AsyncMock()
+    mock_error_handler.handle_dag_failure.return_value = "abort"
+
+    dag = _make_dag(status="submitted", nodes_done=0, nodes_failed=20)
+    workflow = _make_workflow(dag_id=dag.id)
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.FAILED,
+        nodes_done=0, nodes_failed=20,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+        error_handler=mock_error_handler,
+    )
+
+    request = make_request_row(status="active")
+    await lm.evaluate_request(request)
+
+    mock_error_handler.handle_dag_failure.assert_called_once_with(
+        dag, request, workflow
+    )
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.FAILED.value
+
+
 async def test_handle_queued_rescue_dag_submits(lifecycle_manager, mock_repository, mock_condor):
     """QUEUED with rescue DAG → submit to HTCondor → ACTIVE."""
     lifecycle_manager.dag_planner = AsyncMock()

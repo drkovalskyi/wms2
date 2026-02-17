@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # Output staging
     output_base_dir: str = "/mnt/shared/store"
 
+    # Error Handler
+    error_auto_rescue_threshold: float = 0.05
+    error_abort_threshold: float = 0.30
+    error_max_rescue_attempts: int = 3
+
     # API
     api_prefix: str = "/api/v1"
 

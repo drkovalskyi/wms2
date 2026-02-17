@@ -15,6 +15,7 @@ from wms2.api.router import api_router
 from wms2.config import Settings
 from wms2.core.dag_monitor import DAGMonitor
 from wms2.core.dag_planner import DAGPlanner
+from wms2.core.error_handler import ErrorHandler
 from wms2.core.lifecycle_manager import RequestLifecycleManager
 from wms2.core.output_manager import OutputManager
 from wms2.core.workflow_manager import WorkflowManager
@@ -78,12 +79,14 @@ async def lifespan(app: FastAPI):
             dp = DAGPlanner(repo, dbs, rucio, condor, settings)
             dm = DAGMonitor(repo, condor)
             om = OutputManager(repo, dbs, rucio, settings)
+            eh = ErrorHandler(repo, condor, settings)
             lm = RequestLifecycleManager(
                 repo, condor, settings,
                 workflow_manager=wm,
                 dag_planner=dp,
                 dag_monitor=dm,
                 output_manager=om,
+                error_handler=eh,
             )
             app.state.lifecycle_manager = lm
             await lm.main_loop()

@@ -201,9 +201,22 @@ class RequestLifecycleManager:
                 await self.transition(request, RequestStatus.COMPLETED)
                 return
             elif result.status == DAGStatus.PARTIAL:
+                if self.error_handler:
+                    action = await self.error_handler.handle_dag_partial_failure(
+                        dag, request, workflow
+                    )
+                    if action == "rescue":
+                        await self.transition(request, RequestStatus.RESUBMITTING)
+                        return
+                    elif action == "abort":
+                        await self.transition(request, RequestStatus.FAILED)
+                        return
+                # No error_handler or action == "review"
                 await self.transition(request, RequestStatus.PARTIAL)
                 return
             elif result.status == DAGStatus.FAILED:
+                if self.error_handler:
+                    await self.error_handler.handle_dag_failure(dag, request, workflow)
                 await self.transition(request, RequestStatus.FAILED)
                 return
             # RUNNING — no transition, will poll again next cycle
@@ -212,8 +225,20 @@ class RequestLifecycleManager:
         if dag.status == DAGStatus.COMPLETED.value:
             await self.transition(request, RequestStatus.COMPLETED)
         elif dag.status == DAGStatus.PARTIAL.value:
+            if self.error_handler:
+                action = await self.error_handler.handle_dag_partial_failure(
+                    dag, request, workflow
+                )
+                if action == "rescue":
+                    await self.transition(request, RequestStatus.RESUBMITTING)
+                    return
+                elif action == "abort":
+                    await self.transition(request, RequestStatus.FAILED)
+                    return
             await self.transition(request, RequestStatus.PARTIAL)
         elif dag.status == DAGStatus.FAILED.value:
+            if self.error_handler:
+                await self.error_handler.handle_dag_failure(dag, request, workflow)
             await self.transition(request, RequestStatus.FAILED)
 
     async def _handle_stopping(self, request):
@@ -239,17 +264,13 @@ class RequestLifecycleManager:
         await self.transition(request, RequestStatus.QUEUED)
 
     async def _handle_partial(self, request):
-        """Handle partial DAG completion."""
-        if self.error_handler is None:
-            logger.debug("Skipping _handle_partial: error_handler not available")
-            return
+        """Handle partial DAG completion — re-evaluation on subsequent cycles.
 
-        workflow = await self.db.get_workflow_by_request(request.request_name)
-        if not workflow or not workflow.dag_id:
-            return
-        dag = await self.db.get_dag(workflow.dag_id)
-        if dag:
-            await self.error_handler.handle_dag_partial_failure(dag)
+        Currently a stub; can be enhanced with manual retry support later.
+        The initial classification (rescue/review/abort) happens in _handle_active()
+        when the DAG first transitions to PARTIAL.
+        """
+        pass
 
     # ── Clean Stop ──────────────────────────────────────────────
 
