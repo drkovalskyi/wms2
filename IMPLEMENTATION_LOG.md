@@ -903,5 +903,139 @@ mc/RunIII2024Summer24NanoAODv15/QCD_.../NANOAODSIM/150X_...-v2/000000/proc_0_out
 
 - CVMFS setup on dev VM — Enable real CMSSW execution via CVMFS client
 - HTCondor e2e (CMSSW) — Once CVMFS available, verify real `cmsRun` execution
-- Error Handler — Failure classification, rescue DAG decisions
-- Clean Stop — Full clean stop flow with rescue DAGs
+- Site Manager — CRIC sync for site status and capacity
+- Real DBS/Rucio adapters — actual service calls for output registration and transfers
+
+---
+
+# Phase 7 — Error Handler: Failure Classification and Recovery
+
+**Date**: 2026-02-17
+**Spec Version**: 2.4.0
+**Phase**: 7 — Error Handler (Spec Section 4.8, Section 6)
+
+---
+
+## What Was Built
+
+### Error Handler (`core/error_handler.py`)
+
+Workflow-level failure classification and recovery. When a DAG completes with failures, the Error Handler classifies by failure ratio and decides: auto-rescue, flag for review, or abort.
+
+**`handle_dag_failure(dag, request, workflow) → "abort"`**:
+- DAG with zero successes — always aborts
+- Sets workflow status to FAILED
+- Records `dag_failed` event in DAG history
+
+**`handle_dag_partial_failure(dag, request, workflow) → "rescue" | "review" | "abort"`**:
+- Computes `failure_ratio = nodes_failed / total_nodes`
+- Checks rescue attempt count against max before classification
+- Classification thresholds:
+  - `ratio < error_auto_rescue_threshold` (default 0.05 = 5%) → auto-rescue
+  - `ratio < error_abort_threshold` (default 0.30 = 30%) → flag for review (operator alert logged)
+  - `ratio >= error_abort_threshold` → abort
+- Records `dag_partial` event with failure ratio in DAG history
+
+**`_prepare_rescue(dag, request, workflow)`**:
+- Finds highest-numbered rescue DAG file on disk (`.rescue001` through `.rescue099`)
+- Creates new DAG record with `parent_dag_id` pointing to failed DAG, status=READY
+- Updates workflow with new DAG id and RESUBMITTING status
+- Reuses the same pattern as `_prepare_recovery()` in lifecycle manager (clean stop)
+
+**`_count_rescue_chain(dag) → int`**:
+- Walks `parent_dag_id` chain to count how many rescue attempts have been made
+- Used as guard against infinite rescue loops
+
+**Return value convention**: Methods return `"rescue"`, `"review"`, or `"abort"`. The lifecycle manager uses this to decide the state transition — it still owns the state machine.
+
+### Config Settings (`config.py`)
+
+```python
+error_auto_rescue_threshold: float = 0.05   # Below 5% → auto-rescue
+error_abort_threshold: float = 0.30          # Above 30% → abort
+error_max_rescue_attempts: int = 3           # Max rescue chain length
+```
+
+### Lifecycle Manager Integration (`core/lifecycle_manager.py`)
+
+**`_handle_active()` — PARTIAL branch**:
+- If error_handler present: calls `handle_dag_partial_failure()`
+  - `"rescue"` → request transitions to RESUBMITTING (→ QUEUED → ACTIVE via rescue DAG)
+  - `"abort"` → request transitions to FAILED
+  - `"review"` → falls through to PARTIAL (operator intervention needed)
+- If no error_handler → request transitions to PARTIAL (backward compatible)
+
+**`_handle_active()` — FAILED branch**:
+- If error_handler present: calls `handle_dag_failure()` (records event, sets workflow FAILED)
+- Request always transitions to FAILED regardless
+
+**Both poll-result and cached-status code paths** updated — error handler is called whether the DAG status comes from a fresh `poll_dag()` result or from a previously-stored DAG status.
+
+**`_handle_partial()` — simplified to stub**:
+- Previous implementation called `error_handler.handle_dag_partial_failure(dag)` with wrong signature
+- Now a no-op stub — initial classification happens in `_handle_active()` when DAG first reaches PARTIAL
+- Can be enhanced later with manual retry support (operator triggers re-evaluation)
+
+### FastAPI Wiring (`main.py`)
+
+ErrorHandler created and injected into lifecycle manager alongside other components:
+```python
+eh = ErrorHandler(repo, condor, settings)
+lm = RequestLifecycleManager(..., error_handler=eh)
+```
+
+### Tests
+
+**12 new tests (169 total, all passing)**:
+
+| File | New Tests | What |
+|---|---|---|
+| `test_error_handler.py` | 9 | Low ratio → rescue, medium → review, high → abort, zero successes → abort, rescue DAG path discovery (single + highest), max rescue exceeded, DAG history recorded, custom thresholds |
+| `test_lifecycle.py` | 3 | PARTIAL + rescue → RESUBMITTING, PARTIAL without handler → PARTIAL, FAILED + handler called → FAILED |
+
+---
+
+## Recovery Flow
+
+The full rescue flow after a partial DAG failure:
+
+```
+DAG finishes PARTIAL (some nodes failed)
+  → Error Handler classifies failure ratio
+    → If < 5%: "rescue"
+      → _prepare_rescue creates new DAG record (status=READY, parent_dag_id=old)
+      → Workflow updated to point to new DAG
+      → Request: ACTIVE → RESUBMITTING → QUEUED
+      → _handle_queued detects rescue DAG (dag.rescue_dag_path + status=READY)
+      → Rescue DAG submitted to HTCondor
+      → Request: QUEUED → ACTIVE (monitoring resumes)
+    → If 5-30%: "review"
+      → Request stays PARTIAL, operator alert logged
+    → If > 30%: "abort"
+      → Workflow set to FAILED
+      → Request: ACTIVE → FAILED
+```
+
+This reuses the same rescue DAG mechanism as clean stop recovery (Phase 1), but triggered automatically by failure ratio instead of operator request.
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/unit/test_error_handler.py -v` — 9 tests pass
+3. `pytest tests/unit/test_lifecycle.py -v` — 21 tests pass (18 existing + 3 new)
+4. `pytest tests/unit/ tests/integration/ -v -k "not condor"` — 169 tests pass
+
+## Design Decisions
+
+- **Error handler returns action strings, not transitions**: The error handler returns `"rescue"`, `"review"`, or `"abort"` — the lifecycle manager decides the actual state transition. This preserves the single-owner-of-state-machine invariant.
+- **Rescue chain count via parent_dag_id traversal**: Rather than storing a counter, we walk the `parent_dag_id` chain. This is accurate even if records are created by different code paths (clean stop vs error handler).
+- **Thresholds are < (strict), not <=**: Exactly 5% failure ratio goes to "review", not "rescue". This is conservative — borderline cases get human review.
+- **_handle_partial simplified to stub**: The old implementation had a broken call signature. Classification now happens once when the DAG first reaches PARTIAL status (in `_handle_active`). Re-evaluation of PARTIAL requests can be added later for manual retry support.
+- **CLI not wired**: The CLI runs a direct monitoring loop without the lifecycle manager, so the error handler is not needed there. Error handling in CLI mode is manual (operator sees the final DAG status).
+
+## What's Next
+
+- Site Manager — CRIC sync for site status and capacity
+- CVMFS setup on dev VM — Enable real CMSSW execution
+- Real DBS/Rucio adapters — actual service calls for output registration and transfers
+- Continuous lifecycle loop testing — multi-request concurrent processing
