@@ -172,3 +172,73 @@ class TestDAGFileGeneration:
         assert "universe = vanilla" in content
         assert "executable = run_payload.sh" in content
         assert "queue 1" in content
+
+    def test_trivial_scripts_generated(self, tmp_path):
+        """wms2_proc.sh and wms2_merge.py are always generated."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        assert (tmp_path / "wms2_proc.sh").exists()
+        assert (tmp_path / "wms2_merge.py").exists()
+        assert os.access(str(tmp_path / "wms2_proc.sh"), os.X_OK)
+        assert os.access(str(tmp_path / "wms2_merge.py"), os.X_OK)
+
+    def test_test_mode_uses_trivial_scripts(self, tmp_path):
+        """When executables are /bin/true, submit files use generated scripts."""
+        groups = _make_merge_groups(1, 1)
+        executables = {
+            "processing": "/bin/true",
+            "merge": "/bin/true",
+            "cleanup": "/bin/true",
+        }
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            executables=executables,
+        )
+        proc_sub = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "wms2_proc.sh" in proc_sub
+        assert "/bin/true" not in proc_sub
+
+        merge_sub = (tmp_path / "mg_000000" / "merge.sub").read_text()
+        assert "wms2_merge.py" in merge_sub
+        assert "/bin/true" not in merge_sub
+
+        # Cleanup still uses /bin/true
+        cleanup_sub = (tmp_path / "mg_000000" / "cleanup.sub").read_text()
+        assert "executable = /bin/true" in cleanup_sub
+
+    def test_output_info_json_format(self, tmp_path):
+        """output_info.json includes dataset names and tiers."""
+        groups = _make_merge_groups(1, 1)
+        output_datasets = [
+            {
+                "dataset_name": "/Primary/Era-Proc-v1/AODSIM",
+                "merged_lfn_base": "/store/mc/Era/Primary/AODSIM/Proc-v1",
+                "data_tier": "AODSIM",
+            },
+        ]
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            output_datasets=output_datasets,
+            output_base_dir="/mnt/shared/store",
+        )
+        import json
+        info = json.loads((tmp_path / "mg_000000" / "output_info.json").read_text())
+        assert "output_datasets" in info
+        assert info["output_datasets"][0]["dataset_name"] == "/Primary/Era-Proc-v1/AODSIM"
+        assert info["output_datasets"][0]["data_tier"] == "AODSIM"
+        assert info["output_base_dir"] == "/mnt/shared/store"
+        assert info["group_index"] == 0

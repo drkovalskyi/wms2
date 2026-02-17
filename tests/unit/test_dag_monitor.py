@@ -11,6 +11,75 @@ from wms2.core.dag_monitor import DAGMonitor, DAGPollResult, NodeSummary
 from wms2.models.enums import DAGStatus
 
 
+# ── ClassAd status file helpers ──────────────────────────────────
+
+
+# NodeStatus integer codes used by DAGMan
+_NS_NOT_READY = 0
+_NS_READY = 1
+_NS_PRERUN = 2
+_NS_SUBMITTED = 3
+_NS_POSTRUN = 4
+_NS_DONE = 5
+_NS_ERROR = 6
+_NS_FUTILE = 7
+
+
+def _write_classad_status(path, nodes: dict[str, int], **dag_overrides):
+    """Write a DAGMan NODE_STATUS_FILE in ClassAd format.
+
+    nodes: {"mg_000000": _NS_DONE, "mg_000001": _NS_SUBMITTED, ...}
+    dag_overrides: override DagStatus block fields (NodesDone, etc.)
+    """
+    # Compute defaults from node statuses
+    done = sum(1 for s in nodes.values() if s == _NS_DONE)
+    failed = sum(1 for s in nodes.values() if s == _NS_ERROR)
+    futile = sum(1 for s in nodes.values() if s == _NS_FUTILE)
+    queued = sum(1 for s in nodes.values() if s == _NS_SUBMITTED)
+    ready = sum(1 for s in nodes.values() if s == _NS_READY)
+    unready = sum(1 for s in nodes.values() if s == _NS_NOT_READY)
+    pre = sum(1 for s in nodes.values() if s == _NS_PRERUN)
+    post = sum(1 for s in nodes.values() if s == _NS_POSTRUN)
+    total = len(nodes)
+    held = dag_overrides.pop("JobProcsHeld", 0)
+
+    lines = [
+        "[",
+        '  Type = "DagStatus";',
+        f"  NodesTotal = {dag_overrides.get('NodesTotal', total)};",
+        f"  NodesDone = {dag_overrides.get('NodesDone', done)};",
+        f"  NodesPre = {dag_overrides.get('NodesPre', pre)};",
+        f"  NodesQueued = {dag_overrides.get('NodesQueued', queued)};",
+        f"  NodesPost = {dag_overrides.get('NodesPost', post)};",
+        f"  NodesReady = {dag_overrides.get('NodesReady', ready)};",
+        f"  NodesUnready = {dag_overrides.get('NodesUnready', unready)};",
+        f"  NodesFailed = {dag_overrides.get('NodesFailed', failed)};",
+        f"  NodesFutile = {dag_overrides.get('NodesFutile', futile)};",
+        f"  JobProcsHeld = {held};",
+        "]",
+    ]
+
+    for name, status in nodes.items():
+        lines += [
+            "[",
+            '  Type = "NodeStatus";',
+            f'  Node = "{name}";',
+            f"  NodeStatus = {status};",
+            "]",
+        ]
+
+    lines += [
+        "[",
+        '  Type = "StatusEnd";',
+        "]",
+    ]
+
+    path.write_text("\n".join(lines) + "\n")
+
+
+# ── Test fixtures ────────────────────────────────────────────────
+
+
 def _make_dag_row(
     status="submitted",
     dag_file_path="/tmp/submit/workflow.dag",
@@ -52,15 +121,12 @@ def monitor(mock_repo, mock_condor):
 
 class TestParseDagmanStatus:
     def test_parse_valid_status(self, monitor, tmp_path):
-        status_data = {
-            "nodes": {
-                "mg_000000": {"status": "Done"},
-                "mg_000001": {"status": "Running"},
-                "mg_000002": {"status": "Idle"},
-            }
-        }
         status_file = tmp_path / "workflow.dag.status"
-        status_file.write_text(json.dumps(status_data))
+        _write_classad_status(status_file, {
+            "mg_000000": _NS_DONE,
+            "mg_000001": _NS_SUBMITTED,
+            "mg_000002": _NS_READY,
+        })
 
         result = monitor._parse_dagman_status(str(status_file))
         assert result.done == 1
@@ -68,6 +134,7 @@ class TestParseDagmanStatus:
         assert result.idle == 1
         assert result.failed == 0
         assert result.node_statuses["mg_000000"] == "done"
+        assert result.node_statuses["mg_000001"] == "submitted"
 
     def test_parse_missing_file(self, monitor):
         result = monitor._parse_dagman_status("/nonexistent/path.status")
@@ -76,27 +143,21 @@ class TestParseDagmanStatus:
         assert result.idle == 0
 
     def test_parse_failed_nodes(self, monitor, tmp_path):
-        status_data = {
-            "nodes": {
-                "mg_000000": {"status": "Error"},
-                "mg_000001": {"status": "Done"},
-            }
-        }
         status_file = tmp_path / "workflow.dag.status"
-        status_file.write_text(json.dumps(status_data))
+        _write_classad_status(status_file, {
+            "mg_000000": _NS_ERROR,
+            "mg_000001": _NS_DONE,
+        })
 
         result = monitor._parse_dagman_status(str(status_file))
         assert result.done == 1
         assert result.failed == 1
 
     def test_parse_held_nodes(self, monitor, tmp_path):
-        status_data = {
-            "nodes": {
-                "mg_000000": {"status": "Held"},
-            }
-        }
         status_file = tmp_path / "workflow.dag.status"
-        status_file.write_text(json.dumps(status_data))
+        _write_classad_status(status_file, {
+            "mg_000000": _NS_SUBMITTED,
+        }, JobProcsHeld=1)
 
         result = monitor._parse_dagman_status(str(status_file))
         assert result.held == 1
@@ -157,15 +218,10 @@ class TestDetectCompletedWorkUnits:
 class TestPollDag:
     async def test_dag_alive_returns_running(self, monitor, mock_condor, mock_repo, tmp_path):
         dag = _make_dag_row(dag_file_path=str(tmp_path / "workflow.dag"))
-        # Write a status file
-        status_data = {
-            "nodes": {
-                "mg_000000": {"status": "Done"},
-                "mg_000001": {"status": "Running"},
-            }
-        }
-        status_file = tmp_path / "workflow.dag.status"
-        status_file.write_text(json.dumps(status_data))
+        _write_classad_status(tmp_path / "workflow.dag.status", {
+            "mg_000000": _NS_DONE,
+            "mg_000001": _NS_SUBMITTED,
+        })
 
         result = await monitor.poll_dag(dag)
         assert result.status == DAGStatus.RUNNING
@@ -222,14 +278,10 @@ class TestPollDag:
             dag_file_path=str(tmp_path / "workflow.dag"),
             completed_work_units=[],
         )
-        status_data = {
-            "nodes": {
-                "mg_000000": {"status": "Done"},
-                "mg_000001": {"status": "Running"},
-            }
-        }
-        status_file = tmp_path / "workflow.dag.status"
-        status_file.write_text(json.dumps(status_data))
+        _write_classad_status(tmp_path / "workflow.dag.status", {
+            "mg_000000": _NS_DONE,
+            "mg_000001": _NS_SUBMITTED,
+        })
 
         result = await monitor.poll_dag(dag)
         assert len(result.newly_completed_work_units) == 1
@@ -255,6 +307,60 @@ class TestHandleDagCompletion:
         assert result.status == DAGStatus.COMPLETED
         assert result.nodes_done == 5
 
+    async def test_detects_final_work_units(self, monitor, mock_repo, tmp_path):
+        """On DAG exit, newly completed work units from .status file are returned."""
+        dag = _make_dag_row(
+            dag_file_path=str(tmp_path / "workflow.dag"),
+            completed_work_units=[],
+        )
+        monitor.condor = MockCondorAdapter()
+        monitor.condor.completed_jobs.add(dag.dagman_cluster_id)
+
+        # Metrics file
+        metrics_data = {"nodes_done": 2, "nodes_failed": 0}
+        (tmp_path / "workflow.dag.metrics").write_text(json.dumps(metrics_data))
+
+        # Status file shows both merge groups completed
+        _write_classad_status(tmp_path / "workflow.dag.status", {
+            "mg_000000": _NS_DONE,
+            "mg_000001": _NS_DONE,
+        })
+
+        result = await monitor._handle_dag_completion(dag)
+        assert result.status == DAGStatus.COMPLETED
+        assert len(result.newly_completed_work_units) == 2
+        names = {wu["group_name"] for wu in result.newly_completed_work_units}
+        assert names == {"mg_000000", "mg_000001"}
+
+        # Verify update_dag received the completed_work_units
+        call_kwargs = mock_repo.update_dag.call_args[1]
+        assert "mg_000000" in call_kwargs["completed_work_units"]
+        assert "mg_000001" in call_kwargs["completed_work_units"]
+
+    async def test_dag_gone_with_status_file_detects_wus(
+        self, monitor, mock_condor, mock_repo, tmp_path
+    ):
+        """Full poll_dag when DAGMan gone: uses .status to detect final work units."""
+        dag = _make_dag_row(
+            dag_file_path=str(tmp_path / "workflow.dag"),
+            completed_work_units=["mg_000000"],  # One already known
+        )
+        mock_condor.completed_jobs.add(dag.dagman_cluster_id)
+
+        metrics_data = {"nodes_done": 2, "nodes_failed": 0}
+        (tmp_path / "workflow.dag.metrics").write_text(json.dumps(metrics_data))
+
+        _write_classad_status(tmp_path / "workflow.dag.status", {
+            "mg_000000": _NS_DONE,
+            "mg_000001": _NS_DONE,
+        })
+
+        result = await monitor.poll_dag(dag)
+        assert result.status == DAGStatus.COMPLETED
+        # Only mg_000001 is newly completed (mg_000000 was already known)
+        assert len(result.newly_completed_work_units) == 1
+        assert result.newly_completed_work_units[0]["group_name"] == "mg_000001"
+
 
 class TestLifecycleIntegration:
     async def test_handle_active_calls_poll_dag(self, mock_repo, tmp_path):
@@ -274,8 +380,9 @@ class TestLifecycleIntegration:
         )
 
         # Write a status file showing running state
-        status_data = {"nodes": {"mg_000000": {"status": "Running"}}}
-        (tmp_path / "workflow.dag.status").write_text(json.dumps(status_data))
+        _write_classad_status(tmp_path / "workflow.dag.status", {
+            "mg_000000": _NS_SUBMITTED,
+        })
 
         workflow = MagicMock()
         workflow.id = dag.workflow_id

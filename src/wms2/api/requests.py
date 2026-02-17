@@ -1,12 +1,17 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
+from pydantic import BaseModel
 
 from wms2.db.repository import Repository
 from wms2.models.enums import RequestStatus
 from wms2.models.request import Request, RequestCreate, RequestUpdate
 
 from .deps import get_repository
+
+
+class StopRequest(BaseModel):
+    reason: str = "Operator-initiated clean stop"
 
 router = APIRouter(prefix="/requests", tags=["requests"])
 
@@ -123,15 +128,35 @@ async def abort_request(
 @router.post("/{request_name}/stop", response_model=dict)
 async def stop_request(
     request_name: str,
+    body: StopRequest = StopRequest(),
+    raw_request: FastAPIRequest = None,
     repo: Repository = Depends(get_repository),
 ):
     existing = await repo.get_request(request_name)
     if not existing:
         raise HTTPException(status_code=404, detail="Request not found")
-    if existing.status != RequestStatus.ACTIVE.value:
-        raise HTTPException(status_code=400, detail="Can only stop active requests")
-    # Clean stop would be initiated by the lifecycle manager
-    return {"message": "Clean stop requested", "request_name": request_name}
+
+    stoppable = (RequestStatus.ACTIVE.value, RequestStatus.PILOT_RUNNING.value)
+    if existing.status not in stoppable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only stop requests in active or pilot_running state, "
+                   f"current status: {existing.status}",
+        )
+
+    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
+    if lm is None:
+        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
+
+    previous_status = existing.status
+    await lm.initiate_clean_stop(request_name, body.reason)
+    return {
+        "request_name": request_name,
+        "status": "stopping",
+        "previous_status": previous_status,
+        "stop_reason": body.reason,
+        "message": f"Clean stop initiated for {request_name}",
+    }
 
 
 @router.post("/{request_name}/restart", response_model=dict)

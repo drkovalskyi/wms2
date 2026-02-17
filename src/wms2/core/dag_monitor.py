@@ -103,39 +103,89 @@ class DAGMonitor:
             newly_completed_work_units=newly_completed,
         )
 
+    # NodeStatus integer → string mapping for DAGMan NODE_STATUS_FILE
+    _NODE_STATUS_MAP = {
+        "0": "not_ready",
+        "1": "ready",
+        "2": "prerun",
+        "3": "submitted",
+        "4": "postrun",
+        "5": "done",
+        "6": "error",
+        "7": "futile",
+    }
+
     def _parse_dagman_status(self, status_file: str) -> NodeSummary:
-        """Parse the DAGMan .status JSON file."""
+        """Parse the DAGMan NODE_STATUS_FILE (ClassAd format).
+
+        Format is a sequence of ClassAd blocks:
+          [Type = "DagStatus"; NodesDone = N; ...]
+          [Type = "NodeStatus"; Node = "mg_000000"; NodeStatus = 5; ...]
+          [Type = "StatusEnd"; ...]
+        """
+        import re
+
         if not os.path.exists(status_file):
             logger.warning("Status file not found: %s", status_file)
             return NodeSummary()
 
         with open(status_file) as f:
-            data = json.load(f)
+            content = f.read()
 
-        node_statuses = {}
-        counts = {"idle": 0, "running": 0, "done": 0, "failed": 0, "held": 0}
+        # Parse ClassAd blocks
+        blocks: list[dict[str, str]] = []
+        current_block: dict[str, str] = {}
+        for line in content.splitlines():
+            line = re.sub(r"/\*.*?\*/", "", line).strip()
+            if line == "[":
+                current_block = {}
+            elif line in ("]", "];"):
+                if current_block:
+                    blocks.append(current_block)
+                current_block = {}
+            elif "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().rstrip(";").strip()
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                current_block[key] = value
 
-        # DAGMan status file has a "nodes" dict with node_name -> status info
-        for node_name, info in data.get("nodes", {}).items():
-            status = info.get("status", "idle").lower()
-            node_statuses[node_name] = status
-            if status in ("done", "success"):
-                counts["done"] += 1
-            elif status in ("error", "failed"):
-                counts["failed"] += 1
-            elif status in ("running", "submitted"):
-                counts["running"] += 1
-            elif status == "held":
-                counts["held"] += 1
-            else:
-                counts["idle"] += 1
+        node_statuses: dict[str, str] = {}
+        dag_block: dict[str, str] | None = None
+
+        for block in blocks:
+            btype = block.get("Type", "")
+            if btype == "DagStatus":
+                dag_block = block
+            elif btype == "NodeStatus":
+                name = block.get("Node", "")
+                status_num = block.get("NodeStatus", "0")
+                node_statuses[name] = self._NODE_STATUS_MAP.get(status_num, "unknown")
+
+        if dag_block:
+            done = int(dag_block.get("NodesDone", 0))
+            failed = int(dag_block.get("NodesFailed", 0))
+            running = int(dag_block.get("NodesQueued", 0)) + int(dag_block.get("NodesPost", 0))
+            idle = (
+                int(dag_block.get("NodesReady", 0))
+                + int(dag_block.get("NodesUnready", 0))
+                + int(dag_block.get("NodesPre", 0))
+            )
+            held = int(dag_block.get("JobProcsHeld", 0))
+        else:
+            done = sum(1 for s in node_statuses.values() if s == "done")
+            failed = sum(1 for s in node_statuses.values() if s in ("error", "futile"))
+            running = sum(1 for s in node_statuses.values() if s in ("submitted", "postrun", "prerun"))
+            idle = sum(1 for s in node_statuses.values() if s in ("ready", "not_ready"))
+            held = 0
 
         return NodeSummary(
-            idle=counts["idle"],
-            running=counts["running"],
-            done=counts["done"],
-            failed=counts["failed"],
-            held=counts["held"],
+            idle=idle,
+            running=running,
+            done=done,
+            failed=failed,
+            held=held,
             node_statuses=node_statuses,
         )
 
@@ -196,6 +246,11 @@ class DAGMonitor:
             status_file = dag.dag_file_path + ".status"
             summary = self._parse_dagman_status(status_file)
 
+        # Also parse .status to detect work units that completed since last poll
+        status_file = dag.dag_file_path + ".status"
+        status_summary = self._parse_dagman_status(status_file)
+        newly_completed = self._detect_completed_work_units(dag, status_summary)
+
         # Determine final status
         total = dag.total_work_units or (summary.done + summary.failed)
         if summary.failed == 0 and summary.done > 0:
@@ -209,16 +264,22 @@ class DAGMonitor:
             final_status = DAGStatus.FAILED
 
         now = datetime.now(timezone.utc)
-        await self.db.update_dag(
-            dag.id,
-            status=final_status.value,
-            nodes_done=summary.done,
-            nodes_failed=summary.failed,
-            nodes_running=0,
-            nodes_idle=0,
-            nodes_held=0,
-            completed_at=now,
-        )
+        update_kwargs = {
+            "status": final_status.value,
+            "nodes_done": summary.done,
+            "nodes_failed": summary.failed,
+            "nodes_running": 0,
+            "nodes_idle": 0,
+            "nodes_held": 0,
+            "completed_at": now,
+        }
+        if newly_completed:
+            existing = dag.completed_work_units or []
+            update_kwargs["completed_work_units"] = existing + [
+                wu["group_name"] for wu in newly_completed
+            ]
+
+        await self.db.update_dag(dag.id, **update_kwargs)
 
         if dag.workflow_id:
             await self.db.update_workflow(
@@ -230,8 +291,9 @@ class DAGMonitor:
             )
 
         logger.info(
-            "DAG %s completed: status=%s done=%d failed=%d",
+            "DAG %s completed: status=%s done=%d failed=%d newly_completed_wus=%d",
             dag.id, final_status.value, summary.done, summary.failed,
+            len(newly_completed),
         )
 
         return DAGPollResult(
@@ -239,4 +301,5 @@ class DAGMonitor:
             status=final_status,
             nodes_done=summary.done,
             nodes_failed=summary.failed,
+            newly_completed_work_units=newly_completed,
         )

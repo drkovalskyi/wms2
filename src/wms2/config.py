@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     key_file: str | None = None
     ssl_ca_path: str = "/etc/grid-security/certificates"
 
+    # Output staging
+    output_base_dir: str = "/mnt/shared/store"
+
     # API
     api_prefix: str = "/api/v1"
 

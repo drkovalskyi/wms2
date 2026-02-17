@@ -10,9 +10,12 @@ import ssl
 import sys
 from typing import Any
 
+from wms2.adapters.mock import MockDBSAdapter as _MockDBS, MockRucioAdapter as _MockRucio
 from wms2.config import Settings
 from wms2.core.dag_monitor import DAGMonitor
 from wms2.core.dag_planner import DAGPlanner
+from wms2.core.output_lfn import derive_merged_lfn_bases
+from wms2.core.output_manager import OutputManager
 from wms2.core.workflow_manager import WorkflowManager
 from wms2.db.engine import create_engine, create_session_factory
 from wms2.db.repository import Repository
@@ -41,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--max-files", type=int, default=0, help="Limit DBS file query (0=all)")
     imp.add_argument("--files-per-job", type=int, default=None, help="Override splitting param")
     imp.add_argument("--dry-run", action="store_true", help="Plan DAG but don't submit")
+    imp.add_argument("--ca-bundle", default=None, help="CA bundle file for CERN Grid verification")
     imp.add_argument("--db-url", default=None, help="Override database URL")
     imp.add_argument("--poll-interval", type=int, default=10, help="Monitoring poll interval (seconds)")
     imp.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -65,8 +69,20 @@ def _resolve_cert(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def _make_ssl_context(cert_file: str, key_file: str, ca_path: str) -> ssl.SSLContext:
-    """Build an SSL context with CERN Grid CA + client cert."""
-    ctx = ssl.create_default_context(capath=ca_path)
+    """Build an SSL context with CERN Grid CA + client cert.
+
+    Tries ca_path as a directory (capath=) first, then as a file (cafile=).
+    Falls back to the system default CA bundle if neither works.
+    """
+    import os
+
+    if os.path.isdir(ca_path):
+        ctx = ssl.create_default_context(capath=ca_path)
+    elif os.path.isfile(ca_path):
+        ctx = ssl.create_default_context(cafile=ca_path)
+    else:
+        # Fall back to system defaults
+        ctx = ssl.create_default_context()
     ctx.load_cert_chain(cert_file, key_file)
     return ctx
 
@@ -84,6 +100,8 @@ def build_settings(args: argparse.Namespace, cert_file: str, key_file: str) -> S
         "cleanup_executable": "/bin/true",
         "log_level": args.log_level,
     }
+    if args.ca_bundle:
+        overrides["ssl_ca_path"] = args.ca_bundle
     if args.schedd_name:
         overrides["schedd_name"] = args.schedd_name
     if args.db_url:
@@ -146,6 +164,12 @@ def _normalize_request(reqdata: dict[str, Any]) -> dict[str, Any]:
         if not reqdata.get("SplittingAlgo"):
             reqdata["SplittingAlgo"] = task1.get("SplittingAlgo", "FileBased")
 
+    # Detect GEN workflows (no real input dataset)
+    if rtype == "StepChain":
+        step1 = reqdata.get("Step1", {})
+        if not step1.get("InputDataset") and not step1.get("InputFromOutputModule"):
+            reqdata["_is_gen"] = True
+
     # Default SandboxUrl if missing
     if not reqdata.get("SandboxUrl"):
         reqdata["SandboxUrl"] = "N/A"
@@ -161,6 +185,24 @@ def _normalize_request(reqdata: dict[str, Any]) -> dict[str, Any]:
             reqdata["SplittingParams"] = params
 
     return reqdata
+
+
+def _print_output_files(output_base_dir: str) -> None:
+    """Find and display merged output files on disk."""
+    import glob
+
+    pattern = os.path.join(output_base_dir, "**", "merged.txt")
+    files = sorted(glob.glob(pattern, recursive=True))
+    if not files:
+        print("[5/5] No merged output files found on disk")
+        return
+
+    print(f"[5/5] Merged output files ({len(files)} files):")
+    for f in files:
+        size = os.path.getsize(f)
+        # Show path relative to output_base_dir
+        rel = os.path.relpath(f, output_base_dir)
+        print(f"  {rel}  ({size} bytes)")
 
 
 async def run_import(args: argparse.Namespace) -> None:
@@ -179,7 +221,7 @@ async def run_import(args: argparse.Namespace) -> None:
     print(f"  condor_host:  {settings.condor_host}")
     print(f"  submit_dir:   {settings.submit_base_dir}")
     print(f"  max_files:    {settings.max_input_files or 'all'}")
-    print(f"  executables:  /bin/true (test mode)")
+    print(f"  executables:  trivial test scripts")
     print(f"  dry_run:      {dry_run}")
     print()
 
@@ -222,19 +264,32 @@ async def run_import(args: argparse.Namespace) -> None:
             # But WorkflowManager.import_request calls reqmgr.get_request again,
             # which is fine — it's idempotent. However, it won't have our normalization.
             # So create the workflow row directly instead.
+            output_datasets_info = derive_merged_lfn_bases(reqdata)
+            config_data = {
+                "campaign": reqdata.get("Campaign"),
+                "requestor": reqdata.get("Requestor"),
+                "priority": reqdata.get("RequestPriority"),
+                "request_type": reqdata.get("RequestType"),
+                "output_datasets": output_datasets_info,
+                "merged_lfn_base": reqdata.get("MergedLFNBase", "/store/mc"),
+            }
+            if reqdata.get("_is_gen"):
+                config_data["_is_gen"] = True
+                config_data["request_num_events"] = reqdata.get("RequestNumEvents", 0)
             workflow = await repo.create_workflow(
                 request_name=request_name,
                 input_dataset=reqdata["InputDataset"],
                 splitting_algo=reqdata["SplittingAlgo"],
                 splitting_params=reqdata.get("SplittingParams", {}),
                 sandbox_url=reqdata.get("SandboxUrl", "N/A"),
-                config_data={
-                    "campaign": reqdata.get("Campaign"),
-                    "requestor": reqdata.get("Requestor"),
-                    "priority": reqdata.get("RequestPriority"),
-                    "request_type": reqdata.get("RequestType"),
-                },
+                config_data=config_data,
             )
+            if output_datasets_info:
+                print(f"      outputs:     {len(output_datasets_info)} datasets")
+                for ods in output_datasets_info:
+                    print(f"                   {ods['dataset_name']}")
+            else:
+                print("      outputs:     (none detected from request)")
 
             # Override splitting_params if --files-per-job given
             if args.files_per_job is not None:
@@ -251,71 +306,18 @@ async def run_import(args: argparse.Namespace) -> None:
             dp = DAGPlanner(repo, dbs, rucio, condor, settings)
 
             if dry_run:
-                print("[2/5] Planning production DAG (dry-run)...")
-                from wms2.core.dag_planner import PilotMetrics, _generate_dag_files, _plan_merge_groups
-                from wms2.core.splitters import InputFile, get_splitter
+                print("[2/5] Planning production DAG (dry-run, no HTCondor)...")
+                # Use a mock condor adapter for dry-run so plan_production_dag
+                # writes DAG files but doesn't actually submit
+                from wms2.adapters.mock import MockCondorAdapter as _MockCondor
 
-                metrics = PilotMetrics()
-                limit = settings.max_input_files if settings.max_input_files > 0 else 0
-                raw_files = await dbs.get_files(workflow.input_dataset, limit=limit)
-                if not raw_files:
-                    print("ERROR: No input files found for dataset")
-                    return
-
-                lfns = [f["logical_file_name"] for f in raw_files]
-                print(f"      input files: {len(raw_files)}")
-
-                try:
-                    replica_map = await rucio.get_replicas(lfns)
-                except Exception as exc:
-                    logger.warning("Rucio replica lookup failed (%s), using empty locations", exc)
-                    print("      (Rucio unavailable — using empty site locations)")
-                    replica_map = {}
-                input_files = [
-                    InputFile(
-                        lfn=f["logical_file_name"],
-                        file_size=f.get("file_size", 0),
-                        event_count=f.get("event_count", 0),
-                        locations=replica_map.get(f["logical_file_name"], []),
-                    )
-                    for f in raw_files
-                ]
-
-                splitter = get_splitter(
-                    workflow.splitting_algo,
-                    workflow.splitting_params or {},
-                )
-                nodes = splitter.split(input_files)
-                merge_groups = _plan_merge_groups(
-                    nodes,
-                    output_size_per_event_kb=metrics.output_size_per_event_kb,
-                    target_kb=settings.target_merged_size_kb,
-                )
-
-                submit_dir = os.path.join(settings.submit_base_dir, str(workflow.id))
-                os.makedirs(submit_dir, exist_ok=True)
-                executables = {
-                    "processing": settings.processing_executable,
-                    "merge": settings.merge_executable,
-                    "cleanup": settings.cleanup_executable,
-                }
-                dag_file_path = _generate_dag_files(
-                    submit_dir=submit_dir,
-                    workflow_id=str(workflow.id),
-                    merge_groups=merge_groups,
-                    sandbox_url=workflow.sandbox_url,
-                    category_throttles=workflow.category_throttles or {
-                        "Processing": 5000, "Merge": 100, "Cleanup": 50,
-                    },
-                    executables=executables,
-                )
-
-                total_proc = sum(len(mg.processing_nodes) for mg in merge_groups)
+                dp_dry = DAGPlanner(repo, dbs, rucio, _MockCondor(), settings)
+                dag = await dp_dry.plan_production_dag(workflow)
                 await session.commit()
 
-                print(f"      proc nodes:  {total_proc}")
-                print(f"      merge grps:  {len(merge_groups)}")
-                print(f"      dag file:    {dag_file_path}")
+                print(f"      dag_file:    {dag.dag_file_path}")
+                print(f"      nodes:       {dag.total_nodes}")
+                print(f"      work_units:  {dag.total_work_units}")
                 print()
                 print("[3/5] Skipping HTCondor submission (dry-run)")
                 print("[4/5] Skipping monitoring (dry-run)")
@@ -338,12 +340,23 @@ async def run_import(args: argparse.Namespace) -> None:
             # 3. Monitor
             print(f"[3/5] Monitoring DAG (poll every {args.poll_interval}s)...")
             dm = DAGMonitor(repo, condor)
+            # OutputManager with mock DBS/Rucio for output lifecycle
+            om = OutputManager(repo, _MockDBS(), _MockRucio(), settings)
             terminal = {DAGStatus.COMPLETED, DAGStatus.FAILED, DAGStatus.PARTIAL}
 
             while True:
                 await asyncio.sleep(args.poll_interval)
                 dag = await repo.get_dag(dag.id)
+                workflow = await repo.get_workflow(workflow.id)
                 result = await dm.poll_dag(dag)
+
+                # Process completed work units through output manager
+                if result.newly_completed_work_units:
+                    for wu in result.newly_completed_work_units:
+                        print(f"    completed work unit: {wu['group_name']}")
+                        await om.handle_merge_completion(workflow, wu)
+                    await om.process_outputs_for_workflow(workflow.id)
+
                 await session.commit()
 
                 print(
@@ -353,12 +366,26 @@ async def run_import(args: argparse.Namespace) -> None:
                     f"held={result.nodes_held}"
                 )
 
-                if result.newly_completed_work_units:
-                    for wu in result.newly_completed_work_units:
-                        print(f"    completed work unit: {wu['group_name']}")
-
                 if result.status in terminal:
+                    # Process any final outputs
+                    if result.newly_completed_work_units:
+                        await om.process_outputs_for_workflow(workflow.id)
+                        await session.commit()
                     break
+
+            # Print output summary
+            print()
+            output_summary = await om.get_output_summary(workflow.id)
+            if output_summary:
+                print("[4/5] Output summary:")
+                for status, count in sorted(output_summary.items()):
+                    print(f"  {status}: {count}")
+            else:
+                print("[4/5] No output records created")
+
+            # List merged output files on disk
+            print()
+            _print_output_files(settings.output_base_dir)
 
             print()
             print(f"=== DAG finished: {result.status.value} ===")

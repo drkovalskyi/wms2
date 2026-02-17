@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from wms2.adapters.base import CondorAdapter
 from wms2.config import Settings
 from wms2.db.repository import Repository
-from wms2.models.enums import DAGStatus, RequestStatus
+from wms2.models.enums import DAGStatus, RequestStatus, WorkflowStatus
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,15 @@ class RequestLifecycleManager:
         if workflow.dag_id:
             dag = await self.db.get_dag(workflow.dag_id)
             if dag and dag.rescue_dag_path and dag.status == DAGStatus.READY.value:
+                cluster_id, schedd = await self.condor.submit_dag(
+                    dag.rescue_dag_path or dag.dag_file_path
+                )
+                await self.db.update_dag(
+                    dag.id,
+                    dagman_cluster_id=cluster_id,
+                    schedd_name=schedd,
+                    status=DAGStatus.SUBMITTED.value,
+                )
                 await self.transition(request, RequestStatus.ACTIVE)
                 return
 
@@ -178,7 +187,17 @@ class RequestLifecycleManager:
 
         if dag.status in (DAGStatus.SUBMITTED.value, DAGStatus.RUNNING.value):
             result = await self.dag_monitor.poll_dag(dag)
+
+            # Process completed work units through output manager
+            if result.newly_completed_work_units and self.output_manager:
+                for wu in result.newly_completed_work_units:
+                    await self.output_manager.handle_merge_completion(workflow, wu)
+                await self.output_manager.process_outputs_for_workflow(workflow.id)
+
             if result.status == DAGStatus.COMPLETED:
+                # Process any final outputs before transitioning
+                if self.output_manager:
+                    await self.output_manager.process_outputs_for_workflow(workflow.id)
                 await self.transition(request, RequestStatus.COMPLETED)
                 return
             elif result.status == DAGStatus.PARTIAL:
@@ -239,7 +258,22 @@ class RequestLifecycleManager:
         if not request:
             return
         workflow = await self.db.get_workflow_by_request(request_name)
-        if not workflow or not workflow.dag_id:
+        if not workflow:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # PILOT_RUNNING: remove pilot job, no DAG to stop
+        if request.status == RequestStatus.PILOT_RUNNING.value and workflow.pilot_cluster_id:
+            await self.condor.remove_job(
+                schedd_name=workflow.pilot_schedd, cluster_id=workflow.pilot_cluster_id
+            )
+            await self.db.update_workflow(workflow.id, status=WorkflowStatus.STOPPING.value)
+            await self.transition(request, RequestStatus.STOPPING)
+            return
+
+        # ACTIVE: remove DAGMan job
+        if not workflow.dag_id:
             return
         dag = await self.db.get_dag(workflow.dag_id)
         if not dag:
@@ -248,8 +282,8 @@ class RequestLifecycleManager:
         await self.condor.remove_job(
             schedd_name=dag.schedd_name, cluster_id=dag.dagman_cluster_id
         )
-        now = datetime.now(timezone.utc)
         await self.db.update_dag(dag.id, stop_requested_at=now, stop_reason=reason)
+        await self.db.update_workflow(workflow.id, status=WorkflowStatus.STOPPING.value)
         await self.transition(request, RequestStatus.STOPPING)
 
     async def _prepare_recovery(self, request, workflow, dag):

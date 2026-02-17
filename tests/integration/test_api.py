@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -128,3 +130,50 @@ async def test_status_endpoint(api_client):
     resp = await api_client.get("/api/v1/status")
     assert resp.status_code == 200
     assert "requests_by_status" in resp.json()
+
+
+async def test_stop_active_request(api_app, api_client):
+    """POST stop on active request returns correct response."""
+    from wms2.db.repository import Repository
+
+    # Create request
+    await api_client.post("/api/v1/requests", json=_valid_request_body())
+
+    # Set status to active directly via repository
+    async with api_app.state.session_factory() as session:
+        repo = Repository(session)
+        await repo.update_request("api-test-001", status="active")
+        await session.commit()
+
+    # Install a mock lifecycle manager
+    mock_lm = MagicMock()
+    mock_lm.initiate_clean_stop = AsyncMock()
+    api_app.state.lifecycle_manager = mock_lm
+
+    resp = await api_client.post(
+        "/api/v1/requests/api-test-001/stop",
+        json={"reason": "integration test"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["request_name"] == "api-test-001"
+    assert data["status"] == "stopping"
+    assert data["previous_status"] == "active"
+    assert data["stop_reason"] == "integration test"
+
+    mock_lm.initiate_clean_stop.assert_called_once_with("api-test-001", "integration test")
+
+
+async def test_stop_non_active_request(api_app, api_client):
+    """POST stop on non-active request returns 400."""
+    await api_client.post("/api/v1/requests", json=_valid_request_body())
+
+    # Install a mock lifecycle manager (shouldn't be called)
+    mock_lm = MagicMock()
+    mock_lm.initiate_clean_stop = AsyncMock()
+    api_app.state.lifecycle_manager = mock_lm
+
+    # Request is in "new" status, not stoppable
+    resp = await api_client.post("/api/v1/requests/api-test-001/stop")
+    assert resp.status_code == 400
+    mock_lm.initiate_clean_stop.assert_not_called()

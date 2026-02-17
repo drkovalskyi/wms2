@@ -34,6 +34,8 @@ def mock_repository():
     repo.list_workflows = AsyncMock(return_value=[])
     repo.list_dags = AsyncMock(return_value=[])
     repo.get_output_datasets = AsyncMock(return_value=[])
+    repo.create_output_dataset = AsyncMock()
+    repo.update_output_dataset = AsyncMock()
     repo.count_requests_by_status = AsyncMock(return_value={})
     return repo
 

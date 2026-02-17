@@ -137,41 +137,21 @@ class DAGPlanner:
         if metrics is None:
             metrics = PilotMetrics()  # defaults
 
-        # 2. Fetch input files from DBS
-        limit = self.settings.max_input_files if self.settings.max_input_files > 0 else 0
-        raw_files = await self.dbs.get_files(workflow.input_dataset, limit=limit)
-        if not raw_files:
+        config = workflow.config_data or {}
+        is_gen = config.get("_is_gen", False)
+
+        if is_gen:
+            # GEN workflow: no input files, create synthetic event-range nodes
+            nodes = self._plan_gen_nodes(workflow, config)
+        else:
+            nodes = await self._plan_file_based_nodes(workflow)
+
+        if not nodes:
             raise ValueError(
-                f"No input files for dataset {workflow.input_dataset}"
+                f"No processing nodes generated for workflow {workflow.id}"
             )
 
-        # 3. Get replica locations from Rucio
-        lfns = [f["logical_file_name"] for f in raw_files]
-        try:
-            replica_map = await self.rucio.get_replicas(lfns)
-        except Exception as exc:
-            logger.warning("Rucio replica lookup failed (%s), using empty locations", exc)
-            replica_map = {}
-
-        # 4. Convert to InputFile objects
-        input_files = [
-            InputFile(
-                lfn=f["logical_file_name"],
-                file_size=f.get("file_size", 0),
-                event_count=f.get("event_count", 0),
-                locations=replica_map.get(f["logical_file_name"], []),
-            )
-            for f in raw_files
-        ]
-
-        # 5. Split via appropriate splitter
-        splitter = get_splitter(
-            workflow.splitting_algo,
-            workflow.splitting_params or {},
-        )
-        nodes = splitter.split(input_files)
-
-        # 6. Plan merge groups
+        # Plan merge groups
         merge_groups = _plan_merge_groups(
             nodes,
             output_size_per_event_kb=metrics.output_size_per_event_kb,
@@ -186,6 +166,9 @@ class DAGPlanner:
             "merge": self.settings.merge_executable,
             "cleanup": self.settings.cleanup_executable,
         }
+        # Extract output dataset info from workflow config_data
+        config = workflow.config_data or {}
+        output_datasets = config.get("output_datasets")
         dag_file_path = _generate_dag_files(
             submit_dir=submit_dir,
             workflow_id=str(workflow.id),
@@ -195,6 +178,8 @@ class DAGPlanner:
                 "Processing": 5000, "Merge": 100, "Cleanup": 50,
             },
             executables=executables,
+            output_datasets=output_datasets,
+            output_base_dir=self.settings.output_base_dir,
         )
 
         # 8. Count totals
@@ -245,6 +230,88 @@ class DAGPlanner:
         )
         return dag
 
+    async def _plan_file_based_nodes(self, workflow) -> list[DAGNodeSpec]:
+        """Fetch input files from DBS and split them into processing nodes."""
+        limit = self.settings.max_input_files if self.settings.max_input_files > 0 else 0
+        raw_files = await self.dbs.get_files(workflow.input_dataset, limit=limit)
+        if not raw_files:
+            return []
+
+        lfns = [f["logical_file_name"] for f in raw_files]
+        try:
+            replica_map = await self.rucio.get_replicas(lfns)
+        except Exception as exc:
+            logger.warning("Rucio replica lookup failed (%s), using empty locations", exc)
+            replica_map = {}
+
+        input_files = [
+            InputFile(
+                lfn=f["logical_file_name"],
+                file_size=f.get("file_size", 0),
+                event_count=f.get("event_count", 0),
+                locations=replica_map.get(f["logical_file_name"], []),
+            )
+            for f in raw_files
+        ]
+
+        splitter = get_splitter(
+            workflow.splitting_algo,
+            workflow.splitting_params or {},
+        )
+        return splitter.split(input_files)
+
+    def _plan_gen_nodes(self, workflow, config: dict) -> list[DAGNodeSpec]:
+        """Create synthetic processing nodes for GEN workflows (no input files).
+
+        Uses RequestNumEvents and EventsPerJob from the request to compute
+        the number of event-generation jobs needed.
+        """
+        import math
+
+        params = workflow.splitting_params or {}
+        events_per_job = params.get("events_per_job") or params.get("eventsPerJob") or 100_000
+        total_events = config.get("request_num_events") or 0
+        max_files = self.settings.max_input_files
+
+        if total_events <= 0:
+            logger.warning("GEN workflow %s has no RequestNumEvents, using 1 node", workflow.id)
+            total_events = events_per_job
+
+        num_jobs = math.ceil(total_events / events_per_job)
+
+        # Respect --max-files limit (reinterpreted as max jobs for GEN)
+        if max_files > 0:
+            num_jobs = min(num_jobs, max_files)
+
+        nodes: list[DAGNodeSpec] = []
+        for i in range(num_jobs):
+            first_event = i * events_per_job + 1
+            last_event = min((i + 1) * events_per_job, total_events)
+            actual_events = last_event - first_event + 1
+
+            # Create a synthetic InputFile so the rest of the pipeline works
+            synthetic_file = InputFile(
+                lfn=f"synthetic://gen/events_{first_event}_{last_event}",
+                file_size=0,
+                event_count=actual_events,
+                locations=[],
+            )
+            nodes.append(
+                DAGNodeSpec(
+                    node_index=i,
+                    input_files=[synthetic_file],
+                    first_event=first_event,
+                    last_event=last_event,
+                    events_per_job=actual_events,
+                )
+            )
+
+        logger.info(
+            "GEN workflow %s: %d nodes, %d events/job, %d total events",
+            workflow.id, num_jobs, events_per_job, total_events,
+        )
+        return nodes
+
 
 # ── Merge Group Planning ───────────────────────────────────────
 
@@ -288,6 +355,8 @@ def _generate_dag_files(
     sandbox_url: str,
     category_throttles: dict[str, int],
     executables: dict[str, str] | None = None,
+    output_datasets: list[dict] | None = None,
+    output_base_dir: str = "",
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -300,11 +369,14 @@ def _generate_dag_files(
     _write_elect_site_script(str(submit_path / "elect_site.sh"))
     _write_pin_site_script(str(submit_path / "pin_site.sh"))
     _write_post_script(str(submit_path / "post_script.sh"))
+    _write_proc_script(str(submit_path / "wms2_proc.sh"))
+    _write_merge_script(str(submit_path / "wms2_merge.py"))
 
     # Generate outer DAG
     outer_lines = [
         f"# WMS2-generated DAG for workflow {workflow_id}",
         f"CONFIG {submit_path / 'dagman.config'}",
+        f"NODE_STATUS_FILE {submit_path / 'workflow.dag.status'}",
         "",
     ]
 
@@ -313,7 +385,7 @@ def _generate_dag_files(
         mg_dir = submit_path / mg_name
         mg_dir.mkdir(parents=True, exist_ok=True)
 
-        outer_lines.append(f"SUBDAG EXTERNAL {mg_name} {mg_dir / 'group.dag'}")
+        outer_lines.append(f"SUBDAG EXTERNAL {mg_name} {mg_dir / 'group.dag'} DIR {mg_dir}")
 
         # Generate merge group sub-DAG
         _generate_group_dag(
@@ -323,6 +395,8 @@ def _generate_dag_files(
             sandbox_url=sandbox_url,
             category_throttles=category_throttles,
             executables=executables,
+            output_datasets=output_datasets,
+            output_base_dir=output_base_dir,
         )
 
     # Category throttling for merge groups
@@ -344,12 +418,20 @@ def _generate_group_dag(
     sandbox_url: str,
     category_throttles: dict[str, int],
     executables: dict[str, str] | None = None,
+    output_datasets: list[dict] | None = None,
+    output_base_dir: str = "",
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
     exe = executables or {}
     proc_exe = exe.get("processing", "run_payload.sh")
     merge_exe = exe.get("merge", "run_merge.sh")
     cleanup_exe = exe.get("cleanup", "run_cleanup.sh")
+
+    # In test mode (/bin/true), use the generated trivial scripts instead
+    if proc_exe == "/bin/true":
+        proc_exe = str(submit_dir / "wms2_proc.sh")
+    if merge_exe == "/bin/true":
+        merge_exe = str(submit_dir / "wms2_merge.py")
 
     proc_nodes = merge_group.processing_nodes
     lines: list[str] = [
@@ -390,11 +472,28 @@ def _generate_group_dag(
         )
         lines.append("")
 
-    # Merge node
+    # Merge node — write output info to a file, reference it by path in arguments
+    merge_args = f"--sandbox {sandbox_url}"
+    if output_datasets and output_base_dir:
+        output_info = {
+            "output_datasets": [
+                {
+                    "dataset_name": d.get("dataset_name", ""),
+                    "merged_lfn_base": d.get("merged_lfn_base", ""),
+                    "data_tier": d.get("data_tier", ""),
+                }
+                for d in output_datasets
+            ],
+            "output_base_dir": output_base_dir,
+            "group_index": merge_group.group_index,
+        }
+        output_info_path = str(group_dir / "output_info.json")
+        _write_file(output_info_path, json.dumps(output_info, indent=2))
+        merge_args += f" --output-info {output_info_path}"
     _write_submit_file(
         str(group_dir / "merge.sub"),
         executable=merge_exe,
-        arguments=f"--sandbox {sandbox_url}",
+        arguments=merge_args,
         description="merge node",
     )
     lines.append("JOB merge merge.sub")
@@ -495,17 +594,18 @@ def _write_elect_site_script(path: str) -> None:
     _write_file(path, """\
 #!/bin/bash
 # elect_site.sh — POST script for landing node
+# Extracts GLIDEIN_CMSSite from the completed landing job.
+# Falls back to "local" for dev environments without glidein infrastructure.
 ELECTED_SITE_FILE=$1
 CLUSTER_ID=$(condor_q -format "%d.0" ClusterId \\
     -constraint 'DAGNodeName=="landing"' 2>/dev/null)
 SITE=$(condor_history $CLUSTER_ID -limit 1 -af MATCH_GLIDEIN_CMSSite 2>/dev/null)
-if [ -n "$SITE" ]; then
+if [ -n "$SITE" ] && [ "$SITE" != "undefined" ]; then
     echo "$SITE" > "$ELECTED_SITE_FILE"
-    exit 0
 else
-    echo "ERROR: Could not determine site from landing job" >&2
-    exit 1
+    echo "local" > "$ELECTED_SITE_FILE"
 fi
+exit 0
 """)
     os.chmod(path, 0o755)
 
@@ -533,6 +633,111 @@ if [ "$RETURN_CODE" != "0" ]; then
 fi
 exit $RETURN_CODE
 """)
+    os.chmod(path, 0o755)
+
+
+def _write_proc_script(path: str) -> None:
+    """Generate a trivial processing script that reports job metadata to stdout.
+
+    HTCondor captures stdout in proc_NNNNNN.out, which the merge script later
+    reads and concatenates into the merged output file.
+    """
+    _write_file(path, """\
+#!/bin/bash
+# wms2_proc.sh — Trivial processing job
+# Writes job metadata to stdout (captured as proc_NNNNNN.out by HTCondor).
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | pid=$$ | host=$(hostname) | args: $*"
+""")
+    os.chmod(path, 0o755)
+
+
+def _write_merge_script(path: str) -> None:
+    """Generate a trivial merge script that reads proc outputs and writes merged files.
+
+    Reads all proc_*.out files from the merge group directory, then writes
+    one merged text file per output dataset to the local output area.
+    """
+    # Use a regular string — inner \n become literal newlines in the file,
+    # inner f-strings are just text (not interpreted by the outer Python).
+    _write_file(path, '''#!/usr/bin/env python3
+"""wms2_merge.py — Trivial merge job.
+
+Reads processing job outputs (proc_*.out) from the merge group directory,
+writes one merged text file per output dataset to the local output area.
+"""
+import glob
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+# Parse arguments
+output_info_path = None
+i = 1
+while i < len(sys.argv):
+    if sys.argv[i] == "--output-info" and i + 1 < len(sys.argv):
+        output_info_path = sys.argv[i + 1]
+        i += 2
+    else:
+        i += 1
+
+if not output_info_path:
+    print("ERROR: --output-info not specified", file=sys.stderr)
+    sys.exit(1)
+
+with open(output_info_path) as f:
+    info = json.load(f)
+
+group_dir = os.path.dirname(output_info_path)
+output_base_dir = info["output_base_dir"]
+group_index = info["group_index"]
+datasets = info.get("output_datasets", [])
+
+# Collect processing job outputs (one line per job)
+proc_files = sorted(glob.glob(os.path.join(group_dir, "proc_*.out")))
+proc_entries = []
+for pf in proc_files:
+    node_name = os.path.splitext(os.path.basename(pf))[0]
+    with open(pf) as f:
+        content = f.read().strip()
+    if content:
+        proc_entries.append(f"{node_name} | {content}")
+
+# Write merged output for each output dataset
+now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+for ds in datasets:
+    lfn_base = ds.get("merged_lfn_base", "")
+    tier = ds.get("data_tier", "unknown")
+    ds_name = ds.get("dataset_name", "")
+
+    # Convert LFN to local path: /store/X/... -> output_base_dir/X/...
+    if lfn_base.startswith("/store/"):
+        relative = lfn_base[len("/store/"):]
+    else:
+        relative = lfn_base.lstrip("/")
+
+    out_dir = os.path.join(output_base_dir, relative, f"{group_index:06d}")
+    os.makedirs(out_dir, exist_ok=True)
+    out_file = os.path.join(out_dir, "merged.txt")
+
+    with open(out_file, "w") as fout:
+        header = [
+            "# WMS2 Merged Output",
+            f"# Dataset:     {ds_name}",
+            f"# Data tier:   {tier}",
+            f"# Merge group: mg_{group_index:06d}",
+            f"# Generated:   {now}",
+            f"# Host:        {os.uname().nodename}",
+            f"# Jobs merged: {len(proc_entries)}",
+            "#",
+        ]
+        for line in header:
+            fout.write(line + "\\n")
+        for entry in proc_entries:
+            fout.write(entry + "\\n")
+
+    print(f"Wrote: {out_file} ({len(proc_entries)} entries)")
+''')
     os.chmod(path, 0o755)
 
 
