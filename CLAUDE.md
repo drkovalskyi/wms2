@@ -8,6 +8,7 @@ WMS2 is the next-generation CMS Workload Management System, replacing WMCore/WMA
 
 ```
 docs/spec.md                    — The specification document (the primary artifact)
+IMPLEMENTATION_LOG.md           — Development log (what was built, decisions, verification)
 scripts/check-env.sh            — Environment verification script
 README.md                       — Project readme
 LICENSE                         — License file
@@ -67,6 +68,10 @@ This is the main deliverable. It is a comprehensive design spec (~3100 lines) co
 - **Single state machine owner.** The Request Lifecycle Manager is the only component that transitions request status. Other components are stateless workers called by it. Never add independent polling loops to components.
 - **Site selection belongs to HTCondor.** WMS2 does not do load balancing or site assignment. The landing node mechanism lets HTCondor pick sites via normal negotiation. Never add site-selection logic to the DAG Planner.
 - **One DAG per workflow from WMS2's perspective.** WMS2 submits and monitors one top-level DAG. Merge group sub-DAGs are DAGMan's internal concern.
+
+## When committing changes
+
+- **Update `IMPLEMENTATION_LOG.md`** with every significant commit. Add a new section or append to the current phase with: what was built/changed, design decisions, verification steps, and known issues.
 
 ## When editing the spec
 
