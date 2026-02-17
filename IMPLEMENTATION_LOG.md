@@ -327,3 +327,237 @@ Splitter implementations (pure stateless computation):
 - DAG Submission — Move DAGs from READY → SUBMITTED → RUNNING
 - Output Manager — Detect completed merge groups, DBS registration, Rucio transfers
 - Error Handler — Failure classification, rescue DAG decisions
+
+---
+
+# Phase 3 — HTCondor Submission + DAG Monitoring
+
+**Date**: 2026-02-14
+**Spec Version**: 2.4.0
+**Phase**: 3 — Real HTCondor Adapter + DAG Monitor
+
+---
+
+## What Was Built
+
+### Real HTCondor Adapter (`adapters/condor.py`)
+Wraps synchronous `htcondor2` Python bindings in `asyncio.to_thread()`:
+- `submit_job(submit_file)` — Reads submit file, creates `htcondor2.Submit`, submits via `Schedd.submit()`
+- `submit_dag(dag_file)` — Uses `htcondor2.Submit.from_dag()` + `Schedd.submit()`
+- `query_job(schedd_name, cluster_id)` — `Schedd.query()` with DAG status projection (DAG_NodesTotal, DAG_NodesDone, etc.)
+- `check_job_completed(cluster_id, schedd_name)` — Checks queue first, then history for `JobStatus==4`
+- `remove_job(schedd_name, cluster_id)` — `Schedd.act(JobAction.Remove, ...)`
+- `ping_schedd(schedd_name)` — Lightweight `query(constraint="false", limit=1)`
+
+Constructor: `Collector(condor_host)` → `locate(DaemonType.Schedd)` → `Schedd(ad)`.
+
+### DAG Monitor (`core/dag_monitor.py`)
+
+**Data classes**:
+- `NodeSummary` — Aggregate counts: idle, running, done, failed, held + per-node status map
+- `DAGPollResult` — dag_id, status, node counts, newly_completed_work_units
+
+**Main entry point** `poll_dag(dag)`:
+1. Query HTCondor for DAGMan process (`condor.query_job`)
+2. If alive → parse `.status` JSON file for node progress, detect newly completed merge group SUBDAGs, update DAG + workflow rows
+3. If gone → read `.metrics` file for final counts, determine terminal status (COMPLETED / PARTIAL / FAILED), update rows with `completed_at` timestamp
+
+**Status file parsing**:
+- `_parse_dagman_status(path)` — Reads `.status` JSON, maps node statuses to counts (done/success → done, error/failed → failed, running/submitted → running, held → held, else → idle)
+- `_parse_dagman_metrics(path)` — Reads `.metrics` JSON for final aggregate counts
+
+**Work unit detection**:
+- `_detect_completed_work_units(dag, summary)` — Finds `mg_NNNNNN` nodes newly in "done" state, reads merge manifest if available
+- `_read_merge_manifest(dag, group_name)` — Reads `mg_NNNNNN/merge_output.json`
+
+**Completion handling** `_handle_dag_completion(dag)`:
+- Falls back from metrics to status file if metrics missing
+- Terminal status logic: no failures → COMPLETED, mixed → PARTIAL, all failed → FAILED
+
+### Lifecycle Manager Integration
+- `_handle_active` calls `dag_monitor.poll_dag()` when DAG exists
+- DAG Monitor passed as constructor arg alongside other Phase 2+ components
+
+### Tests
+
+**26 new tests (all passing)**:
+
+| File | Tests | What |
+|---|---|---|
+| `test_condor_adapter.py` | 10 | submit_dag, submit_job, query (found/not), check_completed (running/history/gone), remove, ping (success/fail) — all with mocked htcondor2 |
+| `test_dag_monitor.py` | 16 | Status parsing (valid/missing/failed/held), metrics parsing, work unit detection (new/already-reported/non-mg), poll_dag (alive→running, gone→completed/partial/failed), newly completed units, handle_dag_completion, lifecycle integration |
+| `test_condor_submit.py` (integration) | 2 | Submit+query+remove trivial DAG, DAGPlanner end-to-end with real condor — requires `WMS2_CONDOR_HOST` env var |
+
+**Total: 96 tests passing** (93 unit + 3 integration)
+
+---
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/unit/ -v` — 93 tests pass
+3. `pytest tests/integration/test_dag_planner.py -v` — 3 tests pass
+4. `pytest tests/unit/ tests/integration/test_dag_planner.py -v` — 96 tests pass
+5. HTCondor integration tests: `WMS2_CONDOR_HOST=localhost:9618 pytest tests/integration/test_condor_submit.py -v`
+
+## Design Decisions
+
+- **asyncio.to_thread() for htcondor2**: The Python bindings are synchronous. Wrapping in `to_thread()` keeps the main event loop responsive while HTCondor calls block.
+- **DAGMan status via .status file**: Parsing the JSON status file is more reliable than querying individual node statuses through HTCondor. The file is updated by DAGMan itself.
+- **Completion detection is two-tier**: Check queue first (fast), then history (authoritative). If not in either, treat as completed — DAGMan may have exited before history was written.
+- **Work unit granularity**: Only `mg_NNNNNN` nodes in the outer DAG represent work units. Inner nodes (landing, proc, merge, cleanup) are DAGMan's concern.
+
+---
+
+# Phase 4 — CLI Runner + Real Service Integration
+
+**Date**: 2026-02-17
+**Spec Version**: 2.4.0
+**Phase**: 4 — CLI, Adapter Fixes for Production Services, Dev Infrastructure
+
+---
+
+## What Was Built
+
+### CLI Runner (`cli.py`, `__main__.py`)
+
+**Entry point**: `python -m wms2 import <request_name> [options]`
+
+**Options**:
+| Flag | Default | Description |
+|---|---|---|
+| `--proxy` | `/tmp/x509up_u$UID` | X.509 proxy cert (used as both cert and key) |
+| `--cert`, `--key` | — | Separate cert/key paths (alternative to --proxy) |
+| `--condor-host` | `localhost:9618` | HTCondor collector address |
+| `--schedd-name` | auto-discover | Explicit schedd name |
+| `--submit-dir` | `/tmp/wms2` | DAG file output directory |
+| `--max-files N` | `0` (all) | Limit DBS file query |
+| `--files-per-job N` | from request | Override splitting parameter |
+| `--dry-run` | off | Plan DAG but don't submit to HTCondor |
+| `--db-url` | from settings | Override database URL |
+| `--poll-interval` | `10` | Monitoring poll interval in seconds |
+| `--log-level` | `INFO` | Logging verbosity |
+
+**Pipeline** (`run_import`):
+1. Resolve X.509 credentials (proxy auto-detection or explicit cert/key)
+2. Build SSL context with CERN Grid CA (`/etc/grid-security/certificates`)
+3. Connect to PostgreSQL, build real adapters (ReqMgr2, DBS, Rucio, HTCondor)
+4. Fetch request from ReqMgr2, normalize StepChain/TaskChain fields
+5. Create request + workflow rows in DB
+6. Plan production DAG (DBS file fetch → splitting → DAG file generation)
+7. If `--dry-run`: stop here with summary
+8. Submit DAG to HTCondor, monitor with `DAGMonitor.poll_dag()` until terminal
+
+**StepChain/TaskChain normalization** (`_normalize_request`):
+- StepChain: `InputDataset` from Step1 or first `OutputDatasets` entry; `SplittingAlgo` from Step1
+- TaskChain: `InputDataset` from Task1 or first `OutputDatasets` entry; `SplittingAlgo` from Task1
+- Default `SandboxUrl` to "N/A" if missing
+- Build `SplittingParams` from scattered fields (`FilesPerJob`, `EventsPerJob`, `LumisPerJob`)
+
+**Executables overridden to `/bin/true`** in CLI mode — all jobs are trivial for local testing.
+
+### Adapter Fixes for Real CMS Services
+
+**ReqMgr2Client** (`adapters/reqmgr2.py`):
+- Fixed URL path duplication: base URL `https://cmsweb.cern.ch/reqmgr2` already has `/reqmgr2`, so request paths changed from `/reqmgr2/data/request/` to `/data/request/`
+- Fixed response unwrapping: ReqMgr2 returns `{result: [{request_name: {fields}}]}` — must extract inner dict by checking `if request_name in row`
+- Added `verify` parameter for custom SSL context
+
+**DBSClient** (`adapters/dbs.py`):
+- Removed `limit` from DBS query params — DBS `/files` endpoint returns HTTP 400 if `limit` is passed. Files are now sliced in Python after fetch.
+- Added `verify` parameter for custom SSL context
+
+**RucioClient** (`adapters/rucio.py`):
+- Added `verify` parameter for custom SSL context
+- Note: Rucio auth still fails with proxy cert DN. Adapter falls back to empty replica map in DAG planner.
+
+### Config Additions (`config.py`)
+
+```python
+# Job executables (override to /bin/true for local testing)
+processing_executable: str = "run_payload.sh"
+merge_executable: str = "run_merge.sh"
+cleanup_executable: str = "run_cleanup.sh"
+
+# Input file limit (0 = no limit, >0 = cap DBS file query)
+max_input_files: int = 0
+
+# SSL
+ssl_ca_path: str = "/etc/grid-security/certificates"
+```
+
+### DAG Planner Changes (`core/dag_planner.py`)
+- Executables threaded from `settings` through `plan_production_dag()` → `_generate_dag_files()` → `_generate_group_dag()`
+- `max_input_files` passed to DBS query with Python-side slicing
+- Rucio failures caught with try/except, falls back to empty replica map (non-fatal)
+
+### Dev Infrastructure Files
+
+**`condor/config`** — HTCondor container config:
+- Fast negotiation intervals (10s) for testing
+- `ALLOW_WRITE/READ/ADMINISTRATOR/NEGOTIATOR = *`
+- `SEC_DEFAULT_AUTHENTICATION = OPTIONAL` (required for unauthenticated host submissions)
+- `DAGMAN_USE_DIRECT_SUBMIT = True`
+
+**`docker-compose.yml`** — Service definitions:
+- `db`: PostgreSQL 15, port 5432, healthcheck
+- `condor`: htcondor/mini, port 9618, mounts `condor/config` as `99-wms2.conf`
+- `wms2`: App build, port 8000, depends on db
+
+**`install.sh`** — Native setup script (RHEL 9):
+- HTCondor 25.x from official repo (EPEL + CRB required)
+- Personal condor config (all daemons on localhost, shared port 9618)
+- PostgreSQL setup (commented out — instructions for manual steps)
+
+---
+
+## Real Service Testing
+
+Tested with workflow `cmsunified_task_TSG-Run3Summer23BPixGS-00097__v1_T_231129_092644_4472`:
+
+**Dry-run (verified working)**:
+```
+python -m wms2 import cmsunified_task_TSG-Run3Summer23BPixGS-00097__v1_T_231129_092644_4472 \
+  --dry-run --max-files 10 --proxy /tmp/x509up_u11792
+```
+- ReqMgr2 fetch: OK (StepChain, normalized successfully)
+- DBS files: OK (10 files fetched, sliced in Python)
+- Rucio: Falls back to empty map (auth issue)
+- DAG generation: OK (submit files with `executable = /bin/true`)
+
+**Full submit**: NOT YET TESTED — was blocked on HTCondor container auth on vocms118.
+
+---
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/unit/ tests/integration/test_dag_planner.py -v` — 96 tests pass
+3. Dry-run: `python -m wms2 import <request_name> --dry-run --max-files 10`
+4. Full run: `python -m wms2 import <request_name> --max-files 10` (requires working HTCondor)
+
+## Key Bugs Fixed
+
+| Bug | Root Cause | Fix |
+|---|---|---|
+| ReqMgr2 404 | URL path doubled (`/reqmgr2/reqmgr2/data/...`) | Changed paths to `/data/...` (base URL includes `/reqmgr2`) |
+| ReqMgr2 wrong data | Response is `{result: [{name: {fields}}]}` | Unwrap inner dict by name key |
+| DBS 400 | `/files` endpoint rejects `limit` query param | Removed from params, slice in Python |
+| Rucio 400 | Proxy cert DN not recognized for token auth | Non-fatal fallback to empty replica map |
+| StepChain missing fields | `InputDataset`, `SplittingAlgo` in Step1 not top-level | `_normalize_request()` extracts from Step1/Task1 |
+| rucio_account garbage | Config had Unicode `\ufffd` char | Fixed to `"wms2"` |
+| condor_dagman not in PATH | `Submit.from_dag()` needs binary on PATH | Shim: `echo '#!/bin/sh' > /tmp/condor_dagman` |
+
+## Design Decisions
+
+- **CLI creates rows directly**: Rather than calling `WorkflowManager.import_request()` (which re-fetches and lacks normalization), the CLI creates request + workflow rows directly with normalized data.
+- **Executables as settings, not hardcoded**: `processing_executable`, `merge_executable`, `cleanup_executable` in `Settings` allow override to `/bin/true` for testing without changing DAG generation logic.
+- **SSL context passed as `verify` param**: All HTTP adapters accept `verify=ssl.SSLContext` for CERN Grid CA. This is the httpx pattern for custom trust stores.
+- **Rucio failure is non-fatal**: In `plan_production_dag`, Rucio errors are caught and logged. The planner proceeds with empty site locations — jobs will use AAA (remote data access) instead of data locality.
+
+## What's Next
+
+- Full HTCondor submission test on new dev VM
+- Output Manager — DBS registration, Rucio rule creation for completed merge groups
+- Error Handler — Failure classification, rescue DAG decision logic
+- Site Manager — CRIC sync for site status and capacity
