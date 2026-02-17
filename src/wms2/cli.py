@@ -16,6 +16,7 @@ from wms2.core.dag_monitor import DAGMonitor
 from wms2.core.dag_planner import DAGPlanner
 from wms2.core.output_lfn import derive_merged_lfn_bases
 from wms2.core.output_manager import OutputManager
+from wms2.core.sandbox import create_sandbox
 from wms2.core.workflow_manager import WorkflowManager
 from wms2.db.engine import create_engine, create_session_factory
 from wms2.db.repository import Repository
@@ -44,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--max-files", type=int, default=0, help="Limit DBS file query (0=all)")
     imp.add_argument("--files-per-job", type=int, default=None, help="Override splitting param")
     imp.add_argument("--dry-run", action="store_true", help="Plan DAG but don't submit")
+    imp.add_argument("--sandbox-mode", default="auto", choices=["auto", "synthetic", "cmssw"],
+                     help="Sandbox mode: auto (detect), synthetic (sized output), cmssw (real cmsRun)")
     imp.add_argument("--ca-bundle", default=None, help="CA bundle file for CERN Grid verification")
     imp.add_argument("--db-url", default=None, help="Override database URL")
     imp.add_argument("--poll-interval", type=int, default=10, help="Monitoring poll interval (seconds)")
@@ -88,7 +91,7 @@ def _make_ssl_context(cert_file: str, key_file: str, ca_path: str) -> ssl.SSLCon
 
 
 def build_settings(args: argparse.Namespace, cert_file: str, key_file: str) -> Settings:
-    """Build Settings from CLI args, overriding executables to /bin/true."""
+    """Build Settings from CLI args. Uses wrapper scripts by default."""
     overrides: dict = {
         "cert_file": cert_file,
         "key_file": key_file,
@@ -191,8 +194,10 @@ def _print_output_files(output_base_dir: str) -> None:
     """Find and display merged output files on disk."""
     import glob
 
-    pattern = os.path.join(output_base_dir, "**", "merged.txt")
-    files = sorted(glob.glob(pattern, recursive=True))
+    # Look for both text and ROOT merged outputs
+    txt_files = sorted(glob.glob(os.path.join(output_base_dir, "**", "merged.txt"), recursive=True))
+    root_files = sorted(glob.glob(os.path.join(output_base_dir, "**", "merged_*.root"), recursive=True))
+    files = txt_files + root_files
     if not files:
         print("[5/5] No merged output files found on disk")
         return
@@ -200,7 +205,6 @@ def _print_output_files(output_base_dir: str) -> None:
     print(f"[5/5] Merged output files ({len(files)} files):")
     for f in files:
         size = os.path.getsize(f)
-        # Show path relative to output_base_dir
         rel = os.path.relpath(f, output_base_dir)
         print(f"  {rel}  ({size} bytes)")
 
@@ -216,13 +220,15 @@ async def run_import(args: argparse.Namespace) -> None:
     request_name = args.request_name
     dry_run = args.dry_run
 
+    sandbox_mode = args.sandbox_mode
+
     print(f"=== WMS2 CLI: importing {request_name} ===")
-    print(f"  cert:         {cert_file}")
-    print(f"  condor_host:  {settings.condor_host}")
-    print(f"  submit_dir:   {settings.submit_base_dir}")
-    print(f"  max_files:    {settings.max_input_files or 'all'}")
-    print(f"  executables:  trivial test scripts")
-    print(f"  dry_run:      {dry_run}")
+    print(f"  cert:          {cert_file}")
+    print(f"  condor_host:   {settings.condor_host}")
+    print(f"  submit_dir:    {settings.submit_base_dir}")
+    print(f"  max_files:     {settings.max_input_files or 'all'}")
+    print(f"  sandbox_mode:  {sandbox_mode}")
+    print(f"  dry_run:       {dry_run}")
     print()
 
     # SSL context for CERN Grid services
@@ -272,10 +278,33 @@ async def run_import(args: argparse.Namespace) -> None:
                 "request_type": reqdata.get("RequestType"),
                 "output_datasets": output_datasets_info,
                 "merged_lfn_base": reqdata.get("MergedLFNBase", "/store/mc"),
+                # CMSSW metadata
+                "cmssw_version": reqdata.get("CMSSWVersion"),
+                "scram_arch": reqdata.get("ScramArch"),
+                "global_tag": reqdata.get("GlobalTag"),
+                "memory_mb": reqdata.get("Memory", 2048),
+                "multicore": reqdata.get("Multicore", 1),
+                "time_per_event": reqdata.get("TimePerEvent", 1.0),
+                "size_per_event": reqdata.get("SizePerEvent", 1.5),
             }
             if reqdata.get("_is_gen"):
                 config_data["_is_gen"] = True
                 config_data["request_num_events"] = reqdata.get("RequestNumEvents", 0)
+
+            # Create sandbox
+            submit_dir = os.path.join(settings.submit_base_dir, request_name)
+            os.makedirs(submit_dir, exist_ok=True)
+            sandbox_path = os.path.join(submit_dir, "sandbox.tar.gz")
+            create_sandbox(sandbox_path, reqdata, mode=sandbox_mode)
+            config_data["sandbox_path"] = sandbox_path
+
+            # Print CMSSW info if available
+            cmssw_ver = reqdata.get("CMSSWVersion")
+            if cmssw_ver:
+                print(f"      cmssw:       {cmssw_ver}")
+                print(f"      scram_arch:  {reqdata.get('ScramArch', 'N/A')}")
+                print(f"      global_tag:  {reqdata.get('GlobalTag', 'N/A')}")
+            print(f"      sandbox:     {sandbox_path} ({sandbox_mode})")
             workflow = await repo.create_workflow(
                 request_name=request_name,
                 input_dataset=reqdata["InputDataset"],

@@ -557,7 +557,318 @@ python -m wms2 import cmsunified_task_TSG-Run3Summer23BPixGS-00097__v1_T_231129_
 
 ## What's Next
 
-- Full HTCondor submission test on new dev VM
-- Output Manager — DBS registration, Rucio rule creation for completed merge groups
+- ~~Full HTCondor submission test on new dev VM~~ — Done (Phase 5)
+- ~~Output Manager — DBS registration, Rucio rule creation for completed merge groups~~ — Done (Phase 5)
 - Error Handler — Failure classification, rescue DAG decision logic
 - Site Manager — CRIC sync for site status and capacity
+
+---
+
+# Phase 5 — Output Manager + Trivial Test Scripts + End-to-End Pipeline
+
+**Date**: 2026-02-17
+**Spec Version**: 2.4.0
+**Phase**: 5 — Output Management, DAG Fixes, Real E2E Verification
+
+---
+
+## What Was Built
+
+### Output Manager (`core/output_manager.py`)
+
+Full post-compute pipeline with 8-state machine:
+```
+PENDING → DBS_REGISTERED → SOURCE_PROTECTED → TRANSFERS_REQUESTED
+→ TRANSFERRING → TRANSFERRED → SOURCE_RELEASED → ANNOUNCED
+```
+
+- `handle_merge_completion(workflow, merge_info)` — Creates PENDING OutputDataset records (one per output dataset × per merge group)
+- `process_outputs_for_workflow(workflow_id)` — Advances all outputs through the pipeline
+- `_advance_output(output)` — Drives state transitions with local variable tracking for multi-step advancement in one call
+- `_register_in_dbs()` → `_protect_source()` → `_request_transfers()` → `_check_transfer_status()` → `_release_source_protection()` → `_announce()`
+- `validate_local_output(lfn)` — Checks file existence on local SE
+- `get_output_summary(workflow_id)` — Counts by status for display
+
+All DBS/Rucio calls go through adapter interfaces. Mock adapters make every step succeed immediately — the full state machine runs in a single `process_outputs_for_workflow()` call. When real adapters are wired in, transfers will take real time.
+
+### LFN Derivation Helpers (`core/output_lfn.py`)
+
+CMS LFN convention utilities:
+- `derive_merged_lfn_bases(request_data)` — Parses `OutputDatasets` from ReqMgr2 response, extracts PrimaryDataset/AcquisitionEra/ProcessingString/DataTier, builds merged LFN base paths
+- `_parse_dataset_name(name)` — Regex extraction from DBS format `/{Primary}/{Era}-{Proc}-v{N}/{Tier}`
+- `merged_lfn_for_group(base, index, filename)` — Constructs `{base}/{NNNNNN}/{filename}`
+- `local_output_path(output_base_dir, lfn)` — Converts `/store/mc/...` to local path
+
+### Trivial Test Scripts
+
+Processing and merge jobs now produce real output instead of running `/bin/true`:
+
+**`wms2_proc.sh`** — Generated in submit dir, writes one line of job metadata to stdout:
+```
+2026-02-17T15:32:58Z | pid=54134 | host=localhost.localdomain | args: --sandbox N/A --input synthetic://gen/events_1_100000
+```
+HTCondor captures stdout as `proc_NNNNNN.out`.
+
+**`wms2_merge.py`** — Generated in submit dir, reads all `proc_*.out` files from the merge group directory, writes one `merged.txt` per output dataset to the local SE:
+```
+# WMS2 Merged Output
+# Dataset:     /QCD_.../AODSIM
+# Data tier:   AODSIM
+# Merge group: mg_000000
+# Generated:   2026-02-17T15:34:30Z
+# Host:        localhost.localdomain
+# Jobs merged: 1
+#
+proc_000000 | 2026-02-17T15:32:58Z | pid=54134 | host=localhost.localdomain | args: --sandbox N/A --input synthetic://gen/events_1_100000
+```
+
+Output files follow CMS LFN conventions on the local SE:
+```
+/mnt/shared/store/mc/{AcquisitionEra}/{PrimaryDataset}/{DataTier}/{ProcessingString}-vN/{NNNNNN}/merged.txt
+```
+
+**Auto-substitution**: When executables are `/bin/true` (test mode), `_generate_group_dag()` automatically uses the generated scripts instead. Production executables are used as-is.
+
+### DAG Monitor Fixes (`core/dag_monitor.py`)
+
+**ClassAd parser rewrite**: DAGMan's `NODE_STATUS_FILE` uses ClassAd format, not JSON. Completely rewrote `_parse_dagman_status()`:
+- Parses ClassAd blocks (`[ Type = "DagStatus"; NodesDone = N; ... ]`)
+- Handles `DagStatus` block for aggregate counts and `NodeStatus` blocks for per-node status
+- Maps NodeStatus integers: 0=not_ready, 1=ready, 2=prerun, 3=submitted, 4=postrun, 5=done, 6=error, 7=futile
+
+**Work unit detection on DAG exit**: Fixed `_handle_dag_completion()` to also parse the `.status` file and call `_detect_completed_work_units()`. Previously, merge groups that completed between the last poll and DAGMan exit were lost.
+
+### DAG Planner Fixes (`core/dag_planner.py`)
+
+| Fix | Problem | Solution |
+|---|---|---|
+| SUBDAG EXTERNAL DIR | Sub-DAGMan couldn't find relative-path submit files | Added `DIR {mg_dir}` to each SUBDAG EXTERNAL line |
+| NODE_STATUS_FILE | No `.status` file produced by DAGMan | Added `NODE_STATUS_FILE workflow.dag.status` directive |
+| elect_site.sh fallback | Script failed on local dev (no GLIDEIN_CMSSite) | Fall back to "local" and always exit 0 |
+| Merge arguments quoting | Embedded JSON double quotes rejected by HTCondor | Write `output_info.json` file, pass path in arguments |
+| output_info.json format | Only had flat `output_lfn_bases` list | Now includes `output_datasets` with dataset_name, merged_lfn_base, data_tier |
+| GEN workflow support | GEN workflows have no input files | `_plan_gen_nodes()` creates synthetic event-range nodes |
+
+### Lifecycle Manager Wiring (`core/lifecycle_manager.py`)
+
+- `_handle_active()` calls `output_manager.handle_merge_completion()` for each newly completed work unit
+- Calls `output_manager.process_outputs_for_workflow()` to advance outputs through pipeline
+- OutputManager passed as optional constructor arg (backward-compatible)
+
+### CLI Enhancements (`cli.py`)
+
+- Stores output dataset metadata in workflow `config_data` (from `derive_merged_lfn_bases`)
+- Creates OutputManager with mock DBS/Rucio adapters
+- Processes work unit completions through output pipeline during monitoring loop
+- Prints output summary (counts by status) and lists merged output files on disk with sizes
+- GEN workflow detection and handling
+
+### Config (`config.py`)
+
+```python
+output_base_dir: str = "/mnt/shared/store"   # Local SE staging area
+```
+
+### Tests
+
+**42 new tests (138 total, all passing)**:
+
+| File | New Tests | What |
+|---|---|---|
+| `test_output_lfn.py` | 9 | LFN derivation, dataset parsing, block dirs, local path conversion |
+| `test_output_manager.py` | 9 | Merge completion records, full pipeline, DBS/Rucio adapter calls, output summary, file validation |
+| `test_dag_monitor.py` | 10 (rewritten) | ClassAd format parsing, completion detection, work unit tracking on DAG exit |
+| `test_dag_generator.py` | 4 | Trivial script generation, test mode substitution, output_info.json format |
+| `test_lifecycle.py` | 2 | Output manager wiring, backward compat without output manager |
+| `test_api.py` | 2 | Clean stop endpoint, stop non-active request |
+| Integration tests | 6 | DAG planner e2e, API endpoints |
+
+---
+
+## Real End-to-End Verification
+
+Tested with real ReqMgr2 workflow `cmsunified_task_GEN-RunIII2024Summer24GS-00002__v1_T_260204_161305_1359`:
+
+```
+su - wms2 -s /bin/bash -c 'source .venv/bin/activate && python -m wms2 import \
+  cmsunified_task_GEN-RunIII2024Summer24GS-00002__v1_T_260204_161305_1359 \
+  --max-files 5 --proxy /tmp/x509up_wms2 --submit-dir /mnt/shared/wms2_submit \
+  --poll-interval 5 --ca-bundle /tmp/cern-ca-bundle.pem \
+  --db-url "postgresql+asyncpg://wms2:wms2dev@localhost:5432/wms2"'
+```
+
+**Result**: All 5 work units completed, 15 output records (3 datasets × 5 merge groups), all ANNOUNCED.
+
+**Output files on disk** (15 files in `/mnt/shared/store/`):
+```
+mc/RunIII2024Summer24DRPremix/QCD_.../AODSIM/140X_...-v2/000000/merged.txt     (434 bytes)
+mc/RunIII2024Summer24DRPremix/QCD_.../AODSIM/140X_...-v2/000001/merged.txt     (439 bytes)
+...
+mc/RunIII2024Summer24MiniAODv6/QCD_.../MINIAODSIM/150X_...-v2/000000/merged.txt (442 bytes)
+...
+mc/RunIII2024Summer24NanoAODv15/QCD_.../NANOAODSIM/150X_...-v2/000000/merged.txt (443 bytes)
+...
+```
+
+Each file contains a header (dataset, tier, merge group, timestamp, host, job count) followed by one line per processing job with PID, hostname, timestamp, and arguments.
+
+---
+
+## Key Bugs Fixed During E2E Testing
+
+| Bug | Symptom | Root Cause | Fix |
+|---|---|---|---|
+| No status file | DAG monitor warns "Status file not found" | DAGMan only produces `.status` if `NODE_STATUS_FILE` directive present | Added directive to outer DAG |
+| Sub-DAG failures | All 5 merge group SUBDAGs fail immediately | `SUBDAG EXTERNAL` without `DIR` — sub-DAGMan can't find relative-path submit files | Added `DIR {mg_dir}` |
+| elect_site.sh exit 1 | POST script failure kills sub-DAG | `MATCH_GLIDEIN_CMSSite` undefined on local dev | Fall back to "local", always exit 0 |
+| JSON parse error | `json.JSONDecodeError` on `.status` file | NODE_STATUS_FILE is ClassAd format, not JSON | Rewrote parser for ClassAd blocks |
+| HTCondor quote error | "illegal unescaped double-quote" in merge.sub | JSON with double quotes embedded in `arguments` line | Write to `output_info.json` file, pass path |
+
+## Design Decisions
+
+- **Mock adapters for default output lifecycle**: With mock DBS/Rucio, the full 8-state pipeline runs in one call. When real adapters are configured, transfers will take time and `TRANSFERRING` state will persist across multiple poll cycles.
+- **Script generation over script installation**: `wms2_proc.sh` and `wms2_merge.py` are generated in the submit directory alongside the DAG files, not installed as package scripts. This keeps the submit directory self-contained.
+- **ClassAd parser instead of JSON**: DAGMan's NODE_STATUS_FILE uses ClassAd format with `[key = value;]` blocks. The parser handles `DagStatus` (aggregate counts) and `NodeStatus` (per-node) block types.
+- **Output info as separate file**: Complex merge arguments (JSON with dataset info) can't be safely embedded in HTCondor submit file `arguments` lines. Writing to `output_info.json` and passing the file path avoids quoting issues.
+- **One merged.txt per dataset per merge group**: Each output dataset tier (AODSIM, MINIAODSIM, NANOAODSIM) gets its own merged file at its own LFN path. This matches the CMS convention where each data tier is a separate dataset in DBS.
+
+## What's Next
+
+- Error Handler — Failure classification, rescue DAG decision logic
+- Clean Stop — ACTIVE → STOPPING → RESUBMITTING → QUEUED rescue DAG flow
+- Site Manager — CRIC sync for site status and capacity
+- Continuous lifecycle loop — FastAPI daemon polling all active requests
+- Real DBS/Rucio adapters — actual service calls for output registration and transfers
+
+---
+
+# Phase 6 — Processing Wrapper + Sandbox Builder
+
+**Date**: 2026-02-17
+**Spec Version**: 2.4.0
+**Phase**: 6 — Real Payload Execution Support
+
+---
+
+## What Was Built
+
+### Sandbox Builder (`core/sandbox.py`)
+
+Creates `sandbox.tar.gz` with manifest + PSet configs:
+
+- `create_sandbox(output_path, request_data, mode)` — Builds tarball with `manifest.json` + per-step PSet configs
+- Three modes: `auto` (detects CMSSW from request data), `synthetic`, `cmssw`
+- `_build_manifest()` — Generates manifest from ReqMgr2 request data:
+  - Synthetic: `size_per_event_kb`, `time_per_event_sec`, `memory_mb`, `output_tiers`
+  - CMSSW: `cmssw_version`, `scram_arch`, `global_tag`, `multicore`, `memory_mb`, plus per-step info
+- `_extract_steps()` — Handles StepChain multi-step requests (step chaining via `input_from_step`)
+- `_create_test_pset()` — Generates minimal working CMSSW PSet.py files for testing
+
+**Sandbox format**:
+```
+sandbox.tar.gz
+├── manifest.json           # Job config
+└── steps/                  # Per-step CMSSW configs (CMSSW mode only)
+    ├── step1/PSet.py
+    ├── step2/PSet.py
+    └── ...
+```
+
+### Processing Wrapper — Rewritten `_write_proc_script()` in `dag_planner.py`
+
+Replaced one-liner with ~200-line bash wrapper (`run_payload.sh`):
+
+**Argument parsing**: `--sandbox`, `--input`, `--first-event`, `--last-event`, `--events-per-job`, `--node-index`, `--pilot`
+
+**CMSSW mode** (`run_cmssw_mode`):
+- Sources CVMFS: `/cvmfs/cms.cern.ch/cmsset_default.sh`
+- Sets up CMSSW via `scramv1 project` + `scramv1 runtime`
+- Converts LFNs to xrootd URLs (`root://cms-xrd-global.cern.ch/`)
+- Runs multi-step `cmsRun` with FrameworkJobReport parsing
+- Chains step outputs (step N output → step N+1 input)
+- Falls back to synthetic mode if CVMFS unavailable
+
+**Synthetic mode** (`run_synthetic_mode`):
+- Reads `size_per_event_kb` and `time_per_event_sec` from manifest
+- Creates sized output file via `dd if=/dev/urandom`
+- Simulates processing time with proportional `sleep` (capped at 300s)
+
+**Pilot mode** (`run_pilot_mode`):
+- Iterative measurement: runs N, 2N, 4N events
+- Collects wall time, output size, peak RSS per iteration
+- Writes `pilot_metrics.json` with derived metrics
+
+### Merge Wrapper — Enhanced `_write_merge_script()` in `dag_planner.py`
+
+Added ROOT file handling alongside existing text mode:
+
+- Detects output type: `.root` files → ROOT merge, `proc_*.out` → text merge
+- **ROOT mode**: Sets up CMSSW environment, uses `hadd` for ROOT file merging
+- **Text mode**: Unchanged — concatenates `proc_*.out` into `merged.txt`
+- Falls back to copying ROOT files if `hadd` not available
+
+### Submit File Updates — `_write_submit_file()` in `dag_planner.py`
+
+New parameters:
+- `memory_mb` — `request_memory` in submit file (omitted if 0)
+- `disk_kb` — `request_disk` in submit file (omitted if 0)
+- `transfer_input_files` — HTCondor file transfer list (for sandbox)
+
+### Group DAG Updates — `_generate_group_dag()` in `dag_planner.py`
+
+- Processing node arguments now include: `--node-index`, `--first-event`, `--last-event`, `--events-per-job`
+- Sandbox tarball added to `transfer_input_files` for processing nodes
+- Resource parameters (memory, disk) passed through to submit files
+- Sandbox reference uses basename (for file transfer) instead of full URL
+
+### DAG Files Signature — `_generate_dag_files()` in `dag_planner.py`
+
+New parameters:
+- `sandbox_path` — Local path to `sandbox.tar.gz` (passed through to groups)
+- `resource_params` — `{"memory_mb": N, "disk_kb": N}` (passed through to submit files)
+
+### CLI Updates (`cli.py`)
+
+- New `--sandbox-mode` flag: `auto` (default), `synthetic`, `cmssw`
+- Creates sandbox during import (`create_sandbox()`)
+- Stores CMSSW metadata in workflow `config_data`: `cmssw_version`, `scram_arch`, `global_tag`, `memory_mb`, `multicore`, `time_per_event`, `size_per_event`
+- Prints CMSSW info (version, arch, global tag) when available
+- Output file detection includes `.root` files alongside `.txt`
+
+### Workflow Manager Updates (`core/workflow_manager.py`)
+
+- `import_request()` now stores CMSSW fields in `config_data`
+
+### Tests
+
+**21 new tests (157 total, all passing)**:
+
+| File | New Tests | What |
+|---|---|---|
+| `test_sandbox.py` | 9 | Manifest building (synthetic/CMSSW/StepChain), PSet generation, tarball creation, auto-detection |
+| `test_dag_generator.py` | 12 | Processing wrapper content (mode dispatch, sandbox extraction, pilot mode), merge wrapper (ROOT handling, text fallback), resource requests, transfer_input_files, event range args |
+
+---
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/unit/test_sandbox.py -v` — 9 tests pass
+3. `pytest tests/unit/test_dag_generator.py -v` — 21 tests pass
+4. `pytest tests/unit/ tests/integration/ -v -k "not condor"` — 157 tests pass
+
+## Design Decisions
+
+- **Sandbox is a tarball, not a pickle**: Unlike WMCore's WMSandbox (pickled Python objects), WMS2's sandbox uses JSON manifest + ready-to-use PSet.py files. No WMCore dependency on worker nodes.
+- **Wrapper lives in submit_dir, not sandbox**: The processing wrapper is generated alongside the DAG files. The sandbox only contains config and PSet files. This keeps the wrapper updatable without re-creating sandboxes.
+- **CMSSW fallback to synthetic**: If CMSSW mode is requested but `/cvmfs/cms.cern.ch` is unavailable, the wrapper falls back to synthetic mode with a warning. This enables testing on non-CVMFS hosts.
+- **Resource requests optional**: `request_memory` and `request_disk` are omitted from submit files when set to 0. This avoids over-constraining jobs on development pools.
+- **Transfer sandbox via HTCondor**: The sandbox tarball is included in `transfer_input_files` so HTCondor handles delivery to worker nodes. No separate file staging needed.
+
+## What's Next
+
+- CVMFS setup on dev VM — Enable real CMSSW execution via CVMFS client
+- HTCondor e2e (synthetic) — Import workflow with `--sandbox-mode synthetic`, verify sized output files
+- HTCondor e2e (CMSSW) — Once CVMFS available, verify real `cmsRun` execution
+- Error Handler — Failure classification, rescue DAG decisions
+- Clean Stop — Full clean stop flow with rescue DAGs

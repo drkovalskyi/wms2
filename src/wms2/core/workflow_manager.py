@@ -37,6 +37,13 @@ class WorkflowManager:
                 "campaign": data.get("Campaign"),
                 "requestor": data.get("Requestor"),
                 "priority": data.get("Priority"),
+                "cmssw_version": data.get("CMSSWVersion"),
+                "scram_arch": data.get("ScramArch"),
+                "global_tag": data.get("GlobalTag"),
+                "memory_mb": data.get("Memory", 2048),
+                "multicore": data.get("Multicore", 1),
+                "time_per_event": data.get("TimePerEvent", 1.0),
+                "size_per_event": data.get("SizePerEvent", 1.5),
             },
         )
 

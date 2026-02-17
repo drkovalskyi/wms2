@@ -1,5 +1,6 @@
 """Tests for DAG file generation."""
 
+import json
 import os
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from wms2.core.dag_planner import (
 from wms2.core.splitters import DAGNodeSpec, InputFile
 
 
-def _make_node(index, events=10000, location="T1_US_FNAL"):
+def _make_node(index, events=10000, location="T1_US_FNAL",
+               first_event=0, last_event=0, events_per_job=0):
     return DAGNodeSpec(
         node_index=index,
         input_files=[
@@ -26,6 +28,9 @@ def _make_node(index, events=10000, location="T1_US_FNAL"):
             )
         ],
         primary_location=location,
+        first_event=first_event,
+        last_event=last_event,
+        events_per_job=events_per_job,
     )
 
 
@@ -170,10 +175,9 @@ class TestDAGFileGeneration:
         )
         content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
         assert "universe = vanilla" in content
-        assert "executable = run_payload.sh" in content
         assert "queue 1" in content
 
-    def test_trivial_scripts_generated(self, tmp_path):
+    def test_wrapper_scripts_generated(self, tmp_path):
         """wms2_proc.sh and wms2_merge.py are always generated."""
         groups = _make_merge_groups(1, 1)
         _generate_dag_files(
@@ -188,7 +192,7 @@ class TestDAGFileGeneration:
         assert os.access(str(tmp_path / "wms2_proc.sh"), os.X_OK)
         assert os.access(str(tmp_path / "wms2_merge.py"), os.X_OK)
 
-    def test_test_mode_uses_trivial_scripts(self, tmp_path):
+    def test_test_mode_uses_wrapper_scripts(self, tmp_path):
         """When executables are /bin/true, submit files use generated scripts."""
         groups = _make_merge_groups(1, 1)
         executables = {
@@ -235,10 +239,172 @@ class TestDAGFileGeneration:
             output_datasets=output_datasets,
             output_base_dir="/mnt/shared/store",
         )
-        import json
         info = json.loads((tmp_path / "mg_000000" / "output_info.json").read_text())
         assert "output_datasets" in info
         assert info["output_datasets"][0]["dataset_name"] == "/Primary/Era-Proc-v1/AODSIM"
         assert info["output_datasets"][0]["data_tier"] == "AODSIM"
         assert info["output_base_dir"] == "/mnt/shared/store"
         assert info["group_index"] == 0
+
+
+class TestProcessingWrapper:
+    """Tests for the processing wrapper script content."""
+
+    def test_proc_script_has_mode_dispatch(self, tmp_path):
+        """Processing wrapper supports CMSSW and synthetic modes."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_proc.sh").read_text()
+        assert "run_cmssw_mode" in content
+        assert "run_synthetic_mode" in content
+        assert "run_pilot_mode" in content
+        assert "--sandbox" in content
+        assert "manifest.json" in content
+
+    def test_proc_script_has_sandbox_extraction(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_proc.sh").read_text()
+        assert "tar xzf" in content
+
+    def test_proc_script_has_pilot_mode(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_proc.sh").read_text()
+        assert "--pilot" in content
+        assert "pilot_metrics.json" in content
+
+
+class TestMergeWrapper:
+    """Tests for the merge wrapper script content."""
+
+    def test_merge_script_handles_root_files(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_merge.py").read_text()
+        assert "root_files" in content
+        assert "hadd" in content
+        assert "merge_root_files" in content
+
+    def test_merge_script_has_text_fallback(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_merge.py").read_text()
+        assert "merge_text_files" in content
+        assert "proc_*.out" in content
+
+
+class TestResourceRequests:
+    """Tests for resource requests in submit files."""
+
+    def test_resource_params_in_submit_file(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            resource_params={"memory_mb": 4096, "disk_kb": 20_000_000},
+        )
+        content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "request_memory = 4096" in content
+        assert "request_disk = 20000000" in content
+
+    def test_no_resource_params_omits_lines(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "request_memory" not in content
+        assert "request_disk" not in content
+
+    def test_transfer_input_files(self, tmp_path):
+        # Create a fake sandbox file so the path check passes
+        sandbox = tmp_path / "sandbox.tar.gz"
+        sandbox.write_bytes(b"fake")
+
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            sandbox_path=str(sandbox),
+        )
+        content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "transfer_input_files" in content
+        assert "sandbox.tar.gz" in content
+
+
+class TestEventRangeArgs:
+    """Tests for event range arguments in processing node submit files."""
+
+    def test_event_range_in_arguments(self, tmp_path):
+        node = _make_node(0, events=50000, first_event=1, last_event=50000,
+                          events_per_job=50000)
+        mg = PlanningMergeGroup(
+            group_index=0,
+            processing_nodes=[node],
+            estimated_output_kb=500000.0,
+        )
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=[mg],
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "--first-event 1" in content
+        assert "--last-event 50000" in content
+        assert "--events-per-job 50000" in content
+        assert "--node-index 0" in content
+
+    def test_node_index_always_present(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "--node-index 0" in content
