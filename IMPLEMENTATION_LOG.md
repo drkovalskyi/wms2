@@ -865,10 +865,43 @@ New parameters:
 - **Resource requests optional**: `request_memory` and `request_disk` are omitted from submit files when set to 0. This avoids over-constraining jobs on development pools.
 - **Transfer sandbox via HTCondor**: The sandbox tarball is included in `transfer_input_files` so HTCondor handles delivery to worker nodes. No separate file staging needed.
 
+## HTCondor E2E Verification (Synthetic Mode)
+
+Re-ran with same real ReqMgr2 workflow after capping synthetic output sizes:
+
+```
+su -c '.venv/bin/python -m wms2 import \
+  cmsunified_task_GEN-RunIII2024Summer24GS-00002__v1_T_260204_161305_1359 \
+  --max-files 5 --proxy /tmp/x509up_wms2 --submit-dir /mnt/shared/wms2_submit \
+  --poll-interval 5 --ca-bundle /tmp/cern-ca-bundle.pem --sandbox-mode synthetic \
+  --db-url "postgresql+asyncpg://wms2:wms2dev@localhost:5432/wms2"' wms2
+```
+
+**Result**: All 5 work units completed, 15 output records (3 datasets × 5 groups), all ANNOUNCED.
+
+**Processing wrapper verified**:
+- Sandbox extracted, manifest parsed, synthetic mode detected
+- Output capped at 10MB per file (was ~58GB uncapped — fixed)
+- Sleep capped at 10s
+- Each proc node produces `proc_N_output.root` (10,485,760 bytes)
+
+**Merge wrapper verified**:
+- ROOT files detected, `hadd` unavailable (no CMSSW) so fallback to copy
+- Files copied to correct CMS LFN paths on local SE
+
+**15 output files on disk** (150MB total in `/mnt/shared/store/`):
+```
+mc/RunIII2024Summer24DRPremix/QCD_.../AODSIM/140X_...-v2/000000/proc_0_output.root  (10MB)
+mc/RunIII2024Summer24MiniAODv6/QCD_.../MINIAODSIM/150X_...-v2/000000/proc_0_output.root  (10MB)
+mc/RunIII2024Summer24NanoAODv15/QCD_.../NANOAODSIM/150X_...-v2/000000/proc_0_output.root  (10MB)
+... (×5 merge groups)
+```
+
+**Bug fixed**: CLI output file detection glob was looking for `merged_*.root` but actual files are `proc_N_output.root`. Changed to `*.root`.
+
 ## What's Next
 
 - CVMFS setup on dev VM — Enable real CMSSW execution via CVMFS client
-- HTCondor e2e (synthetic) — Import workflow with `--sandbox-mode synthetic`, verify sized output files
 - HTCondor e2e (CMSSW) — Once CVMFS available, verify real `cmsRun` execution
 - Error Handler — Failure classification, rescue DAG decisions
 - Clean Stop — Full clean stop flow with rescue DAGs
