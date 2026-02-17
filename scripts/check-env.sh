@@ -75,7 +75,7 @@ fi
 
 if systemctl is-active condor &>/dev/null; then
     ok "HTCondor — running"
-    SLOTS=$(condor_status -total 2>/dev/null | tail -1 | awk '{print $1}')
+    SLOTS=$(condor_status -total 2>/dev/null | awk '/^ *Total +[0-9]/{print $2}')
     if [ -n "$SLOTS" ] && [ "$SLOTS" -gt 0 ] 2>/dev/null; then
         ok "HTCondor pool — $SLOTS slot(s)"
     else
@@ -109,6 +109,58 @@ if [ -f "$VENV_DIR/bin/activate" ]; then
     fi
 else
     fail "No venv at $VENV_DIR — create with: python3.12 -m venv $VENV_DIR"
+fi
+
+echo ""
+
+# --- CMS Network Access ---
+echo "--- CMS Network Access ---"
+
+PROXY="${X509_USER_PROXY:-}"
+CURL_AUTH=()
+if [ -n "$PROXY" ] && [ -f "$PROXY" ]; then
+    CURL_AUTH=(--cert "$PROXY" --key "$PROXY")
+fi
+
+check_cms_endpoint() {
+    local name="$1" url="$2" expect_auth="$3"
+    HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "${CURL_AUTH[@]}" "$url" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "000" ]; then
+        fail "$name — unreachable (network error or timeout)"
+    elif [ "$HTTP_CODE" = "200" ]; then
+        ok "$name — reachable (HTTP $HTTP_CODE)"
+    elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+        if [ "$expect_auth" = "yes" ]; then
+            warn "$name — reachable but needs auth (HTTP $HTTP_CODE)"
+        else
+            warn "$name — unexpected auth error (HTTP $HTTP_CODE)"
+        fi
+    else
+        warn "$name — reachable but unexpected status (HTTP $HTTP_CODE)"
+    fi
+}
+
+check_cms_endpoint "ReqMgr2" "https://cmsweb.cern.ch/reqmgr2/data/info" "yes"
+check_cms_endpoint "DBS"     "https://cmsweb.cern.ch/dbs/prod/global/DBSReader/serverinfo" "yes"
+check_cms_endpoint "Rucio"   "https://cms-rucio.cern.ch/ping" "no"
+check_cms_endpoint "CRIC"    "https://cms-cric.cern.ch/api/cms/site/query/" "no"
+
+# Check for grid credentials
+if [ -n "${X509_USER_PROXY:-}" ] && [ -f "$X509_USER_PROXY" ]; then
+    ok "X509 proxy exists at $X509_USER_PROXY"
+    # Check if proxy is still valid (not expired)
+    if command -v voms-proxy-info &>/dev/null; then
+        TIMELEFT=$(voms-proxy-info -timeleft 2>/dev/null || echo "0")
+        if [ "$TIMELEFT" -gt 0 ] 2>/dev/null; then
+            ok "X509 proxy valid ($((TIMELEFT / 3600))h remaining)"
+        else
+            warn "X509 proxy expired — renew with voms-proxy-init"
+        fi
+    fi
+elif [ -n "${BEARER_TOKEN_FILE:-}" ] && [ -f "$BEARER_TOKEN_FILE" ]; then
+    ok "Bearer token exists at $BEARER_TOKEN_FILE"
+else
+    warn "No CMS credentials — set X509_USER_PROXY or BEARER_TOKEN_FILE"
 fi
 
 echo ""
