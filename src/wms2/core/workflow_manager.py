@@ -1,9 +1,11 @@
 """Workflow Manager: imports requests from ReqMgr2, creates workflow rows."""
 
 import logging
+from dataclasses import asdict
 from typing import Any
 
 from wms2.adapters.base import ReqMgrAdapter
+from wms2.core.stepchain import parse_stepchain
 from wms2.db.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -33,18 +35,7 @@ class WorkflowManager:
             splitting_algo=data["SplittingAlgo"],
             splitting_params=data.get("SplittingParams", {}),
             sandbox_url=data["SandboxUrl"],
-            config_data={
-                "campaign": data.get("Campaign"),
-                "requestor": data.get("Requestor"),
-                "priority": data.get("Priority"),
-                "cmssw_version": data.get("CMSSWVersion"),
-                "scram_arch": data.get("ScramArch"),
-                "global_tag": data.get("GlobalTag"),
-                "memory_mb": data.get("Memory", 2048),
-                "multicore": data.get("Multicore", 1),
-                "time_per_event": data.get("TimePerEvent", 1.0),
-                "size_per_event": data.get("SizePerEvent", 1.5),
-            },
+            config_data=self._build_config_data(data),
         )
 
         logger.info(
@@ -52,6 +43,45 @@ class WorkflowManager:
             request_name, workflow.id, data["InputDataset"], data["SplittingAlgo"],
         )
         return workflow
+
+    @staticmethod
+    def _build_config_data(data: dict[str, Any]) -> dict[str, Any]:
+        """Extract config_data fields from a ReqMgr2 request.
+
+        For StepChain requests, parses per-step configs using the StepChain parser.
+        Step-level always overrides top-level.
+        """
+        # Common metadata fields
+        config_data: dict[str, Any] = {
+            "campaign": data.get("Campaign"),
+            "requestor": data.get("Requestor"),
+            "priority": data.get("Priority"),
+        }
+
+        if data.get("StepChain"):
+            spec = parse_stepchain(data)
+            config_data["stepchain_spec"] = asdict(spec)
+            # Flat fields for DAG planner backward compat
+            config_data["memory_mb"] = max(s.memory_mb for s in spec.steps)
+            config_data["multicore"] = max(s.multicore for s in spec.steps)
+            config_data["time_per_event"] = spec.time_per_event
+            config_data["size_per_event"] = spec.size_per_event
+            config_data["filter_efficiency"] = spec.filter_efficiency
+        else:
+            # Non-StepChain: existing flat extraction
+            config_data.update({
+                "cmssw_version": data.get("CMSSWVersion"),
+                "scram_arch": data.get("ScramArch"),
+                "global_tag": data.get("GlobalTag"),
+                "memory_mb": data.get("Memory", 2048),
+                "multicore": data.get("Multicore", 1),
+                "time_per_event": data.get("TimePerEvent", 1.0),
+                "size_per_event": data.get("SizePerEvent", 1.5),
+                "filter_efficiency": data.get("FilterEfficiency", 1.0),
+                "event_streams": data.get("EventStreams", 0),
+            })
+
+        return config_data
 
     async def get_workflow_status(self, workflow_id) -> dict[str, Any]:
         """Build a progress summary for a workflow."""

@@ -42,7 +42,6 @@ def _make_merge_groups(num_groups=2, nodes_per_group=3):
         mg = PlanningMergeGroup(
             group_index=g,
             processing_nodes=nodes,
-            estimated_output_kb=500000.0,
         )
         groups.append(mg)
         node_idx += nodes_per_group
@@ -250,8 +249,7 @@ class TestDAGFileGeneration:
 class TestProcessingWrapper:
     """Tests for the processing wrapper script content."""
 
-    def test_proc_script_has_mode_dispatch(self, tmp_path):
-        """Processing wrapper supports CMSSW and synthetic modes."""
+    def _get_proc_content(self, tmp_path):
         groups = _make_merge_groups(1, 1)
         _generate_dag_files(
             submit_dir=str(tmp_path),
@@ -260,7 +258,11 @@ class TestProcessingWrapper:
             sandbox_url="https://example.com/sandbox.tar.gz",
             category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
         )
-        content = (tmp_path / "wms2_proc.sh").read_text()
+        return (tmp_path / "wms2_proc.sh").read_text()
+
+    def test_proc_script_has_mode_dispatch(self, tmp_path):
+        """Processing wrapper supports CMSSW and synthetic modes."""
+        content = self._get_proc_content(tmp_path)
         assert "run_cmssw_mode" in content
         assert "run_synthetic_mode" in content
         assert "run_pilot_mode" in content
@@ -268,29 +270,51 @@ class TestProcessingWrapper:
         assert "manifest.json" in content
 
     def test_proc_script_has_sandbox_extraction(self, tmp_path):
-        groups = _make_merge_groups(1, 1)
-        _generate_dag_files(
-            submit_dir=str(tmp_path),
-            workflow_id="test-wf-001",
-            merge_groups=groups,
-            sandbox_url="https://example.com/sandbox.tar.gz",
-            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
-        )
-        content = (tmp_path / "wms2_proc.sh").read_text()
+        content = self._get_proc_content(tmp_path)
         assert "tar xzf" in content
 
     def test_proc_script_has_pilot_mode(self, tmp_path):
-        groups = _make_merge_groups(1, 1)
-        _generate_dag_files(
-            submit_dir=str(tmp_path),
-            workflow_id="test-wf-001",
-            merge_groups=groups,
-            sandbox_url="https://example.com/sandbox.tar.gz",
-            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
-        )
-        content = (tmp_path / "wms2_proc.sh").read_text()
+        content = self._get_proc_content(tmp_path)
         assert "--pilot" in content
         assert "pilot_metrics.json" in content
+
+    def test_proc_script_per_step_cmssw(self, tmp_path):
+        """Processing wrapper reads per-step CMSSW version from manifest."""
+        content = self._get_proc_content(tmp_path)
+        # Should read cmssw_version from each step, not top-level
+        assert "cmssw_version" in content
+        assert "scram_arch" in content
+        assert "CMSSW_VER" in content
+        assert "STEP_ARCH" in content
+
+    def test_proc_script_apptainer_support(self, tmp_path):
+        """Processing wrapper has apptainer container support."""
+        content = self._get_proc_content(tmp_path)
+        assert "resolve_container" in content
+        assert "apptainer" in content
+        assert "run_step_native" in content
+        assert "run_step_apptainer" in content
+        assert "detect_host_os" in content
+
+    def test_proc_script_nthreads(self, tmp_path):
+        """Processing wrapper injects nThreads into PSet at runtime."""
+        content = self._get_proc_content(tmp_path)
+        assert "NTHREADS" in content
+        assert "numberOfThreads" in content
+
+    def test_proc_script_maxevents_first_step_only(self, tmp_path):
+        """maxEvents and firstEvent only applied to first step."""
+        content = self._get_proc_content(tmp_path)
+        # maxEvents should be conditional on step_idx == 0
+        assert "step_idx -eq 0" in content
+        assert "maxEvents" in content
+        assert "firstEvent" in content
+
+    def test_proc_script_fjr_strips_file_prefix(self, tmp_path):
+        """FJR output parsing strips file: prefix from PFN."""
+        content = self._get_proc_content(tmp_path)
+        assert "file:" in content
+        assert "pfn[5:]" in content or "pfn.startswith('file:')" in content
 
 
 class TestMergeWrapper:
@@ -341,6 +365,20 @@ class TestResourceRequests:
         assert "request_memory = 4096" in content
         assert "request_disk = 20000000" in content
 
+    def test_resource_params_with_ncpus(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            resource_params={"memory_mb": 16000, "ncpus": 8},
+        )
+        content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "request_cpus = 8" in content
+        assert "request_memory = 16000" in content
+
     def test_no_resource_params_omits_lines(self, tmp_path):
         groups = _make_merge_groups(1, 1)
         _generate_dag_files(
@@ -353,6 +391,7 @@ class TestResourceRequests:
         content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
         assert "request_memory" not in content
         assert "request_disk" not in content
+        assert "request_cpus" not in content
 
     def test_transfer_input_files(self, tmp_path):
         # Create a fake sandbox file so the path check passes
@@ -382,7 +421,6 @@ class TestEventRangeArgs:
         mg = PlanningMergeGroup(
             group_index=0,
             processing_nodes=[node],
-            estimated_output_kb=500000.0,
         )
         _generate_dag_files(
             submit_dir=str(tmp_path),

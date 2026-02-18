@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     submit_base_dir: str = "/data/wms2/submit"
     target_merged_size_kb: int = 4 * 1024 * 1024  # 4 GB in KB
 
+    # Work unit sizing
+    jobs_per_work_unit: int = 8  # processing jobs per merge group
+
     # Job executables (override to /bin/true for local testing)
     processing_executable: str = "run_payload.sh"
     merge_executable: str = "run_merge.sh"
@@ -55,6 +58,10 @@ class Settings(BaseSettings):
 
     # Output staging
     output_base_dir: str = "/mnt/shared/store"
+
+    # Pilot profiling (optional functional test)
+    pilot_initial_events: int = 200
+    pilot_step_timeout: int = 900       # 15 minutes per step
 
     # Error Handler
     error_auto_rescue_threshold: float = 0.05

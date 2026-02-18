@@ -45,7 +45,7 @@ def dag_planner_with_condor(tmp_path, adapter):
     settings = Settings(
         database_url="postgresql+asyncpg://test:test@localhost:5433/test",
         submit_base_dir=str(tmp_path),
-        target_merged_size_kb=4 * 1024 * 1024,
+        jobs_per_work_unit=8,
     )
 
     return DAGPlanner(

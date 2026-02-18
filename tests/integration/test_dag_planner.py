@@ -32,7 +32,7 @@ def settings(tmp_path):
     return Settings(
         database_url="postgresql+asyncpg://test:test@localhost:5433/test",
         submit_base_dir=str(tmp_path),
-        target_merged_size_kb=4 * 1024 * 1024,
+        jobs_per_work_unit=8,
     )
 
 
@@ -99,5 +99,10 @@ class TestDAGPlannerEndToEnd:
         pilot_dir = Path(tmp_path / str(wf.id) / "pilot")
         assert (pilot_dir / "pilot.sub").exists()
         content = (pilot_dir / "pilot.sub").read_text()
-        assert "run_pilot.sh" in content
+        assert "wms2_pilot.py" in content
         assert "pilot_metrics.json" in content
+        assert "--initial-events" in content
+        assert "--timeout" in content
+
+        # Verify pilot script was generated
+        assert (pilot_dir / "wms2_pilot.py").exists()

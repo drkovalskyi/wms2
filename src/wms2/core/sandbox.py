@@ -36,12 +36,18 @@ def create_sandbox(output_path: str, request_data: dict[str, Any], mode: str = "
 
         # For CMSSW mode, generate test PSets per step
         if mode == "cmssw":
-            global_tag = manifest.get("global_tag", "")
+            # For StepChain manifests (new format), get global_tag from first step
+            if "steps" in manifest and manifest["steps"]:
+                first_step = manifest["steps"][0]
+                global_tag = first_step.get("global_tag", manifest.get("global_tag", ""))
+            else:
+                global_tag = manifest.get("global_tag", "")
             for step in manifest.get("steps", []):
                 pset_rel = step["pset"]
                 pset_path = tmp / pset_rel
                 pset_path.parent.mkdir(parents=True, exist_ok=True)
-                pset_path.write_text(_create_test_pset(step["name"], global_tag))
+                step_gt = step.get("global_tag", global_tag)
+                pset_path.write_text(_create_test_pset(step["name"], step_gt))
 
         # Create tar.gz
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -51,6 +57,55 @@ def create_sandbox(output_path: str, request_data: dict[str, Any], mode: str = "
                 tar.add(str(item), arcname=arcname)
 
     logger.info("Created sandbox: %s (mode=%s)", output_path, mode)
+    return output_path
+
+
+def create_sandbox_from_spec(
+    output_path: str,
+    spec: Any,
+    pset_paths: dict[str, str],
+) -> str:
+    """Create sandbox from a StepChainSpec + pre-generated PSets.
+
+    pset_paths maps step name to a local file path containing the PSet.
+    These are generated externally (from ConfigCache download or cmsDriver).
+
+    Returns path to created tar.gz.
+    """
+    from wms2.core.stepchain import StepChainSpec, to_manifest
+
+    if not isinstance(spec, StepChainSpec):
+        raise TypeError(f"Expected StepChainSpec, got {type(spec).__name__}")
+
+    manifest = to_manifest(spec)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # Write manifest
+        (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+        # Copy PSet files into sandbox at the expected paths
+        for step in spec.steps:
+            pset_rel = step.pset  # e.g. "steps/step1/cfg.py"
+            pset_dest = tmp / pset_rel
+            pset_dest.parent.mkdir(parents=True, exist_ok=True)
+
+            if step.name in pset_paths:
+                pset_src = Path(pset_paths[step.name])
+                pset_dest.write_text(pset_src.read_text())
+            else:
+                # Generate a placeholder test PSet if no real one provided
+                pset_dest.write_text(_create_test_pset(step.name, step.global_tag))
+
+        # Create tar.gz
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with tarfile.open(output_path, "w:gz") as tar:
+            for item in tmp.rglob("*"):
+                arcname = str(item.relative_to(tmp))
+                tar.add(str(item), arcname=arcname)
+
+    logger.info("Created sandbox from spec: %s (%d steps)", output_path, len(spec.steps))
     return output_path
 
 
@@ -65,7 +120,14 @@ def _build_manifest(request_data: dict[str, Any], mode: str) -> dict[str, Any]:
             "output_tiers": _extract_output_tiers(request_data),
         }
 
-    # CMSSW mode
+    # CMSSW mode — use StepChain parser for StepChain requests
+    if request_data.get("RequestType") == "StepChain" and request_data.get("StepChain"):
+        from wms2.core.stepchain import parse_stepchain, to_manifest
+
+        spec = parse_stepchain(request_data)
+        return to_manifest(spec)
+
+    # Legacy single-step CMSSW mode
     cmssw_version = request_data.get("CMSSWVersion", "")
     scram_arch = request_data.get("ScramArch", "")
     global_tag = request_data.get("GlobalTag", "")
@@ -86,40 +148,16 @@ def _build_manifest(request_data: dict[str, Any], mode: str) -> dict[str, Any]:
 
 
 def _extract_steps(request_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract step definitions from a StepChain/TaskChain request."""
+    """Extract step definitions from a non-StepChain request."""
     steps: list[dict[str, Any]] = []
-    request_type = request_data.get("RequestType", "")
 
-    if request_type == "StepChain":
-        num_steps = int(request_data.get("StepChain", 1))
-        for i in range(1, num_steps + 1):
-            step_data = request_data.get(f"Step{i}", {})
-            step_name = step_data.get("StepName", f"step{i}")
-            output_modules = step_data.get("KeepOutput", True)
-
-            step_info: dict[str, Any] = {
-                "name": step_name,
-                "pset": f"steps/step{i}/PSet.py",
-                "output_modules": [f"{step_name}output"],
-                "keep_output": bool(output_modules) if isinstance(output_modules, bool) else True,
-            }
-
-            # Chain steps: step2+ gets input from previous step
-            if i > 1:
-                prev_step = request_data.get(f"Step{i-1}", {})
-                prev_name = prev_step.get("StepName", f"step{i-1}")
-                step_info["input_from_step"] = prev_name
-                step_info["output_from_module"] = f"{prev_name}output"
-
-            steps.append(step_info)
-    else:
-        # Single step (ReReco, MonteCarlo, etc.)
-        steps.append({
-            "name": "processing",
-            "pset": "steps/step1/PSet.py",
-            "output_modules": ["output"],
-            "keep_output": True,
-        })
+    # Single step (ReReco, MonteCarlo, etc.)
+    steps.append({
+        "name": "processing",
+        "pset": "steps/step1/PSet.py",
+        "output_modules": ["output"],
+        "keep_output": True,
+    })
 
     return steps
 

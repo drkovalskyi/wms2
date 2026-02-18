@@ -30,15 +30,40 @@ class PilotMetrics:
     output_size_per_event_kb: float = 50.0
     time_per_event_sec: float = 1.0
     cpu_efficiency: float = 0.8
+    steps: list[dict] | None = None
+    per_output_module: dict | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> PilotMetrics:
+        # New-format reports have a "summary" section; old-format has flat fields
+        summary = data.get("summary", {})
         return cls(
-            events_per_second=float(data.get("events_per_second", 1.0)),
-            memory_peak_mb=int(data.get("memory_peak_mb", 2000)),
-            output_size_per_event_kb=float(data.get("output_size_per_event_kb", 50.0)),
-            time_per_event_sec=float(data.get("time_per_event_sec", 1.0)),
+            events_per_second=float(
+                summary.get("events_per_second", data.get("events_per_second", 1.0))
+            ),
+            memory_peak_mb=int(
+                summary.get("peak_rss_mb", data.get("memory_peak_mb", 2000))
+            ),
+            output_size_per_event_kb=float(
+                summary.get("output_size_per_event_kb", data.get("output_size_per_event_kb", 50.0))
+            ),
+            time_per_event_sec=float(
+                summary.get("total_time_per_event_sec", data.get("time_per_event_sec", 1.0))
+            ),
             cpu_efficiency=float(data.get("cpu_efficiency", 0.8)),
+            steps=data.get("steps"),
+            per_output_module=summary.get("per_output_module"),
+        )
+
+    @classmethod
+    def from_request(cls, config: dict) -> PilotMetrics:
+        """Create metrics from request spec fields."""
+        tpe = float(config.get("time_per_event", 1.0))
+        return cls(
+            time_per_event_sec=tpe,
+            memory_peak_mb=int(config.get("memory_mb", 2000)),
+            output_size_per_event_kb=float(config.get("size_per_event", 50.0)),
+            events_per_second=1.0 / max(tpe, 0.001),
         )
 
 
@@ -47,7 +72,6 @@ class PlanningMergeGroup:
     """A merge group being assembled during planning."""
     group_index: int
     processing_nodes: list[DAGNodeSpec] = field(default_factory=list)
-    estimated_output_kb: float = 0.0
 
 
 # ── DAG Planner ────────────────────────────────────────────────
@@ -71,11 +95,17 @@ class DAGPlanner:
     # ── Pilot Phase ──────────────────────────────────────────
 
     async def submit_pilot(self, workflow) -> None:
-        """Write a pilot submit file. No actual submission yet (Phase 3)."""
+        """Write a pilot submit file and the pilot script, then submit."""
+        from wms2.core.pilot_runner import write_pilot_script
+
         submit_dir = os.path.join(
             self.settings.submit_base_dir, str(workflow.id), "pilot"
         )
         os.makedirs(submit_dir, exist_ok=True)
+
+        # Generate the standalone pilot script
+        pilot_script_path = os.path.join(submit_dir, "wms2_pilot.py")
+        write_pilot_script(pilot_script_path)
 
         # Fetch a small sample of files
         files = await self.dbs.get_files(workflow.input_dataset, limit=5)
@@ -83,10 +113,17 @@ class DAGPlanner:
             logger.warning("No files found for pilot of workflow %s", workflow.id)
             return
 
+        # Resolve sandbox path from workflow config
+        config = workflow.config_data or {}
+        sandbox_path = config.get("sandbox_path", "")
+
+        pilot_config = _compute_pilot_config(config, self.settings)
+
         pilot_sub = _generate_pilot_submit(
             submit_dir=submit_dir,
-            sandbox_url=workflow.sandbox_url,
+            sandbox_path=sandbox_path or workflow.sandbox_url,
             input_files=[f["logical_file_name"] for f in files],
+            pilot_config=pilot_config,
         )
         pilot_path = os.path.join(submit_dir, "pilot.sub")
         _write_file(pilot_path, pilot_sub)
@@ -108,22 +145,38 @@ class DAGPlanner:
 
     def _parse_pilot_report(self, path: str) -> PilotMetrics:
         """Parse pilot JSON report from disk."""
-        with open(path) as f:
-            data = json.load(f)
+        from wms2.core.pilot_runner import parse_pilot_report
+        data = parse_pilot_report(path)
         return PilotMetrics.from_json(data)
 
     async def handle_pilot_completion(self, workflow, report_path: str) -> Any:
-        """Parse pilot metrics and proceed to production DAG planning."""
-        metrics = self._parse_pilot_report(report_path)
+        """Parse pilot metrics and proceed to production DAG planning.
+
+        Pilot results are stored for reference but don't drive merge group
+        sizing — that uses fixed jobs_per_work_unit. Measured memory overrides
+        the request hint if available.
+        """
+        from wms2.core.pilot_runner import parse_pilot_report
+
+        config = workflow.config_data or {}
+        metrics = PilotMetrics.from_request(config)
+
+        # Store pilot results for reference; override memory if measured
+        try:
+            pilot_data = parse_pilot_report(report_path)
+            summary = pilot_data.get("summary", {})
+            if summary.get("peak_rss_mb", 0) > 0:
+                metrics.memory_peak_mb = int(summary["peak_rss_mb"])
+            if summary.get("per_output_module"):
+                metrics.per_output_module = summary["per_output_module"]
+            metrics.steps = pilot_data.get("steps")
+        except Exception as exc:
+            logger.warning("Pilot report parse failed (%s), using request hints", exc)
+            pilot_data = {}
+
         await self.db.update_workflow(
             workflow.id,
-            pilot_metrics={
-                "events_per_second": metrics.events_per_second,
-                "memory_peak_mb": metrics.memory_peak_mb,
-                "output_size_per_event_kb": metrics.output_size_per_event_kb,
-                "time_per_event_sec": metrics.time_per_event_sec,
-                "cpu_efficiency": metrics.cpu_efficiency,
-            },
+            pilot_metrics=pilot_data,
         )
         return await self.plan_production_dag(workflow, metrics=metrics)
 
@@ -151,11 +204,10 @@ class DAGPlanner:
                 f"No processing nodes generated for workflow {workflow.id}"
             )
 
-        # Plan merge groups
+        # Plan merge groups (fixed job count per work unit)
         merge_groups = _plan_merge_groups(
             nodes,
-            output_size_per_event_kb=metrics.output_size_per_event_kb,
-            target_kb=self.settings.target_merged_size_kb,
+            jobs_per_group=self.settings.jobs_per_work_unit,
         )
 
         # 7. Generate DAG files on disk
@@ -178,6 +230,9 @@ class DAGPlanner:
         disk_kb = config.get("disk_kb", 0)
         if disk_kb:
             resource_params["disk_kb"] = int(disk_kb)
+        ncpus = config.get("multicore", 0)
+        if ncpus:
+            resource_params["ncpus"] = int(ncpus)
 
         dag_file_path = _generate_dag_files(
             submit_dir=submit_dir,
@@ -330,31 +385,53 @@ class DAGPlanner:
 
 def _plan_merge_groups(
     nodes: list[DAGNodeSpec],
-    output_size_per_event_kb: float,
-    target_kb: int,
+    jobs_per_group: int,
 ) -> list[PlanningMergeGroup]:
-    """Accumulate processing nodes into merge groups by estimated output size."""
+    """Group processing nodes into fixed-size merge groups."""
     if not nodes:
         return []
 
     groups: list[PlanningMergeGroup] = []
-    current = PlanningMergeGroup(group_index=0)
-
-    for node in nodes:
-        node_output_kb = node.total_events * output_size_per_event_kb
-        if current.processing_nodes and (
-            current.estimated_output_kb + node_output_kb > target_kb
-        ):
-            groups.append(current)
-            current = PlanningMergeGroup(group_index=len(groups))
-
-        current.processing_nodes.append(node)
-        current.estimated_output_kb += node_output_kb
-
-    if current.processing_nodes:
-        groups.append(current)
+    for i in range(0, len(nodes), jobs_per_group):
+        chunk = nodes[i:i + jobs_per_group]
+        mg = PlanningMergeGroup(group_index=len(groups))
+        mg.processing_nodes = chunk
+        groups.append(mg)
 
     return groups
+
+
+# ── Pilot Config from Request Hints ────────────────────────────
+
+
+def _compute_pilot_config(config: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """Compute pilot parameters from request performance hints.
+
+    The pilot is a functional smoke test, not a measurement tool. All
+    planning parameters come from the request spec. We just need enough
+    events to verify the chain runs successfully.
+    """
+    time_per_event = float(config.get("time_per_event", 0))
+    filter_eff = float(config.get("filter_efficiency", 1.0))
+
+    # Enough events to get ~10 through the filter (functional test)
+    if filter_eff > 0 and filter_eff < 1.0:
+        initial_events = max(10, min(int(10 / filter_eff), 10000))
+    else:
+        initial_events = settings.pilot_initial_events
+
+    # Timeout based on expected time, 5x safety margin
+    if time_per_event > 0:
+        timeout = max(600, int(initial_events * time_per_event * 5))
+    else:
+        timeout = settings.pilot_step_timeout
+
+    return {
+        "initial_events": initial_events,
+        "timeout": timeout,
+        "ncpus": int(config.get("multicore", 0)),
+        "memory_mb": int(config.get("memory_mb", 0)),
+    }
 
 
 # ── DAG File Generation (Appendix C format) ────────────────────
@@ -378,7 +455,7 @@ def _generate_dag_files(
     # Write shared config and scripts
     _write_file(
         str(submit_path / "dagman.config"),
-        "DAGMAN_MAX_RESCUE_NUM = 10\nDAGMAN_USER_LOG_SCAN_INTERVAL = 30\n",
+        "DAGMAN_MAX_RESCUE_NUM = 10\nDAGMAN_USER_LOG_SCAN_INTERVAL = 5\n",
     )
     _write_elect_site_script(str(submit_path / "elect_site.sh"))
     _write_pin_site_script(str(submit_path / "pin_site.sh"))
@@ -455,6 +532,7 @@ def _generate_group_dag(
     rp = resource_params or {}
     memory_mb = rp.get("memory_mb", 0)
     disk_kb = rp.get("disk_kb", 0)
+    ncpus = rp.get("ncpus", 0)
 
     # Build transfer_input_files list for processing nodes
     proc_transfer_files: list[str] = []
@@ -504,6 +582,7 @@ def _generate_group_dag(
             desired_sites=node.primary_location,
             memory_mb=memory_mb,
             disk_kb=disk_kb,
+            ncpus=ncpus,
             transfer_input_files=proc_transfer_files or None,
         )
         lines.append(f"JOB {node_name} {node_name}.sub")
@@ -598,6 +677,7 @@ def _write_submit_file(
     desired_sites: str = "",
     memory_mb: int = 0,
     disk_kb: int = 0,
+    ncpus: int = 0,
     transfer_input_files: list[str] | None = None,
 ) -> None:
     lines = [
@@ -609,6 +689,8 @@ def _write_submit_file(
         f"error = {Path(path).stem}.err",
         f"log = {Path(path).stem}.log",
     ]
+    if ncpus > 0:
+        lines.append(f"request_cpus = {ncpus}")
     if memory_mb > 0:
         lines.append(f"request_memory = {memory_mb}")
     if disk_kb > 0:
@@ -625,23 +707,44 @@ def _write_submit_file(
 
 def _generate_pilot_submit(
     submit_dir: str,
-    sandbox_url: str,
+    sandbox_path: str,
     input_files: list[str],
+    pilot_config: dict[str, Any] | None = None,
 ) -> str:
+    pc = pilot_config or {}
     input_str = ",".join(input_files)
-    return "\n".join([
+    sandbox_basename = os.path.basename(sandbox_path) if sandbox_path else "sandbox.tar.gz"
+    args = (
+        f"--sandbox {sandbox_basename} --input {input_str}"
+        f" --initial-events {pc.get('initial_events', 200)}"
+        f" --timeout {pc.get('timeout', 900)}"
+    )
+    transfer_inputs = ["wms2_pilot.py"]
+    if sandbox_path and os.path.isfile(sandbox_path):
+        transfer_inputs.append(sandbox_path)
+    lines = [
         "# WMS2 pilot job",
         "universe = vanilla",
-        "executable = run_pilot.sh",
-        f"arguments = --sandbox {sandbox_url} --input {input_str}",
+        "executable = wms2_pilot.py",
+        f"arguments = {args}",
         "output = pilot.out",
         "error = pilot.err",
         "log = pilot.log",
+    ]
+    ncpus = pc.get("ncpus", 0)
+    if ncpus > 0:
+        lines.append(f"request_cpus = {ncpus}")
+    memory_mb = pc.get("memory_mb", 0)
+    if memory_mb > 0:
+        lines.append(f"request_memory = {memory_mb}")
+    lines.extend([
         "should_transfer_files = YES",
         "when_to_transfer_output = ON_EXIT",
+        f"transfer_input_files = {','.join(transfer_inputs)}",
         "transfer_output_files = pilot_metrics.json",
         "queue 1",
-    ]) + "\n"
+    ])
+    return "\n".join(lines) + "\n"
 
 
 def _write_elect_site_script(path: str) -> None:
@@ -694,13 +797,13 @@ def _write_proc_script(path: str) -> None:
     """Generate a processing wrapper that supports CMSSW, synthetic, and pilot modes.
 
     Extracts sandbox, reads manifest.json, and dispatches to the appropriate mode.
-    HTCondor captures stdout in proc_NNNNNN.out.  For CMSSW mode the real output
-    files are ROOT files transferred back by HTCondor.
+    CMSSW mode handles per-step CMSSW/ScramArch with apptainer container support
+    for cross-OS execution (e.g. el8 CMSSW on el9 host).
     """
     _write_file(path, r'''#!/bin/bash
-# run_payload.sh — WMS2 processing job wrapper
-# Supports CMSSW mode (cmsRun via CVMFS), synthetic mode (sized output),
-# and pilot mode (iterative measurement).
+# wms2_proc.sh — WMS2 processing job wrapper
+# Supports CMSSW mode (per-step cmsRun with apptainer), synthetic mode
+# (sized output), and pilot mode (iterative measurement).
 set -euo pipefail
 
 # ── Argument parsing ──────────────────────────────────────────
@@ -764,18 +867,107 @@ lfn_to_xrootd() {
     fi
 }
 
-# ── CMSSW mode ────────────────────────────────────────────────
+# ── Host OS detection ─────────────────────────────────────────
+detect_host_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        case "$VERSION_ID" in
+            8*) echo "el8" ;;
+            9*) echo "el9" ;;
+            *)  echo "unknown" ;;
+        esac
+    else
+        echo "unknown"
+    fi
+}
+
+# ── Container resolution ──────────────────────────────────────
+resolve_container() {
+    local scram_arch="$1"
+    local arch_os="${scram_arch%%_*}"   # "el8" from "el8_amd64_gcc10"
+    local HOST_OS
+    HOST_OS=$(detect_host_os)
+
+    if [[ "$arch_os" == "$HOST_OS" ]]; then
+        echo ""  # native execution
+        return
+    fi
+
+    # Find container image on CVMFS
+    for variant in "x86_64" "amd64"; do
+        local img="/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/${arch_os}:${variant}"
+        if [[ -d "$img" ]]; then
+            echo "$img"
+            return
+        fi
+    done
+    echo "ERROR: No container for $scram_arch (need $arch_os, host is $HOST_OS)" >&2
+    return 1
+}
+
+# ── CMSSW step execution: native ──────────────────────────────
+CURRENT_CMSSW=""
+CURRENT_ARCH=""
+
+run_step_native() {
+    local cmssw="$1" arch="$2" cmsrun_args="$3"
+    if [[ "$cmssw" != "$CURRENT_CMSSW" || "$arch" != "$CURRENT_ARCH" ]]; then
+        export SCRAM_ARCH="$arch"
+        source /cvmfs/cms.cern.ch/cmsset_default.sh
+        if [[ ! -d "$cmssw/src" ]]; then
+            scramv1 project CMSSW "$cmssw"
+        fi
+        cd "$cmssw/src" && eval $(scramv1 runtime -sh) && cd "$WORK_DIR"
+        CURRENT_CMSSW="$cmssw"
+        CURRENT_ARCH="$arch"
+    fi
+    cmsRun $cmsrun_args
+}
+
+# ── CMSSW step execution: apptainer ───────────────────────────
+run_step_apptainer() {
+    local container="$1" cmssw="$2" arch="$3" cmsrun_args="$4"
+
+    # Resolve siteconfig path: default to /opt/cms/siteconf if SITECONFIG_PATH unset
+    local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+
+    cat > _step_runner.sh <<STEPEOF
+#!/bin/bash
+set -e
+export SCRAM_ARCH=$arch
+export X509_USER_PROXY="${X509_USER_PROXY:-}"
+export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+if [[ ! -d $cmssw/src ]]; then
+    scramv1 project CMSSW $cmssw
+fi
+cd $cmssw/src && eval \$(scramv1 runtime -sh) && cd $WORK_DIR
+# Override CMS_PATH so cmsRun finds our site-local-config at
+# \$CMS_PATH/SITECONF/local/JobConfig/site-local-config.xml
+mkdir -p $WORK_DIR/_cms/SITECONF/local
+ln -sfn $SITE_CFG/JobConfig    $WORK_DIR/_cms/SITECONF/local/JobConfig
+ln -sfn $SITE_CFG/PhEDEx       $WORK_DIR/_cms/SITECONF/local/PhEDEx   2>/dev/null || true
+ln -sfn $SITE_CFG/storage.json $WORK_DIR/_cms/SITECONF/local/storage.json 2>/dev/null || true
+export CMS_PATH=$WORK_DIR/_cms
+cmsRun $cmsrun_args
+STEPEOF
+    chmod +x _step_runner.sh
+
+    # Bind paths: CVMFS, working dir, temp, and optional site config / credentials
+    local BIND="/cvmfs,/tmp,$(pwd)"
+    [[ -d /opt/cms/siteconf ]] && BIND="$BIND,/opt/cms/siteconf"
+    [[ -d /mnt/creds ]]        && BIND="$BIND,/mnt/creds"
+    [[ -d /mnt/shared ]]       && BIND="$BIND,/mnt/shared"
+    export APPTAINER_BINDPATH="$BIND"
+    apptainer exec --no-home "$container" bash "$(pwd)/_step_runner.sh"
+}
+
+# ── CMSSW mode (per-step CMSSW/ScramArch with apptainer) ─────
 run_cmssw_mode() {
     echo "--- CMSSW mode ---"
 
-    # Read CMSSW params from manifest
-    CMSSW_VERSION=$(python3 -c "import json; print(json.load(open('manifest.json'))['cmssw_version'])")
-    SCRAM_ARCH=$(python3 -c "import json; print(json.load(open('manifest.json'))['scram_arch'])")
-    NUM_STEPS=$(python3 -c "import json; print(len(json.load(open('manifest.json')).get('steps',[])))")
-
-    echo "CMSSW:     $CMSSW_VERSION"
-    echo "arch:      $SCRAM_ARCH"
-    echo "steps:     $NUM_STEPS"
+    NUM_STEPS=$(python3 -c "import json; print(len(json.load(open('manifest.json'))['steps']))")
+    echo "steps: $NUM_STEPS"
 
     # Check CVMFS
     if [[ ! -d /cvmfs/cms.cern.ch ]]; then
@@ -783,17 +975,7 @@ run_cmssw_mode() {
         exit 1
     fi
 
-    # Setup CMSSW environment
-    export SCRAM_ARCH
-    source /cvmfs/cms.cern.ch/cmsset_default.sh
-    scramv1 project CMSSW "$CMSSW_VERSION"
-    cd "${CMSSW_VERSION}/src"
-    eval $(scramv1 runtime -sh)
-    cd "$WORK_DIR"
-
-    echo "CMSSW environment ready"
-
-    # Build input file list for first step
+    # Build xrootd input file list for first step
     IFS=',' read -ra LFN_ARRAY <<< "$INPUT_LFNS"
     XROOTD_INPUTS=""
     for lfn in "${LFN_ARRAY[@]}"; do
@@ -807,38 +989,94 @@ run_cmssw_mode() {
         fi
     done
 
-    # Run each step
     PREV_OUTPUT=""
+
     for step_idx in $(seq 0 $((NUM_STEPS - 1))); do
         step_num=$((step_idx + 1))
-        STEP_NAME=$(python3 -c "import json; print(json.load(open('manifest.json'))['steps'][$step_idx]['name'])")
-        PSET_PATH=$(python3 -c "import json; print(json.load(open('manifest.json'))['steps'][$step_idx]['pset'])")
-        INPUT_FROM=$(python3 -c "import json; print(json.load(open('manifest.json'))['steps'][$step_idx].get('input_from_step',''))")
+
+        # Read step config from manifest
+        STEP_JSON=$(python3 -c "import json; s=json.load(open('manifest.json'))['steps'][$step_idx]; print(json.dumps(s))")
+        STEP_NAME=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+        CMSSW_VER=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['cmssw_version'])")
+        STEP_ARCH=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['scram_arch'])")
+        PSET_PATH=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['pset'])")
+        INPUT_STEP=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('input_step',''))")
+        NTHREADS=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('multicore',1))")
 
         echo ""
         echo "--- Step $step_num: $STEP_NAME ---"
-        echo "  PSet: $PSET_PATH"
+        echo "  CMSSW:  $CMSSW_VER"
+        echo "  Arch:   $STEP_ARCH"
+        echo "  PSet:   $PSET_PATH"
 
+        # Build cmsRun command (no command-line overrides — ConfigCache PSets
+        # ignore them; inject everything into PSet via python append).
         CMSRUN_ARGS="-j report_step${step_num}.xml $PSET_PATH"
 
-        # Determine input files for this step
-        if [[ -n "$INPUT_FROM" && -n "$PREV_OUTPUT" ]]; then
-            CMSRUN_ARGS="$CMSRUN_ARGS inputFiles=file:$PREV_OUTPUT"
-        elif [[ -n "$XROOTD_INPUTS" && $step_idx -eq 0 ]]; then
-            CMSRUN_ARGS="$CMSRUN_ARGS inputFiles=$XROOTD_INPUTS"
+        # Determine input files for PSet injection
+        INJECT_INPUT=""
+        if [[ -n "$INPUT_STEP" && -n "$PREV_OUTPUT" ]]; then
+            INJECT_INPUT="file:$PREV_OUTPUT"
+        elif [[ $step_idx -eq 0 && -n "$XROOTD_INPUTS" ]]; then
+            INJECT_INPUT="$XROOTD_INPUTS"
         fi
 
-        # Event range
-        if [[ "$EVENTS_PER_JOB" -gt 0 ]]; then
-            CMSRUN_ARGS="$CMSRUN_ARGS maxEvents=$EVENTS_PER_JOB"
+        # Inject runtime overrides into PSet (input files, maxEvents, nThreads)
+        python3 -c "
+import os
+pset = '$PSET_PATH'
+lines = ['', '# --- WMS2 runtime PSet injection ---']
+lines.append('import FWCore.ParameterSet.Config as cms')
+
+# Input files override
+inject_input = '$INJECT_INPUT'
+if inject_input:
+    file_list = inject_input.split(',')
+    quoted = ', '.join(repr(f) for f in file_list)
+    lines.append('process.source.fileNames = cms.untracked.vstring(' + quoted + ')')
+    lines.append('process.source.secondaryFileNames = cms.untracked.vstring()')
+
+# maxEvents: only for first step
+step_idx = $step_idx
+events_per_job = $EVENTS_PER_JOB
+first_event = $FIRST_EVENT
+if step_idx == 0 and events_per_job > 0:
+    lines.append('process.maxEvents.input = cms.untracked.int32(' + str(events_per_job) + ')')
+if step_idx == 0 and first_event > 0:
+    lines.append('process.source.firstEvent = cms.untracked.uint32(' + str(first_event) + ')')
+
+# nThreads
+nthreads = $NTHREADS
+if nthreads > 1:
+    lines.append('if not hasattr(process, \"options\"):')
+    lines.append('    process.options = cms.untracked.PSet()')
+    lines.append('process.options.numberOfThreads = cms.untracked.uint32(' + str(nthreads) + ')')
+    lines.append('process.options.numberOfStreams = cms.untracked.uint32(0)')
+
+with open(pset, 'a') as f:
+    f.write(chr(10).join(lines) + chr(10))
+"
+        if [[ -n "$INJECT_INPUT" ]]; then
+            echo "  input: $INJECT_INPUT (injected into PSet)"
         fi
-        if [[ "$FIRST_EVENT" -gt 0 ]]; then
-            CMSRUN_ARGS="$CMSRUN_ARGS firstEvent=$FIRST_EVENT"
+        if [[ $step_idx -eq 0 && "$EVENTS_PER_JOB" -gt 0 ]]; then
+            echo "  maxEvents: $EVENTS_PER_JOB (injected into PSet)"
+        fi
+        if [[ "$NTHREADS" -gt 1 ]]; then
+            echo "  nThreads: $NTHREADS (injected into PSet)"
         fi
 
         echo "  cmsRun $CMSRUN_ARGS"
         STEP_START=$(date +%s)
-        cmsRun $CMSRUN_ARGS
+
+        # Execute: determine if we need apptainer
+        CONTAINER=$(resolve_container "$STEP_ARCH")
+        if [[ -z "$CONTAINER" ]]; then
+            run_step_native "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+        else
+            run_step_apptainer "$CONTAINER" "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+        fi
+
         STEP_RC=$?
         STEP_END=$(date +%s)
         STEP_WALL=$((STEP_END - STEP_START))
@@ -850,22 +1088,21 @@ run_cmssw_mode() {
 
         echo "  Step $STEP_NAME completed in ${STEP_WALL}s"
 
-        # Parse FrameworkJobReport for output file
-        if [[ -f "report_step${step_num}.xml" ]]; then
-            PREV_OUTPUT=$(python3 -c "
+        # Parse FrameworkJobReport for output file (strip file: prefix)
+        PREV_OUTPUT=$(python3 -c "
 import xml.etree.ElementTree as ET
 try:
     tree = ET.parse('report_step${step_num}.xml')
     for f in tree.findall('.//File'):
         pfn = f.findtext('PFN', '')
+        if pfn.startswith('file:'): pfn = pfn[5:]
         if pfn:
             print(pfn)
             break
 except Exception:
     pass
 " 2>/dev/null || true)
-            echo "  Output: ${PREV_OUTPUT:-none}"
-        fi
+        echo "  Output: ${PREV_OUTPUT:-none}"
     done
 
     # Collect output sizes

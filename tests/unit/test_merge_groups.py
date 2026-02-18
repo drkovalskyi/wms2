@@ -1,4 +1,4 @@
-"""Tests for merge group planning."""
+"""Tests for merge group planning (fixed job count)."""
 
 from wms2.core.dag_planner import _plan_merge_groups
 from wms2.core.splitters import DAGNodeSpec, InputFile
@@ -20,37 +20,51 @@ def _make_node(index, events=10000, size=1_000_000_000):
 
 class TestPlanMergeGroups:
     def test_single_group(self):
-        """All nodes fit in one group when output is small."""
-        nodes = [_make_node(i, events=100) for i in range(5)]
-        # 100 events * 50 kb/event = 5000 kb per node, 25000 kb total < 4GB
-        groups = _plan_merge_groups(nodes, output_size_per_event_kb=50.0, target_kb=4_194_304)
+        """Fewer nodes than jobs_per_group → one group."""
+        nodes = [_make_node(i) for i in range(5)]
+        groups = _plan_merge_groups(nodes, jobs_per_group=8)
         assert len(groups) == 1
         assert len(groups[0].processing_nodes) == 5
 
     def test_multiple_groups(self):
-        """Nodes split into multiple groups when output exceeds target."""
-        nodes = [_make_node(i, events=100000) for i in range(10)]
-        # 100k events * 50 kb/event = 5_000_000 kb per node
-        # target = 10_000_000 kb → 2 nodes per group → 5 groups
-        groups = _plan_merge_groups(nodes, output_size_per_event_kb=50.0, target_kb=10_000_000)
-        assert len(groups) == 5
+        """Nodes evenly divisible by jobs_per_group."""
+        nodes = [_make_node(i) for i in range(16)]
+        groups = _plan_merge_groups(nodes, jobs_per_group=8)
+        assert len(groups) == 2
         for g in groups:
-            assert len(g.processing_nodes) == 2
+            assert len(g.processing_nodes) == 8
 
-    def test_group_boundary_exact(self):
-        """When a node exactly fills a group, next node starts new group."""
-        nodes = [_make_node(i, events=10000) for i in range(3)]
-        # 10000 events * 100 kb = 1_000_000 kb per node, target = 1_000_000
-        groups = _plan_merge_groups(nodes, output_size_per_event_kb=100.0, target_kb=1_000_000)
-        # Each node exactly fills a group
-        assert len(groups) == 3
+    def test_remainder_group(self):
+        """Last group smaller than jobs_per_group."""
+        nodes = [_make_node(i) for i in range(10)]
+        groups = _plan_merge_groups(nodes, jobs_per_group=8)
+        assert len(groups) == 2
+        assert len(groups[0].processing_nodes) == 8
+        assert len(groups[1].processing_nodes) == 2
 
     def test_empty_nodes(self):
-        groups = _plan_merge_groups([], output_size_per_event_kb=50.0, target_kb=4_194_304)
+        """Empty input returns empty list."""
+        groups = _plan_merge_groups([], jobs_per_group=8)
         assert groups == []
 
     def test_group_indices_sequential(self):
-        nodes = [_make_node(i, events=100000) for i in range(6)]
-        groups = _plan_merge_groups(nodes, output_size_per_event_kb=50.0, target_kb=5_500_000)
+        """Group indices are 0, 1, 2, ..."""
+        nodes = [_make_node(i) for i in range(20)]
+        groups = _plan_merge_groups(nodes, jobs_per_group=8)
         for i, g in enumerate(groups):
             assert g.group_index == i
+
+    def test_single_node_per_group(self):
+        """jobs_per_group=1 creates one group per node."""
+        nodes = [_make_node(i) for i in range(3)]
+        groups = _plan_merge_groups(nodes, jobs_per_group=1)
+        assert len(groups) == 3
+        for g in groups:
+            assert len(g.processing_nodes) == 1
+
+    def test_exact_fit(self):
+        """Exactly jobs_per_group nodes → one group."""
+        nodes = [_make_node(i) for i in range(8)]
+        groups = _plan_merge_groups(nodes, jobs_per_group=8)
+        assert len(groups) == 1
+        assert len(groups[0].processing_nodes) == 8
