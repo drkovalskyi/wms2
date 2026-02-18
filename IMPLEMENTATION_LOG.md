@@ -1200,3 +1200,78 @@ python scripts/e2e_real_condor.py \
 - Pilot integration — Use pilot_runner to measure real metrics before production DAG
 - Site Manager — CRIC sync for site status and capacity
 - Real DBS/Rucio adapters — actual service calls for output registration and transfers
+
+---
+
+# Phase 9 — Environment Test Infrastructure
+
+**Date**: 2026-02-18
+**Spec Version**: 2.4.0
+**Phase**: 9 — Test Environment Gating
+
+---
+
+## What Was Built
+
+### Test Levels
+
+Four hierarchical test levels, each gating the next:
+
+| Level | Scope | Checks |
+|-------|-------|--------|
+| 0 | Unit tests | Python >= 3.11, 8 core packages importable, PostgreSQL reachable |
+| 1 | Local real CMSSW | CVMFS mounted, CMSSW releases available, valid X509 proxy, siteconf exists, apptainer available |
+| 2 | Local HTCondor | HTCondor CLI tools, schedd reachable, execution slots available, htcondor2 Python bindings |
+| 3 | Production CMS services | ReqMgr2 API, DBS API, CouchDB/ConfigCache (HTTPS + X509 auth) |
+
+Levels are cumulative: a test marked `level2` requires both level 1 and level 2 checks to pass.
+
+### Environment Check Module (`tests/environment/checks.py`)
+
+Reusable check functions that return `(ok: bool, detail: str)`:
+- Level 0: `check_python_version()`, `check_package_importable()`, `check_postgres_reachable()`
+- Level 1: `check_cvmfs_mounted()`, `check_cmssw_release_available()`, `check_x509_proxy()`, `check_siteconf()`, `check_apptainer()`
+- Level 2: `check_condor_binaries()`, `check_condor_schedd()`, `check_condor_slots()`, `check_condor_python_bindings()`
+- Level 3: `check_reqmgr2_reachable()`, `check_dbs_reachable()`, `check_couchdb_reachable()`
+- `run_level_checks(level)` — aggregate runner returning all results for a level
+
+Level 3 checks use `curl` subprocess instead of httpx because Python's ssl module does not handle X509 proxy certificate chains correctly (sends only the proxy cert, not the full chain, resulting in HTTP 401).
+
+### Environment Test Files (`tests/environment/test_level{0-3}.py`)
+
+Each level has its own test file. Running `pytest tests/environment/` serves as a pre-flight check before any real tests.
+
+### Gating Mechanism (`tests/conftest.py`)
+
+- `pytest_configure()` — registers `level1`, `level2`, `level3` markers
+- `pytest_collection_modifyitems()` — runs environment checks once per session (cached), auto-skips tests whose level prerequisites are not met
+- Skip messages include the specific failure: `"Level 2 environment not ready: condor_schedd: ..."`
+
+### Marker Registration (`pyproject.toml`)
+
+Added `[tool.pytest.ini_options].markers` for `level1`, `level2`, `level3`, and legacy `condor`.
+
+### Migration of Existing Tests
+
+Updated `tests/integration/test_condor_submit.py`: replaced ad-hoc `WMS2_CONDOR_HOST` env var gate with `@pytest.mark.level2`.
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/environment/ -v` — 22 checks pass (all levels available on dev VM)
+3. `pytest tests/ -v -k "not condor"` — 238 tests pass (22 environment + 216 existing)
+
+## Design Decisions
+
+- **Checks return (ok, detail), not raise**: Check functions are pure predicates. They never throw — this lets the gating logic collect all failures before deciding to skip, and gives clear diagnostic messages.
+- **curl for Level 3 instead of httpx**: Python's ssl context doesn't forward the full X509 proxy certificate chain, causing HTTP 401 from CMS services. `curl` handles this correctly. This is the right tool for the job — the check is about the environment, not about Python's TLS stack.
+- **Levels are cumulative**: A `level2` test auto-requires `level1`. This prevents confusing failures where HTCondor is available but CVMFS isn't.
+- **Environment tests are not markers on themselves**: The `tests/environment/test_level*.py` files don't carry level markers — they *are* the environment checks. The markers are for gating actual functional tests.
+
+## What's Next
+
+- Mark existing and future tests with appropriate level markers as they're written
+- Add checks for new requirements as they're discovered during debugging
+- Multi-merge-group DAG — Submit workflow with multiple work units
+- Output registration — Wire merge outputs to Output Manager
+- Site Manager — CRIC sync for site status and capacity
