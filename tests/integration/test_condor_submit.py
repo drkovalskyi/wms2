@@ -1,7 +1,7 @@
-"""Integration tests for HTCondor submission — requires a running HTCondor container.
+"""Integration tests for HTCondor submission — requires a running HTCondor pool.
 
-Run with: pytest tests/integration/test_condor_submit.py -v -m condor
-Skip without container: pytest -m "not condor"
+Run with: pytest tests/integration/test_condor_submit.py -v -m level2
+Skip:     pytest -m "not level2"
 """
 
 import os
@@ -11,11 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-condor_mark = pytest.mark.condor
-pytestmark = [condor_mark, pytest.mark.skipif(
-    not os.environ.get("WMS2_CONDOR_HOST"),
-    reason="Set WMS2_CONDOR_HOST to run HTCondor integration tests",
-)]
+pytestmark = [pytest.mark.level2, pytest.mark.condor]
 
 
 @pytest.fixture

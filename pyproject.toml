@@ -39,6 +39,12 @@ packages = ["src/wms2"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "level1: Requires local CMSSW (CVMFS, X509, siteconf, apptainer)",
+    "level2: Requires local HTCondor (schedd, slots, Python bindings)",
+    "level3: Requires production CMS services (ReqMgr2, DBS, CouchDB)",
+    "condor: HTCondor integration tests (legacy)",
+]
 
 [tool.ruff]
 target-version = "py311"
