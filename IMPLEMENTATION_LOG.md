@@ -1039,3 +1039,164 @@ This reuses the same rescue DAG mechanism as clean stop recovery (Phase 1), but 
 - CVMFS setup on dev VM — Enable real CMSSW execution
 - Real DBS/Rucio adapters — actual service calls for output registration and transfers
 - Continuous lifecycle loop testing — multi-request concurrent processing
+
+---
+
+# Phase 8 — Real CMSSW StepChain Execution via HTCondor
+
+**Date**: 2026-02-18
+**Spec Version**: 2.4.0
+**Phase**: 8 — Real CMSSW Payload Verification
+
+---
+
+## What Was Built
+
+### Real CMSSW StepChain Support — `_write_proc_script()` rewrite in `dag_planner.py`
+
+Major rewrite of the processing wrapper to handle real multi-step CMSSW StepChain execution. The wrapper now has two execution paths:
+
+**`run_step_native()`** — Direct execution on hosts with CVMFS:
+- Sources `/cvmfs/cms.cern.ch/cmsset_default.sh`
+- Creates CMSSW project via `scramv1 project`
+- Evaluates runtime environment via `scramv1 runtime -sh`
+- Overrides `CMS_PATH` with local siteconf symlinks to `/opt/cms/siteconf/` (or `$SITECONFIG_PATH`)
+- Runs `cmsRun` with step-specific PSet.py
+
+**`run_step_apptainer()`** — Container execution for cross-architecture (el8 on el9):
+- Uses `apptainer exec` with `/cvmfs/unpacked.cern.ch` singularity images
+- Binds CVMFS, siteconf, and X509 credentials into the container
+- Passes `SCRAM_ARCH` from manifest for architecture selection
+
+**Step chaining logic**:
+- Step 1 gets `--firstEvent`, `--lastEvent`, `--nThreads`, `--customise_commands` for maxEvents
+- Steps 2+ get `--filein file:` pointing to previous step's output, `--nThreads`, `--customise_commands` for maxEvents=-1
+- GEN steps: uses `--customise_commands 'process.maxEvents.input=...'` since there's no input file
+- Non-GEN steps: output file names derived from step config in manifest
+
+**PSet maxEvents injection**:
+- Production PSets from ConfigCache have hardcoded `maxEvents` from cmsDriver (e.g., 100 events)
+- Steps 2+ need `maxEvents=-1` injected to process all input from previous step
+- Added `process.maxEvents.input = cms.untracked.int32(-1)` append to PSet.py for steps 2+
+
+### HTCondor Environment Passthrough — `_write_submit_file()` and `_generate_group_dag()`
+
+HTCondor sanitizes job environments by default. Added explicit environment passthrough:
+
+**`_write_submit_file()`** — New `environment: dict[str, str] | None` parameter:
+```python
+if environment:
+    env_str = " ".join(f"{k}={v}" for k, v in environment.items())
+    lines.append(f'environment = "{env_str}"')
+```
+
+**`_generate_group_dag()`** — Passes three env vars from submitter to proc jobs:
+- `X509_USER_PROXY` — Required for xrootd pileup access via `root://cms-xrd-global.cern.ch/`
+- `X509_CERT_DIR` — CA certificate directory for grid authentication
+- `SITECONFIG_PATH` — Path to CMS site-local-config (defaults to `/opt/cms/siteconf/`)
+
+### StepChain Module (`core/stepchain.py`)
+
+New module for CMSSW StepChain request handling:
+- `extract_steps_from_request()` — Parses ReqMgr2 StepChain request into ordered list of step dicts
+- `get_step_output_modules()` — Determines output module names and dataset tiers per step
+- `resolve_input_chain()` — Maps step N input to step N-1 output for file chaining
+
+### PSet Generator (`core/pset_generator.py`)
+
+New module for downloading and processing ConfigCache PSets:
+- `fetch_config_cache_pset()` — Downloads PSet.py from CouchDB ConfigCache
+- `inject_max_events()` — Appends `maxEvents=-1` for steps 2+
+
+### Pilot Runner (`core/pilot_runner.py`)
+
+Standalone pilot execution without full DAG:
+- `run_pilot()` — Executes a single processing node with small event count
+- Measures wall time, RSS, output size per step
+- Returns structured pilot metrics
+
+### End-to-End Test Script (`scripts/e2e_real_condor.py`)
+
+New script for real CMSSW HTCondor verification:
+- Fetches request from ReqMgr2 (HTTPS with CA bundle)
+- Downloads ConfigCache PSets from CouchDB
+- Builds sandbox with real PSets
+- Creates mock workflow matching request parameters
+- Submits production DAG via DAGPlanner
+- Polls DAGMan to completion with progress display
+- `--events N` — Events per job (default 1000)
+- `--jobs N` — Number of parallel jobs (default 1)
+- `--request` — ReqMgr2 request name
+
+### Unit Tests
+
+| File | Tests | What |
+|---|---|---|
+| `test_stepchain.py` | 6 | Step extraction, output module resolution, input chaining |
+| `test_pilot_runner.py` | 4 | Pilot metric collection, error handling |
+
+---
+
+## Verification — 8-Job Real CMSSW StepChain via HTCondor
+
+**Request**: `cmsunified_task_NPS-Run3Summer22EEGS-00049__v1_T_260126_110934_54`
+**Chain**: 5 steps — GEN-SIM → DRPremix → HLT → MiniAOD → NanoAOD
+**CMSSW versions**: 12_4_16 (steps 1-2), 12_4_14_patch3 (step 3), 13_0_23 (step 4), 13_0_19 (step 5)
+**Architecture**: el8 via apptainer on el9 host
+**Resources**: 8 cores/job, 16 GB memory
+
+```
+python scripts/e2e_real_condor.py \
+  --request cmsunified_task_NPS-Run3Summer22EEGS-00049__v1_T_260126_110934_54 \
+  --events 50 --jobs 8
+```
+
+**Result**: 8/8 jobs completed all 5 steps in ~25 minutes. Full 64-core utilization.
+
+```
+[5/6] Polling DAGMan (max 7200s)...
+    [   0s] status=running nodes: 0/0 done, 0 queued, 0 ready, 0 failed
+    ...
+    [1526s] status=running nodes: 8/8 done, 0 queued, 0 ready, 0 failed
+    DAGMan finished successfully
+
+[6/6] Results
+    Status:  PASS
+    Time:    1526s (25.4 min)
+    Outputs: 8 × 5-step StepChain = 40 cmsRun executions, all succeeded
+```
+
+**Key milestones verified**:
+- xrootd pileup access works (MCPileup for DRPremix step via `root://cms-xrd-global.cern.ch/`)
+- Cross-CMSSW-version step chaining works (5 different releases in one job)
+- el8/el9 cross-architecture execution via apptainer works
+- Site-local-config override via CMS_PATH works across all steps
+- ConfigCache PSets with maxEvents injection work
+- 8 parallel jobs × 8 cores = 64 cores fully utilized
+
+---
+
+## Bugs Fixed
+
+1. **xrootd authentication failure in HTCondor jobs**: Step 2 (DRPremix) crashed with `[FATAL] Auth failed` trying to access MCPileup files. Root cause: `X509_USER_PROXY` not set in HTCondor job environment. Fixed by adding `environment` dict to submit files with proxy path passthrough.
+
+2. **Site-local-config not found in native execution**: Step 4 (MiniAOD, CMSSW_13_0_23) crashed with "Valid site-local-config not found at /cvmfs/cms.cern.ch/SITECONF/local/". Root cause: `scramv1 runtime` sets `CMS_PATH=/cvmfs/cms.cern.ch` which overrides any prior setting. Fixed by adding `CMS_PATH` override *after* `eval $(scramv1 runtime -sh)` in `run_step_native()`, symlinking to local siteconf.
+
+3. **Hardcoded maxEvents in ConfigCache PSets**: Production PSets from CouchDB had `process.maxEvents.input = cms.untracked.int32(100)` from cmsDriver. Steps 2+ would only process 100 events regardless of input. Fixed by appending `process.maxEvents.input = cms.untracked.int32(-1)` to PSet.py for all non-first steps.
+
+4. **Single-job bottleneck**: Initial test used 1 job × 1000 events (only 8 of 64 cores). Changed to support `--jobs N` for parallel execution within one merge group.
+
+## Design Decisions
+
+- **Environment passthrough is explicit, not blanket**: Only three specific env vars are forwarded (X509_USER_PROXY, X509_CERT_DIR, SITECONFIG_PATH). Using `getenv = true` in submit files would leak the full submitter environment, which is fragile and can conflict with CMSSW's `scramv1 runtime`.
+- **CMS_PATH override after scramv1**: The siteconf symlink approach (creating `$WORK_DIR/_cms/SITECONF/local/` with links to real config) is more robust than modifying `/cvmfs/` or relying on `$SITECONF` — it works for all CMSSW versions and both native/apptainer paths.
+- **maxEvents=-1 injected at PSet level, not cmsRun CLI**: Using `--customise_commands` for maxEvents on step 1 (GEN) and PSet append for steps 2+. CLI `--number` flag only works for step 1; steps 2+ must read all input from previous step, which requires PSet-level override.
+- **50 events/job × 8 jobs for e2e testing**: Much faster iteration than 1000 events × 1 job (25 min vs 70+ min). Uses all available cores. Sufficient to verify the full pipeline without waiting for production-scale event counts.
+
+## What's Next
+
+- Multi-merge-group DAG — Submit workflow with multiple work units (currently only one merge group tested)
+- Output registration — Wire merge outputs to Output Manager for DBS/Rucio registration
+- Pilot integration — Use pilot_runner to measure real metrics before production DAG
+- Site Manager — CRIC sync for site status and capacity
+- Real DBS/Rucio adapters — actual service calls for output registration and transfers
