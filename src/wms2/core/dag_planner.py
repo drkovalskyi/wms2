@@ -539,6 +539,18 @@ def _generate_group_dag(
     if sandbox_path and os.path.isfile(sandbox_path):
         proc_transfer_files.append(sandbox_path)
 
+    # Pass X509 proxy to jobs if available
+    proc_env: dict[str, str] = {}
+    x509_proxy = os.environ.get("X509_USER_PROXY", "")
+    if x509_proxy and os.path.isfile(x509_proxy):
+        proc_env["X509_USER_PROXY"] = x509_proxy
+    x509_cert_dir = os.environ.get("X509_CERT_DIR", "")
+    if x509_cert_dir:
+        proc_env["X509_CERT_DIR"] = x509_cert_dir
+    siteconfig = os.environ.get("SITECONFIG_PATH", "")
+    if siteconfig and os.path.isdir(siteconfig):
+        proc_env["SITECONFIG_PATH"] = siteconfig
+
     proc_nodes = merge_group.processing_nodes
     lines: list[str] = [
         f"# Merge group {merge_group.group_index}",
@@ -584,6 +596,7 @@ def _generate_group_dag(
             disk_kb=disk_kb,
             ncpus=ncpus,
             transfer_input_files=proc_transfer_files or None,
+            environment=proc_env or None,
         )
         lines.append(f"JOB {node_name} {node_name}.sub")
         lines.append(
@@ -679,6 +692,7 @@ def _write_submit_file(
     disk_kb: int = 0,
     ncpus: int = 0,
     transfer_input_files: list[str] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> None:
     lines = [
         f"# {description}",
@@ -695,6 +709,9 @@ def _write_submit_file(
         lines.append(f"request_memory = {memory_mb}")
     if disk_kb > 0:
         lines.append(f"request_disk = {disk_kb}")
+    if environment:
+        env_str = " ".join(f"{k}={v}" for k, v in environment.items())
+        lines.append(f'environment = "{env_str}"')
     lines.append("should_transfer_files = YES")
     lines.append("when_to_transfer_output = ON_EXIT")
     if transfer_input_files:
@@ -918,6 +935,13 @@ run_step_native() {
             scramv1 project CMSSW "$cmssw"
         fi
         cd "$cmssw/src" && eval $(scramv1 runtime -sh) && cd "$WORK_DIR"
+        # Override CMS_PATH for site-local-config
+        local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+        mkdir -p "$WORK_DIR/_cms/SITECONF/local"
+        ln -sfn "$SITE_CFG/JobConfig"    "$WORK_DIR/_cms/SITECONF/local/JobConfig"
+        ln -sfn "$SITE_CFG/PhEDEx"       "$WORK_DIR/_cms/SITECONF/local/PhEDEx"       2>/dev/null || true
+        ln -sfn "$SITE_CFG/storage.json" "$WORK_DIR/_cms/SITECONF/local/storage.json" 2>/dev/null || true
+        export CMS_PATH="$WORK_DIR/_cms"
         CURRENT_CMSSW="$cmssw"
         CURRENT_ARCH="$arch"
     fi
@@ -1036,12 +1060,15 @@ if inject_input:
     lines.append('process.source.fileNames = cms.untracked.vstring(' + quoted + ')')
     lines.append('process.source.secondaryFileNames = cms.untracked.vstring()')
 
-# maxEvents: only for first step
+# maxEvents: step 1 uses EVENTS_PER_JOB; steps 2+ use -1 (all input)
+# ConfigCache PSets have hardcoded maxEvents from cmsDriver that must be overridden.
 step_idx = $step_idx
 events_per_job = $EVENTS_PER_JOB
 first_event = $FIRST_EVENT
 if step_idx == 0 and events_per_job > 0:
     lines.append('process.maxEvents.input = cms.untracked.int32(' + str(events_per_job) + ')')
+elif step_idx > 0:
+    lines.append('process.maxEvents.input = cms.untracked.int32(-1)')
 if step_idx == 0 and first_event > 0:
     lines.append('process.source.firstEvent = cms.untracked.uint32(' + str(first_event) + ')')
 
@@ -1072,8 +1099,10 @@ with open(pset, 'a') as f:
         # Execute: determine if we need apptainer
         CONTAINER=$(resolve_container "$STEP_ARCH")
         if [[ -z "$CONTAINER" ]]; then
+            echo "  execution: native (host OS matches $STEP_ARCH)"
             run_step_native "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
         else
+            echo "  execution: apptainer ($CONTAINER)"
             run_step_apptainer "$CONTAINER" "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
         fi
 
