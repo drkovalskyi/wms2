@@ -1485,9 +1485,94 @@ The prefix is now a pure LFN→PFN mapping site prefix, not a partial path with 
 - **Backward compatibility**: Both merge script and proc wrapper handle missing `unmerged_lfn_base` gracefully (fall back to group directory reads). The merge script reads either `local_pfn_prefix` or `output_base_dir` from `output_info.json`.
 - **`lfn_to_pfn()` inline in merge script**: The merge script runs standalone on worker nodes without access to the `wms2` package. The 2-line helper is duplicated rather than imported.
 
+---
+
+## Phase 12 — cmsRun Merge Fix & NANOAODSIM Conversion (2026-02-19)
+
+**Date**: 2026-02-19
+**Spec Version**: 2.4.0
+**Phase**: 12 — Working cmsRun Merge
+
+---
+
+### Problem
+
+The Phase 11 E2E test completed the full pipeline (8 proc jobs → merge → cleanup) but with two critical defects:
+
+1. **Files not actually merged.** cmsRun merge failed with `LogicalFileNameNotFound` (missing `file:` prefix on local paths), hadd fallback failed with `libtbb.so.12: cannot open shared object` (ran bare binary outside CMSSW env on el9), so the merge job fell back to copying 8 individual files. A work unit should produce **one merged file per tier**.
+
+2. **NANOEDMAODSIM instead of NANOAODSIM.** Proc steps produce EDM-format nano (`NANOEDMAODSIM`). The merge step converts to flat ROOT ntuples (`NANOAODSIM`) via `mergeNANO=True` + `NanoAODOutputModule`. Since merge fell back to copy, no conversion happened.
+
+### Root Causes
+
+1. **`write_merge_pset()`** wrote bare paths like `'/mnt/shared/store/.../file.root'`. CMSSW's PoolSource requires `'file:/mnt/shared/store/.../file.root'` for local PFN.
+
+2. **`merge_root_with_hadd()`** found hadd binary path via `which hadd` inside CMSSW env, then ran the bare binary in a separate subprocess without CMSSW runtime libraries. On el9 host with el8 CMSSW, the binary needs the container and `LD_LIBRARY_PATH` from `scramv1 runtime -sh`.
+
+3. **`run_cmsrun()`** was missing `$SITE_CFG` in apptainer bind paths, missing `CMS_PATH` export (needed by CMSSW <14.x), and missing `SITECONF/local/` directory layout.
+
+4. **Merged output filename** used the input tier (`NANOEDMAODSIM`) rather than the converted tier (`NANOAODSIM`).
+
+### Changes (`src/wms2/core/dag_planner.py`)
+
+#### 1. `write_merge_pset()` — add `file:` prefix
+Input file paths and output file path now get `file:` prefix so CMSSW PoolSource treats them as local PFN, not LFN. Idempotent — skips if prefix already present.
+
+#### 2. `merge_root_with_hadd()` — run inside CMSSW env
+Replaced two-step approach (find hadd path, run bare binary) with a single bash command that sources `scramv1 runtime -sh` before running hadd. Uses apptainer via `resolve_container()` when cross-OS (el8 CMSSW on el9 host). Added `shlex.quote()` for safe shell quoting of file paths.
+
+#### 3. `run_cmsrun()` — site config fixes
+- **Bind `$SITE_CFG`** into apptainer: `bind_paths += "," + site_cfg`
+- **Export `CMS_PATH`** alongside `SITECONFIG_PATH` in runner script for CMSSW <14.x compat
+- **Create `SITECONF/local/` layout**: Copies `site-local-config.xml` and `PhEDEx/` into `_siteconf/SITECONF/local/` (the directory structure `CMS_PATH` expects)
+
+#### 4. `merge_root_tier()` — NANOEDMAODSIM → NANOAODSIM naming
+When the input tier contains "EDM" and "NANO" (i.e., `NANOEDMAODSIM`), the merged output filename uses the converted tier (`NANOAODSIM`). The `mergeNANO=True` flag in the PSet produces flat ROOT ntuples via `NanoAODOutputModule`, so the filename should reflect the actual output format.
+
+### Tests (`tests/unit/test_dag_generator.py`)
+
+3 new tests (40 total, was 37):
+
+- **`test_merge_pset_adds_file_prefix`** — Verifies `file:` prefix logic in generated `write_merge_pset()`
+- **`test_hadd_runs_inside_cmssw_env`** — Verifies hadd uses `scramv1 runtime` and apptainer support
+- **`test_cmsrun_merge_binds_site_cfg`** — Verifies site_cfg binding, `CMS_PATH` export, and `SITECONF/local/` layout
+
+### E2E Verification
+
+**Real CMSSW 5-step NPS StepChain** (GEN-SIM → DRPremix × 2 → MiniAOD → NanoAOD):
+```
+Request:  cmsunified_task_NPS-Run3Summer22EEGS-00049__v1_T_260126_110934_54
+Events:   50/job × 8 jobs = 400 total (8 cores each, 64 cores total)
+Result:   PASS — 1093s (18.2 min)
+```
+
+**Before (Phase 11):**
+- cmsRun merge: FAILED (LogicalFileNameNotFound)
+- hadd fallback: FAILED (libtbb.so.12 not found)
+- Result: 8 individual copied files per tier (no merge)
+
+**After (Phase 12):**
+- cmsRun merge: SUCCESS
+- MINIAODSIM: 8 files → **1 merged file** (`merged_MINIAODSIM.root`, 27.5 MB)
+- NANOAODSIM: 8 files → **1 merged file** (`merged_NANOAODSIM.root`, 3.0 MB, flat ntuple format)
+- Unmerged directories: cleaned up
+- No rescue DAGs, no hadd fallback needed
+
+**Output paths:**
+```
+/mnt/shared/store/mc/Run3Summer22EEMiniAODv4/.../MINIAODSIM/.../000000/merged_MINIAODSIM.root
+/mnt/shared/store/mc/Run3Summer22EENanoAODv12/.../NANOAODSIM/.../000000/merged_NANOAODSIM.root
+```
+
+### Key Discoveries
+
+- **CMSSW `file:` prefix**: CMSSW PoolSource interprets bare paths as LFNs (logical file names resolved via catalog). Local files must have `file:` prefix to be treated as PFNs. This is the same issue proc jobs had (already documented in MEMORY.md) — now also fixed for merge.
+- **hadd shared library dependency**: hadd from el8 CMSSW requires `libtbb.so.12` and other libraries from the CMSSW runtime. Running the binary outside `scramv1 runtime -sh` or outside the apptainer container fails on el9 hosts.
+- **CMS_PATH vs SITECONFIG_PATH**: CMSSW >=14.x uses `SITECONFIG_PATH` (flat layout: `$SITECONFIG_PATH/JobConfig/site-local-config.xml`). CMSSW <14.x uses `CMS_PATH` (nested layout: `$CMS_PATH/SITECONF/local/JobConfig/site-local-config.xml`). Both must be set for compatibility.
+
 ## What's Next
 
-- E2E verification with real CMSSW StepChain — verify files at `/mnt/shared/store/unmerged/...` and `/mnt/shared/store/mc/...`
-- Multi-merge-group DAG with output staging
+- Multi-merge-group DAG — Submit workflow with multiple work units
+- Output registration — Wire merge outputs to Output Manager (DBS/Rucio)
 - Site Manager — CRIC sync for site status and capacity
-- Real DBS/Rucio adapters — actual service calls for output registration and transfers
+- AODSIM tier handling — proc stages AODSIM to unmerged but no dataset config for it; decide whether to merge or discard
