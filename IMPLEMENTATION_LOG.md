@@ -1353,3 +1353,141 @@ Merged:   4 files (2 MINIAODSIM1 + 2 NANOEDMAODSIM1), 22.9 MB
 - Multi-merge-group DAG — Submit workflow with multiple work units
 - Output registration — Wire merge outputs to Output Manager
 - Site Manager — CRIC sync for site status and capacity
+
+---
+
+# Phase 11 — LFN-Based Output Paths: Unmerged Staging, Merged Output, Real Cleanup
+
+**Date**: 2026-02-19
+**Spec Version**: 2.4.0
+**Phase**: 11 — Correct Output Data Flow
+
+---
+
+## Problem
+
+Output paths were broken in multiple ways:
+
+1. **Proc outputs stayed in HTCondor sandbox** — temporary storage, lost after job exit. No staging to persistent site storage.
+2. **`output_base_dir` semantic mismatch** — Config was `/mnt/shared/store` with `local_output_path()` stripping `/store/` prefix. This caused double `/store/` in paths (e.g., `/mnt/shared/store/store/mc/...`).
+3. **No `UnmergedLFNBase`** — Never read from request, nowhere in the system. Proc outputs should go to `/store/unmerged/...` before merging.
+4. **Merge script read from wrong place** — Read proc outputs from group directory via glob. Should read from unmerged site storage where proc jobs stage their outputs.
+5. **No real cleanup** — Cleanup job was a no-op (`/bin/true` or generated script that did nothing). Unmerged files were never removed after merge.
+6. **`lstrip("/")` path bug** — `lfn_base.lstrip("/")` in the merge script could eat extra characters, and the overall path construction was fragile.
+
+### Correct Data Flow (WMAgent convention)
+
+```
+Proc job → stages to unmerged:  PFN = /mnt/shared + /store/unmerged/Era/Primary/TIER/Proc-v1/000000/file.root
+Merge job → reads unmerged, writes merged: PFN = /mnt/shared + /store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root
+Cleanup job → removes unmerged directory
+```
+
+LFN→PFN mapping: `PFN = local_pfn_prefix + LFN` (simple concatenation).
+
+## What Was Changed
+
+### Config (`config.py`)
+
+Renamed `output_base_dir: str = "/mnt/shared/store"` → `local_pfn_prefix: str = "/mnt/shared"`.
+
+The prefix is now a pure LFN→PFN mapping site prefix, not a partial path with `/store` baked in.
+
+### LFN Helpers (`core/output_lfn.py`)
+
+- **`lfn_to_pfn(local_pfn_prefix, lfn)`** — New canonical path function: `os.path.join(prefix, lfn.lstrip("/"))`. Replaces the old `local_output_path()` which stripped `/store/` prefix.
+- **`local_output_path()`** — Kept as backward-compatible alias for `lfn_to_pfn()`.
+- **`derive_merged_lfn_bases()`** — Now reads `UnmergedLFNBase` from request (default `/store/unmerged`) and produces `unmerged_lfn_base` per dataset alongside the existing `merged_lfn_base`.
+- **`unmerged_lfn_for_group()`** — New function, parallel to `merged_lfn_for_group()`, builds unmerged LFN paths per merge group.
+
+### CLI (`cli.py`)
+
+- Threads `unmerged_lfn_base` from request's `UnmergedLFNBase` field into workflow `config_data`.
+- Updated `_print_output_files()` to use `local_pfn_prefix` instead of `output_base_dir`.
+
+### Output Manager (`core/output_manager.py`)
+
+- Updated imports: `local_output_path` → `lfn_to_pfn`.
+- Updated all references: `self.settings.output_base_dir` → `self.settings.local_pfn_prefix`.
+
+### DAG Planner (`core/dag_planner.py`) — Major Changes
+
+**`output_info.json` format change**:
+- Renamed `output_base_dir` → `local_pfn_prefix`
+- Added `unmerged_lfn_base` per dataset entry
+- Backward compat: merge script reads either `local_pfn_prefix` or `output_base_dir`
+
+**Proc jobs**:
+- `output_info.json` added to `transfer_input_files` list
+- `--output-info output_info.json` added to proc job arguments
+- Proc wrapper parses `--output-info` argument
+
+**Proc wrapper — new `stage_out_to_unmerged()` function**:
+- After CMSSW/synthetic execution and output renaming, reads `output_info.json`
+- For each output file, looks up the unmerged LFN base by tier
+- Copies file to unmerged PFN: `local_pfn_prefix + unmerged_lfn_base/{group_index:06d}/{filename}`
+- Also stages the output manifest (`proc_N_outputs.json`) for merge to read
+- Graceful no-op if no `output_info.json` (backward compat)
+- Called from both `run_cmssw_mode()` and `run_synthetic_mode()`
+
+**Merge script — reads from unmerged site storage**:
+- New `lfn_to_pfn()` helper inline (same logic as `output_lfn.py`)
+- Reads proc ROOT files and output manifests from unmerged PFN paths instead of group directory glob
+- Falls back to group directory glob if no `unmerged_lfn_base` (backward compat with old format)
+- Writes merged output to merged PFN paths via `lfn_to_pfn()`
+- Writes `cleanup_manifest.json` listing unmerged directories for cleanup
+- Text file merge (`merge_text_files()`) updated to use `lfn_to_pfn()` for output paths
+
+**Cleanup script — new `_write_cleanup_script()` generating `wms2_cleanup.py`**:
+- Reads `cleanup_manifest.json` from group directory (written by merge job)
+- Removes all listed unmerged directories via `shutil.rmtree()`
+- Graceful no-op if no manifest found
+- In test mode (`/bin/true`), cleanup now uses generated script (same pattern as proc/merge)
+
+**Cleanup submit file**:
+- Now receives `--output-info` argument to find the group directory
+- Uses generated `wms2_cleanup.py` instead of `/bin/true` in test mode
+
+### Tests
+
+**`test_output_lfn.py`** — 18 tests (was 11):
+- New `TestLfnToPfn` class: store_mc, store_unmerged, no_double_slash, trailing_slash, backward_compat_alias
+- New `TestUnmergedLfnForGroup` class: directory_only, with_filename, large_group_index
+- `TestDeriveMergedLfnBases`: added `test_unmerged_lfn_base_derived`, `test_default_unmerged_lfn_base`
+
+**`test_dag_generator.py`** — 37 tests (was 28):
+- `test_output_info_json_format`: updated to assert `local_pfn_prefix` and `unmerged_lfn_base`, assert no `output_base_dir`
+- New: `test_proc_transfer_includes_output_info`, `test_proc_args_include_output_info`
+- New: `test_proc_script_has_stage_out`, `test_proc_script_output_info_arg`
+- New: `test_merge_script_uses_lfn_to_pfn`, `test_merge_script_reads_from_unmerged`, `test_merge_script_writes_cleanup_manifest`
+- New: `TestCleanupWrapper` class: `test_cleanup_script_generated`, `test_cleanup_script_reads_manifest`, `test_cleanup_submit_has_output_info`
+- Updated: `test_test_mode_uses_wrapper_scripts` — cleanup now also uses generated script
+- Updated: `test_wrapper_scripts_generated` — includes `wms2_cleanup.py`
+
+**`test_output_manager.py`** — Updated for renamed config field (`local_pfn_prefix`) and new PFN path structure.
+
+**Total: 272 tests passing** (excluding 2 pre-existing condor_submit failures unrelated to this change).
+
+---
+
+## Verification Steps
+
+1. `source .venv/bin/activate`
+2. `pytest tests/unit/test_output_lfn.py -v` — 18 tests pass
+3. `pytest tests/unit/test_dag_generator.py -v` — 37 tests pass
+4. `pytest tests/ -v --ignore=tests/integration/test_condor_submit.py` — 272 tests pass
+
+## Design Decisions
+
+- **`local_pfn_prefix` not `output_base_dir`**: The old name implied a directory containing outputs. The new name makes clear it's a site-specific prefix for LFN→PFN mapping. Default `/mnt/shared` means PFN = `/mnt/shared/store/mc/...`.
+- **Stage-out in proc wrapper, not HTCondor transfer**: HTCondor's `transfer_output_files` moves files to the group directory (DAGMan's working directory). Stage-out to site storage must happen *inside* the proc job, before HTCondor cleans up the sandbox.
+- **Cleanup manifest written by merge, read by cleanup**: The merge job knows which unmerged directories it read from. Writing a `cleanup_manifest.json` decouples cleanup from knowing the full LFN structure — it just removes what merge tells it to.
+- **Backward compatibility**: Both merge script and proc wrapper handle missing `unmerged_lfn_base` gracefully (fall back to group directory reads). The merge script reads either `local_pfn_prefix` or `output_base_dir` from `output_info.json`.
+- **`lfn_to_pfn()` inline in merge script**: The merge script runs standalone on worker nodes without access to the `wms2` package. The 2-line helper is duplicated rather than imported.
+
+## What's Next
+
+- E2E verification with real CMSSW StepChain — verify files at `/mnt/shared/store/unmerged/...` and `/mnt/shared/store/mc/...`
+- Multi-merge-group DAG with output staging
+- Site Manager — CRIC sync for site status and capacity
+- Real DBS/Rucio adapters — actual service calls for output registration and transfers
