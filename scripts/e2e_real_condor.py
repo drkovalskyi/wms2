@@ -231,6 +231,7 @@ def make_workflow(request: dict, sandbox_path: str, events_per_job: int,
             output_datasets.append({
                 "dataset_name": f"/{prim}/{acq}-{proc}-v{ver}/{tier}",
                 "merged_lfn_base": f"/store/mc/{acq}/{prim}/{tier}/{proc}-v{ver}",
+                "unmerged_lfn_base": f"/store/unmerged/{acq}/{prim}/{tier}/{proc}-v{ver}",
                 "data_tier": tier,
             })
 
@@ -308,7 +309,7 @@ async def run_test(request_name: str, events: int, num_jobs: int = 1):
         processing_executable="/bin/true",
         merge_executable="/bin/true",
         cleanup_executable="/bin/true",
-        output_base_dir=str(output_dir),
+        local_pfn_prefix="/mnt/shared",
         max_input_files=num_jobs,
     )
 
@@ -498,12 +499,31 @@ async def run_test(request_name: str, events: int, num_jobs: int = 1):
                 for line in content.split("\n")[-3:]:
                     print(f"      merge: {line}")
 
-    # Check output directory
-    merged_files = [f for f in output_dir.rglob("*") if f.is_file()]
-    if merged_files:
-        total_merged = sum(f.stat().st_size for f in merged_files)
-        print(f"\n    Merged output: {len(merged_files)} files, "
-              f"{total_merged / 1048576:.1f} MB in {output_dir}")
+    # Check LFN-based output paths
+    pfn_prefix = "/mnt/shared"
+    output_datasets = wf.config_data.get("output_datasets", [])
+    for ds in output_datasets:
+        tier = ds.get("data_tier", "?")
+        for label, key in [("merged", "merged_lfn_base"), ("unmerged", "unmerged_lfn_base")]:
+            lfn_base = ds.get(key, "")
+            if not lfn_base:
+                continue
+            pfn_dir = os.path.join(pfn_prefix, lfn_base.lstrip("/"))
+            if os.path.isdir(pfn_dir):
+                files = sorted(Path(pfn_dir).rglob("*"))
+                real_files = [f for f in files if f.is_file()]
+                if real_files:
+                    total = sum(f.stat().st_size for f in real_files)
+                    print(f"\n    {label}/{tier}: {len(real_files)} files, "
+                          f"{total / 1048576:.1f} MB")
+                    for f in real_files:
+                        print(f"      {f}  ({f.stat().st_size:,} bytes)")
+                else:
+                    tag = "(cleaned up)" if label == "unmerged" else "(empty)"
+                    print(f"\n    {label}/{tier}: {tag}")
+            else:
+                tag = "(cleaned up)" if label == "unmerged" else "(not found)"
+                print(f"\n    {label}/{tier}: {tag}")
 
     rescue_dags = list(wf_dir.glob("workflow.dag.rescue*"))
     if rescue_dags:
