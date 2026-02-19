@@ -278,6 +278,7 @@ async def run_import(args: argparse.Namespace) -> None:
                 "request_type": reqdata.get("RequestType"),
                 "output_datasets": output_datasets_info,
                 "merged_lfn_base": reqdata.get("MergedLFNBase", "/store/mc"),
+                "unmerged_lfn_base": reqdata.get("UnmergedLFNBase", "/store/unmerged"),
                 # CMSSW metadata
                 "cmssw_version": reqdata.get("CMSSWVersion"),
                 "scram_arch": reqdata.get("ScramArch"),
@@ -414,7 +415,7 @@ async def run_import(args: argparse.Namespace) -> None:
 
             # List merged output files on disk
             print()
-            _print_output_files(settings.output_base_dir)
+            _print_output_files(settings.local_pfn_prefix)
 
             print()
             print(f"=== DAG finished: {result.status.value} ===")

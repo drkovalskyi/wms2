@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     key_file: str | None = None
     ssl_ca_path: str = "/etc/grid-security/certificates"
 
-    # Output staging
-    output_base_dir: str = "/mnt/shared/store"
+    # Output staging — LFN→PFN mapping: PFN = local_pfn_prefix + LFN
+    local_pfn_prefix: str = "/mnt/shared"
 
     # Pilot profiling (optional functional test)
     pilot_initial_events: int = 200

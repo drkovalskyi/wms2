@@ -2,9 +2,42 @@
 
 from wms2.core.output_lfn import (
     derive_merged_lfn_bases,
+    lfn_to_pfn,
     local_output_path,
     merged_lfn_for_group,
+    unmerged_lfn_for_group,
 )
+
+
+class TestLfnToPfn:
+    def test_store_mc(self):
+        """LFN /store/mc/... → /mnt/shared/store/mc/..."""
+        result = lfn_to_pfn(
+            "/mnt/shared",
+            "/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root",
+        )
+        assert result == "/mnt/shared/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root"
+
+    def test_store_unmerged(self):
+        result = lfn_to_pfn(
+            "/mnt/shared",
+            "/store/unmerged/Era/Primary/TIER/Proc-v1",
+        )
+        assert result == "/mnt/shared/store/unmerged/Era/Primary/TIER/Proc-v1"
+
+    def test_no_double_slash(self):
+        """Prefix without trailing slash + LFN with leading slash → no double slash."""
+        result = lfn_to_pfn("/mnt/shared", "/store/mc/test")
+        assert "//" not in result
+
+    def test_prefix_with_trailing_slash(self):
+        result = lfn_to_pfn("/mnt/shared/", "/store/mc/test")
+        assert result == "/mnt/shared/store/mc/test"
+
+    def test_backward_compat_alias(self):
+        """local_output_path is an alias for lfn_to_pfn."""
+        assert local_output_path("/mnt/shared", "/store/mc/test") == \
+               lfn_to_pfn("/mnt/shared", "/store/mc/test")
 
 
 class TestDeriveMergedLfnBases:
@@ -30,6 +63,33 @@ class TestDeriveMergedLfnBases:
 
         # Second dataset
         assert result[1]["data_tier"] == "NANOAODSIM"
+
+    def test_unmerged_lfn_base_derived(self):
+        """Each result includes unmerged_lfn_base derived from UnmergedLFNBase."""
+        request_data = {
+            "MergedLFNBase": "/store/mc",
+            "UnmergedLFNBase": "/store/unmerged",
+            "OutputDatasets": [
+                "/Primary/Era-Proc-v1/AODSIM",
+            ],
+        }
+        result = derive_merged_lfn_bases(request_data)
+        assert len(result) == 1
+        assert result[0]["unmerged_lfn_base"] == (
+            "/store/unmerged/Era/Primary/AODSIM/Proc-v1"
+        )
+        assert result[0]["merged_lfn_base"] == (
+            "/store/mc/Era/Primary/AODSIM/Proc-v1"
+        )
+
+    def test_default_unmerged_lfn_base(self):
+        """Missing UnmergedLFNBase defaults to /store/unmerged."""
+        request_data = {
+            "OutputDatasets": ["/Primary/Era-Proc-v1/TIER"],
+        }
+        result = derive_merged_lfn_bases(request_data)
+        assert len(result) == 1
+        assert result[0]["unmerged_lfn_base"].startswith("/store/unmerged/")
 
     def test_no_output_modules_returns_empty(self):
         """No OutputDatasets → empty list."""
@@ -85,18 +145,16 @@ class TestMergedLfnForGroup:
         assert lfn == "/base/999999/merged.txt"
 
 
-class TestLocalOutputPath:
-    def test_store_mc_conversion(self):
-        """LFN /store/mc/... → /mnt/shared/store/mc/..."""
-        result = local_output_path(
-            "/mnt/shared/store",
-            "/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.txt",
-        )
-        assert result == "/mnt/shared/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.txt"
+class TestUnmergedLfnForGroup:
+    def test_directory_only(self):
+        """Without filename, returns directory path."""
+        result = unmerged_lfn_for_group("/store/unmerged/Era/Primary/TIER/Proc-v1", 0)
+        assert result == "/store/unmerged/Era/Primary/TIER/Proc-v1/000000"
 
-    def test_store_unmerged_conversion(self):
-        result = local_output_path(
-            "/mnt/shared/store",
-            "/store/unmerged/Era/Primary/TIER/Proc-v1",
-        )
-        assert result == "/mnt/shared/store/unmerged/Era/Primary/TIER/Proc-v1"
+    def test_with_filename(self):
+        result = unmerged_lfn_for_group("/store/unmerged/Era/Primary/TIER/Proc-v1", 3, "file.root")
+        assert result == "/store/unmerged/Era/Primary/TIER/Proc-v1/000003/file.root"
+
+    def test_large_group_index(self):
+        result = unmerged_lfn_for_group("/base", 999999)
+        assert result == "/base/999999"

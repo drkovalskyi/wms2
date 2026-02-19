@@ -1,18 +1,18 @@
 {
   "permissions": {
-    "allow": [
-      "Bash(alembic *)",
-      "Bash(uvicorn *)",
-      "Bash(httpx *)",
-      "Bash(condor_submit_dag *)",
-      "Bash(condor_hold *)",
-      "Bash(condor_release *)",
-      "Bash(condor_rm *)",
-      "Bash(rm -rf /mnt/shared/wms2_submit/*)",
-      "Bash(rm -rf /mnt/shared/store/*)",
-      "Bash(rm -rf /tmp/wms2*)",
-      "Bash(PGPASSWORD=* psql *)",
-      "Bash(su - wms2 *)"
+    "allowAll": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/root/.claude/hooks/policy-check.sh"
+          }
+        ]
+      }
     ]
   }
 }

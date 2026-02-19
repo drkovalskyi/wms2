@@ -4,28 +4,50 @@ CMS LFN conventions:
   Unmerged: /store/unmerged/{AcquisitionEra}/{PrimaryDataset}/{DataTier}/{ProcessingString}-v{ProcessingVersion}
   Merged:   /store/mc/{AcquisitionEra}/{PrimaryDataset}/{DataTier}/{ProcessingString}-v{ProcessingVersion}/{block}/{file}
   DBS name: /{PrimaryDataset}/{AcquisitionEra}-{ProcessingString}-v{ProcessingVersion}/{DataTier}
+
+LFN→PFN mapping for local storage:
+  PFN = local_pfn_prefix + LFN
+  e.g. /mnt/shared + /store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root
+     → /mnt/shared/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 logger = logging.getLogger(__name__)
 
 
-def derive_merged_lfn_bases(request_data: dict) -> list[dict]:
-    """Derive merged LFN bases from a ReqMgr2 request.
+def lfn_to_pfn(local_pfn_prefix: str, lfn: str) -> str:
+    """Convert an LFN to a local PFN by prepending the site prefix.
 
-    Uses OutputModulesLFNBases + OutputDatasets + MergedLFNBase
+    Example: lfn_to_pfn("/mnt/shared", "/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root")
+           → "/mnt/shared/store/mc/Era/Primary/TIER/Proc-v1/000000/merged.root"
+    """
+    return os.path.join(local_pfn_prefix, lfn.lstrip("/"))
+
+
+def local_output_path(local_pfn_prefix: str, lfn: str) -> str:
+    """Backward-compatible alias for lfn_to_pfn()."""
+    return lfn_to_pfn(local_pfn_prefix, lfn)
+
+
+def derive_merged_lfn_bases(request_data: dict) -> list[dict]:
+    """Derive merged and unmerged LFN bases from a ReqMgr2 request.
+
+    Uses OutputModulesLFNBases + OutputDatasets + MergedLFNBase + UnmergedLFNBase
     to produce a list of:
       {"dataset_name": "/Primary/Era-Proc-vN/Tier",
-       "merged_lfn_base": "/store/mc/Era/Primary/Tier/Proc-vN"}
+       "merged_lfn_base": "/store/mc/Era/Primary/Tier/Proc-vN",
+       "unmerged_lfn_base": "/store/unmerged/Era/Primary/Tier/Proc-vN"}
 
     Only returns outputs that appear in OutputDatasets (KeepOutput=true steps).
     """
     output_datasets = request_data.get("OutputDatasets", [])
     merged_lfn_base_root = request_data.get("MergedLFNBase", "/store/mc")
+    unmerged_lfn_base_root = request_data.get("UnmergedLFNBase", "/store/unmerged")
 
     if not output_datasets:
         return []
@@ -46,9 +68,15 @@ def derive_merged_lfn_bases(request_data: dict) -> list[dict]:
             f"{merged_lfn_base_root}/{acq_era}/{primary}/{data_tier}/"
             f"{proc_string}-v{proc_version}"
         )
+        # Build unmerged LFN base (same structure, different root)
+        unmerged_base = (
+            f"{unmerged_lfn_base_root}/{acq_era}/{primary}/{data_tier}/"
+            f"{proc_string}-v{proc_version}"
+        )
         results.append({
             "dataset_name": ds_name,
             "merged_lfn_base": merged_base,
+            "unmerged_lfn_base": unmerged_base,
             "primary_dataset": primary,
             "acquisition_era": acq_era,
             "processing_string": proc_string,
@@ -99,17 +127,16 @@ def merged_lfn_for_group(
     return f"{merged_lfn_base}/{group_index:06d}/{filename}"
 
 
-def local_output_path(output_base_dir: str, lfn: str) -> str:
-    """Convert an LFN to a local file path.
+def unmerged_lfn_for_group(
+    unmerged_lfn_base: str,
+    group_index: int,
+    filename: str = "",
+) -> str:
+    """Build full unmerged LFN directory (or file) for a specific merge group.
 
-    /store/mc/Era/... → {output_base_dir}/mc/Era/...
+    Returns: {unmerged_lfn_base}/{group_index:06d}[/{filename}]
     """
-    # Strip the /store prefix from the LFN
-    if lfn.startswith("/store/"):
-        relative = lfn[len("/store/"):]
-    elif lfn.startswith("/store"):
-        relative = lfn[len("/store"):]
-    else:
-        relative = lfn.lstrip("/")
-
-    return f"{output_base_dir}/{relative}"
+    base = f"{unmerged_lfn_base}/{group_index:06d}"
+    if filename:
+        return f"{base}/{filename}"
+    return base

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from wms2.adapters.base import DBSAdapter, RucioAdapter
 from wms2.config import Settings
-from wms2.core.output_lfn import derive_merged_lfn_bases, local_output_path, merged_lfn_for_group
+from wms2.core.output_lfn import derive_merged_lfn_bases, lfn_to_pfn, merged_lfn_for_group
 from wms2.db.repository import Repository
 from wms2.models.enums import OutputStatus
 
@@ -66,7 +66,7 @@ class OutputManager:
 
             # Build the merged LFN for this group
             lfn = merged_lfn_for_group(merged_base, group_index)
-            local_path = local_output_path(self.settings.output_base_dir, lfn)
+            local_path = lfn_to_pfn(self.settings.local_pfn_prefix, lfn)
 
             await self.db.create_output_dataset(
                 workflow_id=workflow.id,
@@ -250,8 +250,8 @@ class OutputManager:
         logger.info("Announced: %s", output.dataset_name)
 
     def validate_local_output(self, output_lfn: str) -> bool:
-        """Check if output file exists at output_base_dir + lfn."""
-        path = local_output_path(self.settings.output_base_dir, output_lfn)
+        """Check if output file exists at local_pfn_prefix + lfn."""
+        path = lfn_to_pfn(self.settings.local_pfn_prefix, output_lfn)
         return os.path.exists(path)
 
     async def get_output_summary(self, workflow_id) -> dict[str, int]:

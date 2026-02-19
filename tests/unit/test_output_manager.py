@@ -14,7 +14,7 @@ from wms2.models.enums import OutputStatus
 def _make_settings(**overrides):
     defaults = {
         "database_url": "postgresql+asyncpg://test:test@localhost:5433/test",
-        "output_base_dir": "/mnt/shared/store",
+        "local_pfn_prefix": "/mnt/shared",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -190,9 +190,9 @@ class TestGetOutputSummary:
 class TestValidateLocalOutput:
     def test_file_exists(self, output_manager, tmp_path):
         """validate_local_output returns True for existing file."""
-        output_manager.settings.output_base_dir = str(tmp_path)
-        # Create a file at the expected path
-        target = tmp_path / "mc" / "Era" / "Primary" / "TIER"
+        output_manager.settings.local_pfn_prefix = str(tmp_path)
+        # Create a file at the expected PFN path (prefix + LFN)
+        target = tmp_path / "store" / "mc" / "Era" / "Primary" / "TIER"
         target.mkdir(parents=True)
         (target / "merged.txt").touch()
 
