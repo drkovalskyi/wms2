@@ -1570,6 +1570,25 @@ Result:   PASS — 1093s (18.2 min)
 - **hadd shared library dependency**: hadd from el8 CMSSW requires `libtbb.so.12` and other libraries from the CMSSW runtime. Running the binary outside `scramv1 runtime -sh` or outside the apptainer container fails on el9 hosts.
 - **CMS_PATH vs SITECONFIG_PATH**: CMSSW >=14.x uses `SITECONFIG_PATH` (flat layout: `$SITECONFIG_PATH/JobConfig/site-local-config.xml`). CMSSW <14.x uses `CMS_PATH` (nested layout: `$CMS_PATH/SITECONF/local/JobConfig/site-local-config.xml`). Both must be set for compatibility.
 
+### Dev VM Setup Script (`scripts/setup-dev-vm.sh`)
+
+Added a provisioning script for fresh AlmaLinux 9 VMs. Addresses the recurring friction of running as root — HTCondor rejects root job submissions, file ownership conflicts require constant `chown`, and postgres config edits break ownership.
+
+The script creates an `agent` user that owns the repo, submits to HTCondor, and runs all dev tasks. 10 idempotent steps:
+
+1. Create `agent` user
+2. Sudoers — limited `systemctl`, `dnf`, `chown`, `condor_reconfig`, `psql`
+3. System packages — python3.12, git, postgresql-server, condor, jq
+4. PostgreSQL — init, scram-sha-256 auth, wms2 role + databases + pgcrypto
+5. HTCondor — dev config with `ALLOW_ADMINISTRATOR = *` (fixes condor_reconfig denied)
+6. CMS siteconf — `/opt/cms/siteconf/` with site-local-config, storage.json, PhEDEx
+7. Directory ownership — `/mnt/shared/work`, `/mnt/shared/store`, repo dir
+8. Python venv — `.venv/` with all deps + htcondor pip bindings
+9. Shell profile — `.bashrc` auto-cd, activate venv, set `SITECONFIG_PATH`/`CMS_PATH`/`X509_*`
+10. Verification — smoke-test PostgreSQL, HTCondor, Python, CVMFS
+
+Usage: `sudo bash scripts/setup-dev-vm.sh`, then `su - agent` for all work.
+
 ## What's Next
 
 - Multi-merge-group DAG — Submit workflow with multiple work units
