@@ -1855,6 +1855,11 @@ def merge_root_tier(tier, tier_files, tier_step_index, out_dir, manifest, work_d
     is_nano = "NANO" in tier.upper()
     is_dqmio = "DQMIO" in tier.upper()
 
+    # NANOEDMAODSIM → NANOAODSIM: mergeNANO=True converts EDM nano to flat nano
+    output_tier = tier
+    if is_nano and "EDM" in tier.upper():
+        output_tier = tier.replace("EDM", "").replace("edm", "")
+
     # Check if cmsRun merge is possible
     has_cvmfs = os.path.isdir("/cvmfs/cms.cern.ch")
     can_cmsrun = bool(cmssw_version) and has_cvmfs
@@ -1867,7 +1872,7 @@ def merge_root_tier(tier, tier_files, tier_step_index, out_dir, manifest, work_d
     merged_files = []
     for batch_idx, batch in enumerate(batches):
         suffix = f"_{batch_idx}" if len(batches) > 1 else ""
-        out_file = os.path.join(out_dir, f"merged_{tier}{suffix}.root")
+        out_file = os.path.join(out_dir, f"merged_{output_tier}{suffix}.root")
 
         if len(batch) == 1:
             # Single file — just copy, no merge needed
