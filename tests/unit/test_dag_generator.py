@@ -464,6 +464,58 @@ class TestMergeWrapper:
         assert "cleanup_manifest.json" in content
         assert "cleanup_dirs" in content
 
+    def test_merge_pset_adds_file_prefix(self, tmp_path):
+        """write_merge_pset adds file: prefix to local paths for CMSSW PoolSource."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_merge.py").read_text()
+        # write_merge_pset must add file: prefix so CMSSW treats paths as local PFN
+        assert 'f"file:{f}"' in content or "file:" in content
+        assert 'f.startswith("file:")' in content
+        assert 'output_file.startswith("file:")' in content
+
+    def test_hadd_runs_inside_cmssw_env(self, tmp_path):
+        """merge_root_with_hadd runs hadd inside CMSSW runtime (not bare binary)."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_merge.py").read_text()
+        # hadd must run inside full CMSSW env, not as a bare binary
+        assert "scramv1 runtime -sh" in content
+        assert "import shlex" in content
+        # Must use apptainer when cross-OS
+        assert "resolve_container(scram_arch)" in content
+
+    def test_cmsrun_merge_binds_site_cfg(self, tmp_path):
+        """run_cmsrun binds SITECONFIG_PATH into apptainer and sets CMS_PATH."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "wms2_merge.py").read_text()
+        # Must bind site_cfg dir into apptainer
+        assert "bind_paths += \",\" + site_cfg" in content
+        # Must export CMS_PATH for older CMSSW versions
+        assert "export CMS_PATH=" in content
+        # Must create SITECONF/local/ layout
+        assert "SITECONF" in content
+        assert "local" in content
+
 
 class TestCleanupWrapper:
     """Tests for the cleanup wrapper script content."""

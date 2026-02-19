@@ -966,9 +966,10 @@ run_step_native() {
             scramv1 project CMSSW "$cmssw"
         fi
         cd "$cmssw/src" && eval $(scramv1 runtime -sh) && cd "$WORK_DIR"
-        # CMSSW reads SITECONFIG_PATH to find site-local-config.xml
+        # CMSSW >=14.x reads SITECONFIG_PATH; <14.x reads CMS_PATH
         local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
         export SITECONFIG_PATH="$SITE_CFG"
+        export CMS_PATH="$SITE_CFG"
         CURRENT_CMSSW="$cmssw"
         CURRENT_ARCH="$arch"
     fi
@@ -984,16 +985,22 @@ run_step_apptainer() {
 
     # Copy siteconf files into the execute directory so they're available
     # inside the container via the working-directory bind mount.
+    # Layout for SITECONFIG_PATH (CMSSW >=14.x): _siteconf/JobConfig/site-local-config.xml
     mkdir -p "$WORK_DIR/_siteconf/JobConfig"
     cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
     [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
     [[ -f "$SITE_CFG/storage.json" ]] && cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+    # Layout for CMS_PATH (CMSSW <14.x): _siteconf/SITECONF/local/JobConfig/site-local-config.xml
+    mkdir -p "$WORK_DIR/_siteconf/SITECONF/local/JobConfig"
+    cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/SITECONF/local/JobConfig/" 2>/dev/null || true
+    [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
 
     cat > _step_runner.sh <<STEPEOF
 #!/bin/bash
 set -e
-# CMSSW reads SITECONFIG_PATH (not CMS_PATH) to find site-local-config.xml
+# CMSSW >=14.x reads SITECONFIG_PATH; <14.x reads CMS_PATH + /SITECONF/local/
 export SITECONFIG_PATH=$WORK_DIR/_siteconf
+export CMS_PATH=$WORK_DIR/_siteconf
 
 export SCRAM_ARCH=$arch
 export X509_USER_PROXY="${X509_USER_PROXY:-}"
@@ -1011,6 +1018,7 @@ STEPEOF
     local BIND="/cvmfs,/tmp,$(pwd)"
     [[ -d /mnt/creds ]]        && BIND="$BIND,/mnt/creds"
     [[ -d /mnt/shared ]]       && BIND="$BIND,/mnt/shared"
+    [[ -d "$SITE_CFG" ]]       && BIND="$BIND,$SITE_CFG"
     export APPTAINER_BINDPATH="$BIND"
     apptainer exec --no-home "$container" bash "$(pwd)/_step_runner.sh"
 }
@@ -1387,10 +1395,21 @@ run_synthetic_mode() {
     # Write a simple output manifest for synthetic mode
     python3 -c "
 import json, os
+# Determine tier from output_info.json if available
+tier = 'unknown'
+if os.path.isfile('${OUTPUT_INFO:-}'):
+    try:
+        with open('${OUTPUT_INFO}') as f:
+            info = json.load(f)
+        datasets = info.get('output_datasets', [])
+        if datasets:
+            tier = datasets[0].get('data_tier', 'unknown')
+    except Exception:
+        pass
 files = {}
 for f in os.listdir('.'):
     if f.startswith('proc_') and f.endswith('.root'):
-        files[f] = {'tier': 'unknown', 'step_index': -1}
+        files[f] = {'tier': tier, 'step_index': -1}
 if files:
     with open('proc_${NODE_INDEX}_outputs.json', 'w') as fh:
         json.dump(files, fh, indent=2)
@@ -1557,6 +1576,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1652,8 +1672,10 @@ def write_merge_pset(pset_path, input_files, output_file, is_nano=False, is_dqmi
         "process = mergeProcess(",
     ]
     for f in input_files:
-        lines.append(f"    {f!r},")
-    lines.append(f"    output_file={output_file!r},")
+        pfn = f if f.startswith("file:") else f"file:{f}"
+        lines.append(f"    {pfn!r},")
+    out_pfn = output_file if output_file.startswith("file:") else f"file:{output_file}"
+    lines.append(f"    output_file={out_pfn!r},")
     if is_nano:
         lines.append("    mergeNANO=True,")
     if is_dqmio:
@@ -1690,11 +1712,26 @@ def run_cmsrun(pset_path, cmssw_version, scram_arch, work_dir):
         if os.path.isfile(storage_json):
             shutil.copy2(storage_json, os.path.join(work_dir, "_siteconf"))
 
+        # Create SITECONF/local/ layout for CMS_PATH compatibility (CMSSW <14.x)
+        local_cms_jobconfig = os.path.join(
+            work_dir, "_siteconf", "SITECONF", "local", "JobConfig"
+        )
+        os.makedirs(local_cms_jobconfig, exist_ok=True)
+        src_slc = os.path.join(site_cfg, "JobConfig", "site-local-config.xml")
+        if os.path.isfile(src_slc):
+            shutil.copy2(src_slc, local_cms_jobconfig)
+        local_cms_phedex = os.path.join(
+            work_dir, "_siteconf", "SITECONF", "local", "PhEDEx"
+        )
+        if os.path.isdir(phedex_src):
+            shutil.copytree(phedex_src, local_cms_phedex, dirs_exist_ok=True)
+
         runner_path = os.path.join(work_dir, "_merge_runner.sh")
         with open(runner_path, "w") as f:
             f.write(f"""#!/bin/bash
 set -e
 export SITECONFIG_PATH={work_dir}/_siteconf
+export CMS_PATH={work_dir}/_siteconf
 export SCRAM_ARCH={scram_arch}
 export X509_USER_PROXY={os.environ.get('X509_USER_PROXY', '')}
 export X509_CERT_DIR={os.environ.get('X509_CERT_DIR', '/cvmfs/grid.cern.ch/etc/grid-security/certificates')}
@@ -1712,6 +1749,8 @@ cmsRun {pset_path}
             bind_paths += ",/mnt/creds"
         if os.path.isdir("/mnt/shared"):
             bind_paths += ",/mnt/shared"
+        if os.path.isdir(site_cfg):
+            bind_paths += "," + site_cfg
         env = dict(os.environ, APPTAINER_BINDPATH=bind_paths)
         cmd = ["apptainer", "exec", "--no-home", container, "bash", runner_path]
     else:
@@ -1746,30 +1785,44 @@ cmsRun {pset_path}
 
 
 def merge_root_with_hadd(root_files, out_file, cmssw_version, scram_arch):
-    """Fallback: merge ROOT files using hadd from CMSSW environment."""
-    setup_cmd = (
+    """Fallback: merge ROOT files using hadd from CMSSW environment.
+
+    Runs hadd inside the full CMSSW runtime environment (with apptainer
+    when cross-OS) so that all shared libraries (libtbb, ROOT, etc.) are
+    available.
+    """
+    file_args = " ".join(shlex.quote(f) for f in root_files)
+    hadd_script = (
         f"source /cvmfs/cms.cern.ch/cmsset_default.sh && "
         f"export SCRAM_ARCH={scram_arch} && "
-        f"scramv1 project CMSSW {cmssw_version} && "
-        f"cd {cmssw_version}/src && eval $(scramv1 runtime -sh) && "
-        f"which hadd"
+        f"if [[ ! -d {cmssw_version}/src ]]; then "
+        f"scramv1 project CMSSW {cmssw_version}; fi && "
+        f"cd {cmssw_version}/src && eval $(scramv1 runtime -sh) && cd - >/dev/null && "
+        f"hadd -f {shlex.quote(out_file)} {file_args}"
     )
-    try:
-        result = subprocess.run(
-            ["bash", "-c", setup_cmd], capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0:
-            hadd_path = result.stdout.strip().split("\\n")[-1]
-        else:
-            hadd_path = "hadd"
-    except Exception:
-        hadd_path = "hadd"
 
-    cmd = [hadd_path, "-f", out_file] + root_files
+    container = resolve_container(scram_arch)
+    if container:
+        bind_paths = "/cvmfs,/tmp," + os.getcwd()
+        if os.path.isdir("/mnt/shared"):
+            bind_paths += ",/mnt/shared"
+        env = dict(os.environ, APPTAINER_BINDPATH=bind_paths)
+        cmd = ["apptainer", "exec", "--no-home", container, "bash", "-c", hadd_script]
+    else:
+        cmd = ["bash", "-c", hadd_script]
+        env = None
+
     print(f"  Fallback: hadd -f {out_file} ({len(root_files)} inputs)")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=env)
+
+    if result.stdout:
+        for line in result.stdout.strip().split("\\n")[-5:]:
+            print(f"  [hadd] {line}")
     if result.returncode != 0:
-        print(f"  ERROR: hadd failed: {result.stderr}", file=sys.stderr)
+        print(f"  ERROR: hadd failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr:
+            for line in result.stderr.strip().split("\\n")[-10:]:
+                print(f"  [stderr] {line}", file=sys.stderr)
         return False
     return True
 
