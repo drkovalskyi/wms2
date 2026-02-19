@@ -1268,6 +1268,84 @@ Updated `tests/integration/test_condor_submit.py`: replaced ad-hoc `WMS2_CONDOR_
 - **Levels are cumulative**: A `level2` test auto-requires `level1`. This prevents confusing failures where HTCondor is available but CVMFS isn't.
 - **Environment tests are not markers on themselves**: The `tests/environment/test_level*.py` files don't carry level markers — they *are* the environment checks. The markers are for gating actual functional tests.
 
+---
+
+## Phase 10 — Merge Mechanism Fix & Real CMSSW StepChain Verification (2026-02-19)
+
+### Problem
+When multiple proc jobs in a merge group produced output ROOT files, HTCondor transferred all
+outputs to the same group directory (`mg_000000/`). Files with identical names from different
+proc jobs (e.g., `B2G-RunIII2024Summer24wmLHEGS-00642.root`) overwrote each other — only the
+last proc job's outputs survived. The merge job had no way to distinguish which files came from
+which proc job, or which output tier each file belonged to.
+
+### Changes
+
+#### 1. Proc output rename (`dag_planner.py` — proc wrapper)
+After all CMSSW steps complete, the proc wrapper renames every `*.root` file to
+`proc_{NODE_INDEX}_{original}.root`. This prevents file collisions when HTCondor transfers
+outputs from multiple proc jobs to the same merge group directory.
+
+#### 2. Proc output manifest (`dag_planner.py` — proc wrapper)
+After renaming, the proc wrapper parses all FrameworkJobReport XML files (`report_stepN.xml`)
+to build a `proc_{NODE_INDEX}_outputs.json` manifest mapping each renamed file to its data
+tier (extracted from the FJR `ModuleLabel` field, e.g., `MINIAODSIMoutput` → `MINIAODSIM`).
+
+#### 3. Merge script tier-aware file grouping (`dag_planner.py` — merge script)
+The merge script reads all `proc_*_outputs.json` manifests to build a tier→files mapping.
+Each output dataset is matched to the correct subset of ROOT files by tier name, with
+case-insensitive substring fallback. Only matching files are merged/copied to each dataset's
+output directory.
+
+#### 4. FJR output selection for step chaining (`dag_planner.py` — proc wrapper)
+When a CMSSW step produces multiple output files (e.g., GEN-SIM + LHE), the proc wrapper now
+prefers the non-LHE output for the next step's input. Previously it took the first FJR `<File>`
+entry, which could be the LHE output — causing the next step to crash with `ProductNotFound`
+for `generatorSmeared` HepMCProduct.
+
+#### 5. ExternalLHEProducer nEvents sync (`dag_planner.py` — PSet injection)
+When injecting `maxEvents` into the step 1 PSet, also update `ExternalLHEProducer.nEvents` to
+match. Otherwise the gridpack produces more LHE events than cmsRun consumes, and
+ExternalLHEProducer throws a fatal error at end-of-run.
+
+#### 6. SITECONFIG_PATH fix (`dag_planner.py` — CMSSW execution)
+CMSSW 14.x+ uses `SITECONFIG_PATH` (not `CMS_PATH`) to find `site-local-config.xml`. Updated
+both native and apptainer execution paths. For apptainer, siteconf files are copied into the
+execute directory (since CVMFS bind mounts are read-only).
+
+#### 7. E2e test tier extraction (`e2e_real_condor.py`)
+Fixed `_extract_pset_tier()` to parse output module names from the PSet
+(`process.MINIAODSIMoutput = cms.OutputModule(...)`) instead of looking for filename patterns.
+
+### Verification
+
+**Real CMSSW 5-step StepChain test** (wmLHEGS → DRPremix → DRPremix → MiniAODv6 → NanoAODv15):
+```
+Request:  cmsunified_task_B2G-RunIII2024Summer24wmLHEGS-00642__v1_T_251007_083425_3739
+Events:   50/job × 2 jobs = 100 total
+Result:   PASS — 842s (14.0 min)
+CPU:      Peak 1672% (16.7 cores), Expected 1600% (2×8)
+Output:   12 .root files (6 per proc), 411 MB total
+Merged:   4 files (2 MINIAODSIM1 + 2 NANOEDMAODSIM1), 22.9 MB
+```
+
+- All 5 FJR files produced per proc job
+- Proc output rename: `proc_0_*.root` and `proc_1_*.root` (no collisions)
+- Manifest correctly maps files to tiers from FJR ModuleLabels
+- Merge correctly routes files to output datasets by tier
+- 208 unit tests pass
+
+### Key Discoveries
+
+- **CMSSW SITECONFIG_PATH**: CMSSW 14.x uses `std::getenv("SITECONFIG_PATH")` in
+  `SiteLocalConfigService.cc`, NOT `CMS_PATH`. Confirmed from CMSSW source code.
+- **ExternalLHEProducer nEvents**: Must match `maxEvents`, otherwise the gridpack generates
+  excess LHE events and CMSSW throws `EventGenerationFailure` at end-of-run.
+- **StepChain output modules**: Multi-step PSets use numbered suffixes like `MINIAODSIM1output`
+  (not just `MINIAODSIMoutput`). The `1` suffix is from CMSSW's StepChain output numbering.
+- **FJR output ordering**: LHE output may be listed before GEN-SIM output in the FJR. Must
+  filter by ModuleLabel to get the correct input for the next step.
+
 ## What's Next
 
 - Mark existing and future tests with appropriate level markers as they're written

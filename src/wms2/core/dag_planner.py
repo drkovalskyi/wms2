@@ -538,6 +538,17 @@ def _generate_group_dag(
     proc_transfer_files: list[str] = []
     if sandbox_path and os.path.isfile(sandbox_path):
         proc_transfer_files.append(sandbox_path)
+        # Extract manifest.json to group dir so merge job can find CMSSW info
+        import tarfile
+        try:
+            with tarfile.open(sandbox_path, "r:gz") as tf:
+                for member in tf.getmembers():
+                    if member.name == "manifest.json" or member.name.endswith("/manifest.json"):
+                        member.name = "manifest.json"
+                        tf.extract(member, str(group_dir))
+                        break
+        except Exception:
+            pass  # merge will fall back to copy mode without hadd
 
     # Pass X509 proxy to jobs if available
     proc_env: dict[str, str] = {}
@@ -935,13 +946,9 @@ run_step_native() {
             scramv1 project CMSSW "$cmssw"
         fi
         cd "$cmssw/src" && eval $(scramv1 runtime -sh) && cd "$WORK_DIR"
-        # Override CMS_PATH for site-local-config
+        # CMSSW reads SITECONFIG_PATH to find site-local-config.xml
         local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
-        mkdir -p "$WORK_DIR/_cms/SITECONF/local"
-        ln -sfn "$SITE_CFG/JobConfig"    "$WORK_DIR/_cms/SITECONF/local/JobConfig"
-        ln -sfn "$SITE_CFG/PhEDEx"       "$WORK_DIR/_cms/SITECONF/local/PhEDEx"       2>/dev/null || true
-        ln -sfn "$SITE_CFG/storage.json" "$WORK_DIR/_cms/SITECONF/local/storage.json" 2>/dev/null || true
-        export CMS_PATH="$WORK_DIR/_cms"
+        export SITECONFIG_PATH="$SITE_CFG"
         CURRENT_CMSSW="$cmssw"
         CURRENT_ARCH="$arch"
     fi
@@ -955,9 +962,19 @@ run_step_apptainer() {
     # Resolve siteconfig path: default to /opt/cms/siteconf if SITECONFIG_PATH unset
     local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
 
+    # Copy siteconf files into the execute directory so they're available
+    # inside the container via the working-directory bind mount.
+    mkdir -p "$WORK_DIR/_siteconf/JobConfig"
+    cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
+    [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
+    [[ -f "$SITE_CFG/storage.json" ]] && cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+
     cat > _step_runner.sh <<STEPEOF
 #!/bin/bash
 set -e
+# CMSSW reads SITECONFIG_PATH (not CMS_PATH) to find site-local-config.xml
+export SITECONFIG_PATH=$WORK_DIR/_siteconf
+
 export SCRAM_ARCH=$arch
 export X509_USER_PROXY="${X509_USER_PROXY:-}"
 export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
@@ -966,20 +983,12 @@ if [[ ! -d $cmssw/src ]]; then
     scramv1 project CMSSW $cmssw
 fi
 cd $cmssw/src && eval \$(scramv1 runtime -sh) && cd $WORK_DIR
-# Override CMS_PATH so cmsRun finds our site-local-config at
-# \$CMS_PATH/SITECONF/local/JobConfig/site-local-config.xml
-mkdir -p $WORK_DIR/_cms/SITECONF/local
-ln -sfn $SITE_CFG/JobConfig    $WORK_DIR/_cms/SITECONF/local/JobConfig
-ln -sfn $SITE_CFG/PhEDEx       $WORK_DIR/_cms/SITECONF/local/PhEDEx   2>/dev/null || true
-ln -sfn $SITE_CFG/storage.json $WORK_DIR/_cms/SITECONF/local/storage.json 2>/dev/null || true
-export CMS_PATH=$WORK_DIR/_cms
 cmsRun $cmsrun_args
 STEPEOF
     chmod +x _step_runner.sh
 
     # Bind paths: CVMFS, working dir, temp, and optional site config / credentials
     local BIND="/cvmfs,/tmp,$(pwd)"
-    [[ -d /opt/cms/siteconf ]] && BIND="$BIND,/opt/cms/siteconf"
     [[ -d /mnt/creds ]]        && BIND="$BIND,/mnt/creds"
     [[ -d /mnt/shared ]]       && BIND="$BIND,/mnt/shared"
     export APPTAINER_BINDPATH="$BIND"
@@ -1067,6 +1076,11 @@ events_per_job = $EVENTS_PER_JOB
 first_event = $FIRST_EVENT
 if step_idx == 0 and events_per_job > 0:
     lines.append('process.maxEvents.input = cms.untracked.int32(' + str(events_per_job) + ')')
+    # Also update ExternalLHEProducer.nEvents if present (wmLHE workflows)
+    # The gridpack must produce exactly as many LHE events as cmsRun will consume,
+    # otherwise ExternalLHEProducer throws a fatal error at end-of-run.
+    lines.append('if hasattr(process, \"externalLHEProducer\"):')
+    lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32(' + str(events_per_job) + ')')
 elif step_idx > 0:
     lines.append('process.maxEvents.input = cms.untracked.int32(-1)')
 if step_idx == 0 and first_event > 0:
@@ -1118,27 +1132,94 @@ with open(pset, 'a') as f:
         echo "  Step $STEP_NAME completed in ${STEP_WALL}s"
 
         # Parse FrameworkJobReport for output file (strip file: prefix)
+        # When a step produces multiple outputs (e.g. GEN-SIM + LHE), prefer
+        # the non-LHE output since the next step needs the physics data.
         PREV_OUTPUT=$(python3 -c "
 import xml.etree.ElementTree as ET
 try:
     tree = ET.parse('report_step${step_num}.xml')
+    candidates = []
     for f in tree.findall('.//File'):
         pfn = f.findtext('PFN', '')
         if pfn.startswith('file:'): pfn = pfn[5:]
-        if pfn:
+        if not pfn: continue
+        label = f.findtext('ModuleLabel', '')
+        candidates.append((pfn, label))
+    # Prefer non-LHE output for next step's input
+    for pfn, label in candidates:
+        if 'LHE' not in label.upper():
             print(pfn)
             break
+    else:
+        # All are LHE or no label — take first
+        if candidates:
+            print(candidates[0][0])
 except Exception:
     pass
 " 2>/dev/null || true)
         echo "  Output: ${PREV_OUTPUT:-none}"
     done
 
+    # Rename output ROOT files to include node index — prevents collisions
+    # when HTCondor transfers outputs from multiple proc jobs to the same dir
+    echo ""
+    echo "--- Renaming outputs for merge disambiguation ---"
+    for f in *.root; do
+        if [[ -f "$f" ]]; then
+            new_name="proc_${NODE_INDEX}_${f}"
+            mv "$f" "$new_name"
+            echo "  $f -> $new_name"
+        fi
+    done
+
+    # Write output manifest — maps renamed files to their tiers
+    # Parse FJRs (report_stepN.xml) to find each output file's data tier
+    python3 -c "
+import re, json, os, glob
+import xml.etree.ElementTree as ET
+
+# Build mapping: original_filename -> tier from FJR ModuleLabels
+orig_to_tier = {}
+for fjr in sorted(glob.glob('report_step*.xml')):
+    try:
+        tree = ET.parse(fjr)
+        for fnode in tree.findall('.//File'):
+            pfn = fnode.findtext('PFN', '')
+            if pfn.startswith('file:'): pfn = pfn[5:]
+            pfn = os.path.basename(pfn)
+            label = fnode.findtext('ModuleLabel', '')
+            # ModuleLabel is like 'RAWSIMoutput', 'LHEoutput', 'MINIAODSIMoutput'
+            tier = re.sub(r'output$', '', label, flags=re.IGNORECASE)
+            if pfn and tier:
+                orig_to_tier[pfn] = tier
+    except Exception:
+        pass
+
+# Map renamed files -> tier
+files = {}
+for f in sorted(os.listdir('.')):
+    m = re.match(r'proc_\d+_(.+\.root)$', f)
+    if m:
+        orig = m.group(1)
+        tier = orig_to_tier.get(orig, '')
+        if not tier:
+            # Fallback: try to extract from filename pattern (stepN_TIER.root)
+            m2 = re.match(r'step\d+_(.+)\.root', orig)
+            tier = m2.group(1) if m2 else 'unknown'
+        files[f] = tier
+
+with open('proc_${NODE_INDEX}_outputs.json', 'w') as fh:
+    json.dump(files, fh, indent=2)
+print('Wrote proc_${NODE_INDEX}_outputs.json:', len(files), 'files')
+for fn, t in files.items():
+    print(f'  {fn} -> tier={t}')
+" 2>/dev/null || true
+
     # Collect output sizes
     echo ""
     echo "--- Output files ---"
     OUTPUT_SIZES=0
-    for f in *.root; do
+    for f in proc_*.root; do
         if [[ -f "$f" ]]; then
             sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
             echo "  $f: $sz bytes"
@@ -1442,10 +1523,7 @@ def merge_text_files(datasets, text_files, output_base_dir, group_index):
         tier = ds.get("data_tier", "unknown")
         ds_name = ds.get("dataset_name", "")
 
-        if lfn_base.startswith("/store/"):
-            relative = lfn_base[len("/store/"):]
-        else:
-            relative = lfn_base.lstrip("/")
+        relative = lfn_base.lstrip("/")
 
         out_dir = os.path.join(output_base_dir, relative, f"{group_index:06d}")
         os.makedirs(out_dir, exist_ok=True)
@@ -1470,11 +1548,13 @@ def merge_text_files(datasets, text_files, output_base_dir, group_index):
         print(f"Wrote: {out_file} ({len(proc_entries)} entries)")
 
 
-# Detect output type
-root_files = sorted(glob.glob(os.path.join(group_dir, "*.root")))
-# Also check for synthetic output pattern
-root_files += sorted(glob.glob(os.path.join(group_dir, "proc_*_output.root")))
-root_files = sorted(set(root_files))  # deduplicate
+# Detect output type — proc outputs are named proc_NNNNNN_<original>.root
+import re
+
+root_files = sorted(glob.glob(os.path.join(group_dir, "proc_*_*.root")))
+# Fallback: any .root files (backwards compat with synthetic mode)
+if not root_files:
+    root_files = sorted(glob.glob(os.path.join(group_dir, "*.root")))
 
 text_files = sorted(glob.glob(os.path.join(group_dir, "proc_*.out")))
 
@@ -1482,25 +1562,57 @@ if root_files:
     print(f"Detected {len(root_files)} ROOT file(s) — using ROOT merge mode")
     has_cmssw = setup_cmssw_env()
 
+    # Build file-to-tier mapping from proc output manifests
+    file_tier_map = {}  # filename -> tier
+    for mf in sorted(glob.glob(os.path.join(group_dir, "proc_*_outputs.json"))):
+        try:
+            with open(mf) as f:
+                file_tier_map.update(json.load(f))
+        except Exception:
+            pass
+
+    # Group files by tier using manifest, falling back to filename parsing
+    tier_to_files = {}  # tier -> [paths]
+    for f in root_files:
+        basename = os.path.basename(f)
+        tier = file_tier_map.get(basename, "")
+        if not tier:
+            # Fallback: extract tier from filename pattern proc_NNN_stepN_TIER.root
+            m = re.match(r'proc_\\d+_step\\d+_(\\w+)\\.root', basename)
+            tier = m.group(1) if m else "unknown"
+        tier_to_files.setdefault(tier, []).append(f)
+
+    print(f"Tier groups: { {k: len(v) for k, v in tier_to_files.items()} }")
+
     for ds in datasets:
         lfn_base = ds.get("merged_lfn_base", "")
-        tier = ds.get("data_tier", "unknown")
+        ds_tier = ds.get("data_tier", "unknown")
 
-        if lfn_base.startswith("/store/"):
-            relative = lfn_base[len("/store/"):]
-        else:
-            relative = lfn_base.lstrip("/")
+        relative = lfn_base.lstrip("/")
 
+        # Match dataset tier to discovered file tiers
+        tier_files = tier_to_files.get(ds_tier, [])
+        if not tier_files:
+            # Try case-insensitive substring match
+            for tier, files in tier_to_files.items():
+                if ds_tier.upper() in tier.upper() or tier.upper() in ds_tier.upper():
+                    tier_files = files
+                    break
+
+        if not tier_files:
+            print(f"WARNING: No ROOT files matching tier {ds_tier}, skipping")
+            continue
+
+        print(f"Tier {ds_tier}: {len(tier_files)} files to merge")
         out_dir = os.path.join(output_base_dir, relative, f"{group_index:06d}")
         os.makedirs(out_dir, exist_ok=True)
 
         if has_cmssw:
-            merge_root_files(ds, root_files, out_dir)
+            merge_root_files(ds, tier_files, out_dir)
         else:
-            # Without hadd, just copy/concatenate ROOT files
-            print(f"WARNING: hadd not available, copying ROOT files to {out_dir}")
+            print(f"WARNING: hadd not available, copying {len(tier_files)} ROOT files to {out_dir}")
             import shutil
-            for rf in root_files:
+            for rf in tier_files:
                 dest = os.path.join(out_dir, os.path.basename(rf))
                 shutil.copy2(rf, dest)
                 print(f"  Copied: {dest}")
