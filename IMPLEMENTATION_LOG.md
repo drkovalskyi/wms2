@@ -1777,3 +1777,53 @@ DAGMan always exits with `job_status=4` ("completed") regardless of whether node
 - Site Manager — CRIC sync for site status and capacity
 - AODSIM tier handling — proc stages AODSIM to unmerged but no dataset config for it; decide whether to merge or discard
 - Resource calibration — Use `work_unit_metrics.json` to feed back into DAG planning (memory/CPU right-sizing)
+
+---
+
+## Phase 15 — Spec Update: Adaptive Execution Model (2026-02-20)
+
+**Spec Version**: 2.4.0 → 2.5.0
+
+### What Changed
+
+Replaced the dedicated pilot job execution model with an adaptive execution model. The key insight: eliminate the separate pilot entirely — let the first production jobs serve as calibration, and use the existing recovery/rescue DAG mechanism as the natural re-optimization point.
+
+### Spec Changes Summary
+
+| Area | Change |
+|---|---|
+| **RequestStatus enum** | Removed `PILOT_RUNNING` |
+| **WorkflowStatus enum** | Removed `PILOT_RUNNING` |
+| **Workflow model** | Removed `pilot_cluster_id`, `pilot_schedd`, `pilot_output_path`, `pilot_metrics`; removed `PilotMetrics` and `StepProfile` classes; added `step_metrics: Optional[Dict[str, Any]]` |
+| **Database schema** | Replaced 4 pilot columns with single `step_metrics JSONB` column |
+| **Component Overview (4.1)** | DAG Planner description updated: request hints or step_metrics instead of pilot |
+| **Lifecycle Manager (4.2)** | Removed `PILOT_RUNNING` from timeouts, dispatch, stuck handler; simplified `_handle_queued` to go directly to DAG planning; removed `_handle_pilot_running`; added step_metrics aggregation to `_prepare_recovery` |
+| **DAG Planner (4.5)** | Removed pilot phase methods (`submit_pilot`, `handle_pilot_completion`, `_parse_pilot_report`); updated `plan_and_submit` to use step_metrics or request hints; added `step_profile.json` writing for sandbox |
+| **Section 5** | Full rewrite: "Pilot Execution Model" → "Adaptive Execution Model" with 6 subsections covering execution rounds, per-step splitting, memory calibration, metric aggregation, and convergence |
+| **Section 6.2.1** | Updated partial production flow: rescue DAGs carry step_metrics instead of "skipping pilot" |
+| **Section 7 API** | Replaced `pilot_metrics` with `step_metrics` in workflow status response |
+| **Section 10** | Phase 2 title/content updated; Phase 4 deliverables updated |
+| **Section 13** | "Pilot Accuracy" → "Adaptive Convergence" |
+| **Section 14** | "Pilot not representative" → "First-round estimates inaccurate" |
+| **Section 15** | Updated OQ-2; added OQ-16 (default threads), OQ-17 (median vs p90), OQ-18 (min sample size) |
+| **Section 16** | Added DD-12: Adaptive execution instead of dedicated pilot |
+| **Appendix A** | Updated pilot row to adaptive execution |
+
+### Design Rationale
+
+A dedicated pilot phase adds ~8 hours of latency before the first production job runs, and measurements may not represent the full dataset. The adaptive model:
+
+1. Starts producing real results immediately (no latency)
+2. Converges to optimal parameters by round 2 (most gains realized)
+3. Uses production data that is inherently representative
+4. Simplifies the state machine (no `PILOT_RUNNING` status, no pilot tracking fields)
+5. Reuses existing recovery/rescue DAG mechanism — no new components
+
+Partial production steps are natural re-optimization points: after the first 10% completes, the rescue DAG for the remaining 90% carries accumulated metrics.
+
+### Verification
+
+- `grep -i pilot docs/spec.md` — remaining references are only in DD-12 (rejected alternative context), migration phase naming ("Pilot" = system pilot testing), and Section 5.1 (explaining what was eliminated)
+- All `PILOT_RUNNING` enum values removed from both `RequestStatus` and `WorkflowStatus`
+- All pilot tracking fields removed from Workflow model and database schema
+- `step_metrics` field consistently referenced across model, schema, lifecycle manager, DAG planner, API, and Section 5

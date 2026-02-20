@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.4.0 |
+| **Spec Version** | 2.5.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-14 |
+| **Date** | 2026-02-20 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -205,7 +205,7 @@ class Request(BaseModel):
     scram_arch: str                 # e.g. "el9_amd64_gcc12"
     global_tag: str                 # Conditions DB tag
 
-    # Resource Hints (used for urgent workflows without pilot)
+    # Resource Hints (initial defaults for first DAG round)
     memory_mb: int = 2048
     time_per_event_sec: float = 1.0
     size_per_event_kb: float = 1.5
@@ -224,7 +224,7 @@ class Request(BaseModel):
     acquisition_era: str
     processing_version: int
     priority: int = 100000
-    urgent: bool = False            # Skip pilot if True
+    urgent: bool = False            # Prioritize in admission queue
 
     # Partial Production — fair-share scheduling: produce a fraction of work
     # units at each priority level before yielding to other requests.
@@ -255,7 +255,6 @@ class RequestStatus(str, Enum):
     NEW = "new"                    # Requestor's workspace, WMS2 ignores
     SUBMITTED = "submitted"        # Requestor signals ready, WMS2 validates
     QUEUED = "queued"              # In admission queue, waiting for capacity
-    PILOT_RUNNING = "pilot_running"  # Pilot job executing
     PLANNING = "planning"          # DAG Planner building production DAG
     ACTIVE = "active"              # DAG submitted to DAGMan
     STOPPING = "stopping"          # Clean stop in progress (condor_rm issued)
@@ -313,13 +312,10 @@ class Workflow(BaseModel):
     sandbox_url: str
     config_cache_id: str
 
-    # Pilot tracking (set when pilot is submitted, cleared after completion)
-    pilot_cluster_id: Optional[str]         # HTCondor cluster ID of pilot job
-    pilot_schedd: Optional[str]             # Schedd that owns the pilot job
-    pilot_output_path: Optional[str]        # Path to pilot metrics report
-
-    # Pilot Results (populated after pilot completes)
-    pilot_metrics: Optional[PilotMetrics]
+    # Accumulated per-step FJR metrics from completed jobs (populated after
+    # recovery rounds). Passed to sandbox via step_profile.json for adaptive
+    # per-step optimization. Structure defined in Section 5.5.
+    step_metrics: Optional[Dict[str, Any]]
 
     # DAG Reference (set after DAG submission)
     dag_id: Optional[UUID]
@@ -349,7 +345,6 @@ class Workflow(BaseModel):
 
 class WorkflowStatus(str, Enum):
     NEW = "new"
-    PILOT_RUNNING = "pilot_running"
     PLANNING = "planning"
     ACTIVE = "active"
     STOPPING = "stopping"              # Clean stop in progress
@@ -360,31 +355,6 @@ class WorkflowStatus(str, Enum):
     ABORTED = "aborted"
 
 
-class PilotMetrics(BaseModel):
-    """
-    Performance measurements from the pilot job.
-    Used by DAG Planner for resource estimation and merge planning.
-    """
-    time_per_event_sec: float       # Measured across full step chain
-    memory_peak_mb: int             # High-water mark across all steps
-    output_size_per_event_kb: float # Final output size ratio
-    cpu_efficiency: float           # CPU time / wall time
-    events_processed: int           # Total events the pilot processed
-    steps_profiled: List[StepProfile]  # Per-step breakdown
-
-    # Recommended settings derived from measurements
-    recommended_events_per_job: int
-    recommended_memory_mb: int
-    recommended_time_per_job_sec: int
-
-
-class StepProfile(BaseModel):
-    """Per-step performance from pilot."""
-    step_name: str
-    time_per_event_sec: float
-    memory_peak_mb: int
-    output_size_per_event_kb: float
-    threads_used: int
 ```
 
 #### 3.1.3 DAG (DAGMan Submission Unit)
@@ -478,7 +448,7 @@ class DAGNodeSpec(BaseModel):
     first_run: Optional[int]
     last_run: Optional[int]
 
-    # Resource estimates (from pilot or requestor)
+    # Resource estimates (from request hints or step_metrics)
     estimated_time_sec: int
     estimated_disk_kb: int
     estimated_memory_mb: int
@@ -638,10 +608,7 @@ CREATE TABLE workflows (
     splitting_params JSONB,
     sandbox_url TEXT,
     config_data JSONB,
-    pilot_cluster_id VARCHAR(50),
-    pilot_schedd VARCHAR(255),
-    pilot_output_path TEXT,
-    pilot_metrics JSONB,
+    step_metrics JSONB,
     dag_id UUID,
     category_throttles JSONB DEFAULT '{"Processing": 5000, "Merge": 100, "Cleanup": 50}',
     total_nodes INTEGER DEFAULT 0,
@@ -784,9 +751,9 @@ CREATE INDEX idx_output_datasets_status ON output_datasets(status);
 │     - Prevent resource starvation and long tails                │
 │                                                                 │
 │  4. DAG Planner                                                 │
-│     - Run pilot job (or use requestor estimates for urgent)     │
-│     - Split input data into DAG node specs using pilot metrics  │
-│     - Plan merge nodes based on actual output sizes             │
+│     - Split input data into DAG node specs                      │
+│     - Use request hints (round 1) or step_metrics (round 2+)   │
+│     - Plan merge nodes based on output size estimates           │
 │     - Generate DAGMan .dag and .sub files                       │
 │     - Submit DAGs via condor_submit_dag                         │
 │                                                                 │
@@ -856,7 +823,6 @@ class RequestLifecycleManager:
     STATUS_TIMEOUTS = {
         RequestStatus.SUBMITTED: 3600,          # 1 hour to validate and queue
         RequestStatus.QUEUED: 86400 * 7,        # 7 days in admission queue
-        RequestStatus.PILOT_RUNNING: 86400,     # 24 hours for pilot
         RequestStatus.PLANNING: 3600,           # 1 hour for DAG planning
         RequestStatus.ACTIVE: 86400 * 30,       # 30 days for DAG execution
         RequestStatus.STOPPING: 3600,           # 1 hour for clean stop
@@ -893,7 +859,6 @@ class RequestLifecycleManager:
         handler = {
             RequestStatus.SUBMITTED: self._handle_submitted,
             RequestStatus.QUEUED: self._handle_queued,
-            RequestStatus.PILOT_RUNNING: self._handle_pilot_running,
             RequestStatus.ACTIVE: self._handle_active,
             RequestStatus.STOPPING: self._handle_stopping,
             RequestStatus.RESUBMITTING: self._handle_resubmitting,
@@ -911,7 +876,7 @@ class RequestLifecycleManager:
         await self.transition(request, RequestStatus.QUEUED)
 
     async def _handle_queued(self, request: Request):
-        """Check admission capacity and start pilot, planning, or rescue DAG."""
+        """Check admission capacity and start DAG planning or rescue DAG."""
         if not await self.admission_controller.has_capacity():
             return  # Wait for capacity
 
@@ -921,7 +886,7 @@ class RequestLifecycleManager:
 
         workflow = await self.db.get_workflow_by_request(request.request_name)
 
-        # Rescue DAG re-admission: pilot metrics already exist, skip pilot
+        # Rescue DAG re-admission: submit existing rescue DAG directly
         dag = await self.db.get_dag(workflow.dag_id) if workflow.dag_id else None
         if dag and dag.rescue_dag_path and dag.status == DAGStatus.READY:
             dagman_id, schedd = await self.dag_planner.submit_rescue_dag(dag)
@@ -933,25 +898,9 @@ class RequestLifecycleManager:
             await self.transition(request, RequestStatus.ACTIVE)
             return
 
-        # Fresh submission
-        if request.urgent:
-            await self.dag_planner.plan_and_submit(workflow)
-            await self.transition(request, RequestStatus.ACTIVE)
-        else:
-            await self.dag_planner.submit_pilot(workflow)
-            await self.transition(request, RequestStatus.PILOT_RUNNING)
-
-    async def _handle_pilot_running(self, request: Request):
-        """Poll pilot status, trigger DAG planning on completion."""
-        workflow = await self.db.get_workflow_by_request(request.request_name)
-        completed = await self.condor_adapter.check_job_completed(
-            workflow.pilot_cluster_id, workflow.pilot_schedd
-        )
-        if completed:
-            await self.dag_planner.handle_pilot_completion(
-                workflow, workflow.pilot_output_path
-            )
-            await self.transition(request, RequestStatus.ACTIVE)
+        # Fresh submission: plan and submit DAG using request hints
+        await self.dag_planner.plan_and_submit(workflow)
+        await self.transition(request, RequestStatus.ACTIVE)
 
     async def _handle_active(self, request: Request):
         """Poll DAG status, register/protect outputs as work units complete."""
@@ -1050,10 +999,18 @@ class RequestLifecycleManager:
 
     async def _prepare_recovery(self, request: Request, workflow, dag):
         """
-        After clean stop completes, create a new DAG record pointing to
+        After clean stop completes, aggregate per-step FJR metrics from
+        completed work units and create a new DAG record pointing to
         the rescue DAG path. Transition to RESUBMITTING → QUEUED so the
         admission controller re-admits it.
         """
+        # Aggregate per-step FJR metrics from completed work units.
+        # These are stored on the workflow so the next DAG round can
+        # use them for adaptive optimization (see Section 5).
+        step_metrics = await self._aggregate_step_metrics(dag)
+        if step_metrics:
+            await self.db.update_workflow(workflow.id, step_metrics=step_metrics)
+
         rescue_path = f"{dag.dag_file_path}.rescue001"
         new_dag = DAG(
             workflow_id=workflow.id,
@@ -1174,8 +1131,6 @@ class RequestLifecycleManager:
           fast. Likely a bug or infrastructure issue. Retry the operation once,
           then fail if still stuck.
         - QUEUED: Normal — admission queue can be slow. Just alert.
-        - PILOT_RUNNING: Pilot may have failed silently. Check if the job
-          still exists; if not, resubmit or fail.
         - ACTIVE: DAG may be making slow progress (normal) or schedd may be
           unreachable (catastrophic). Probe the schedd before escalating.
         - STOPPING: condor_rm may have failed. Retry the removal.
@@ -1201,17 +1156,6 @@ class RequestLifecycleManager:
             # Alert only; operator may need to adjust capacity or priority.
             await self._send_alert(request, "stuck_in_queue",
                 f"Request queued for {elapsed.total_seconds() / 86400:.1f} days")
-
-        elif request.status == RequestStatus.PILOT_RUNNING:
-            # Check if pilot job still exists in the schedd
-            workflow = await self.db.get_workflow_by_request(request.request_name)
-            job_exists = await self.condor_adapter.query_job(
-                schedd_name=workflow.pilot_schedd,
-                cluster_id=workflow.pilot_cluster_id,
-            )
-            if job_exists is None:
-                # Pilot vanished without completion — fail the request
-                await self.transition(request, RequestStatus.FAILED)
 
         elif request.status == RequestStatus.ACTIVE:
             # The critical case: is the schedd reachable?
@@ -1329,7 +1273,9 @@ class AdmissionController:
 class DAGPlanner:
     """
     Plans and submits DAGMan DAGs for workflows.
-    Two-phase model: pilot first, then production DAG.
+    Adaptive model: first round uses request resource hints; subsequent
+    rounds (after recovery) use accumulated step_metrics from FJR data.
+    See Section 5 for the adaptive execution model.
     """
     SPLITTERS = {
         SplittingAlgo.FILE_BASED: FileBasedSplitter,
@@ -1338,86 +1284,31 @@ class DAGPlanner:
         SplittingAlgo.EVENT_AWARE_LUMI: EventAwareLumiSplitter,
     }
 
-    # ── Pilot Phase ──────────────────────────────────────────────
+    # ── DAG Planning and Submission ──────────────────────────────
 
-    async def submit_pilot(self, workflow: Workflow):
-        """Submit pilot job that measures performance iteratively."""
-        input_files = await self.dbs_adapter.get_files(
-            dataset=workflow.input_dataset, limit=5,
-        )
-        pilot_dir = self._create_submit_dir(workflow, pilot=True)
-        pilot_sub = self._write_pilot_submit_file(workflow, input_files, pilot_dir)
-        cluster_id, schedd = await self.condor_adapter.submit_job(pilot_sub)
-        pilot_output_path = f"{pilot_dir}/pilot_metrics.json"
-        await self.db.update_workflow(workflow.id,
-            pilot_cluster_id=cluster_id,
-            pilot_schedd=schedd,
-            pilot_output_path=pilot_output_path,
-            status=WorkflowStatus.PILOT_RUNNING,
-        )
-
-    async def handle_pilot_completion(self, workflow: Workflow, pilot_output_path: str):
-        """Parse pilot metrics and trigger production DAG planning."""
-        metrics = self._parse_pilot_report(pilot_output_path)
-        await self.db.update_workflow(workflow.id, pilot_metrics=metrics, status=WorkflowStatus.PLANNING)
-        await self.plan_and_submit(workflow, metrics=metrics)
-
-    def _parse_pilot_report(self, pilot_output_path: str) -> PilotMetrics:
+    async def plan_and_submit(self, workflow: Workflow) -> DAG:
         """
-        Parse the pilot's JSON performance report into PilotMetrics.
+        Build and submit the production DAG.
 
-        The pilot (running inside the sandbox in pilot mode) writes a
-        structured JSON report — see Section 5.2 for the schema. The
-        "recommended" block is computed by the pilot itself based on
-        convergence of its iterative measurements. We trust the pilot's
-        recommendations for events_per_job, memory_mb, and time_per_job.
-
-        The key value for merge group planning is output_size_per_event_kb:
-        this drives _plan_merge_groups() to compute how many processing
-        nodes can feed one merge node without exceeding the target merged
-        file size (default 4 GB).
+        Round 1 (no step_metrics): uses request resource hints directly.
+        Round 2+ (step_metrics populated from previous round's FJR data):
+        uses measured peak RSS for memory sizing. Writes step_profile.json
+        to submit dir so sandbox can apply per-step adaptive optimization.
         """
-        with open(pilot_output_path) as f:
-            data = json.load(f)
+        request = await self.db.get_request(workflow.request_name)
 
-        recommended = data["recommended"]
-        last_iteration = data["iterations"][-1]
-
-        steps = [
-            StepProfile(
-                step_name=s["step"],
-                time_per_event_sec=s["time_per_event"],
-                memory_peak_mb=s["memory_mb"],
-                output_size_per_event_kb=s.get("output_size_per_event_kb", 0),
-                threads_used=s.get("threads", 1),
-            )
-            for s in data.get("per_step", [])
-        ]
-
-        return PilotMetrics(
-            time_per_event_sec=last_iteration["wall_time_sec"] / last_iteration["events"],
-            memory_peak_mb=max(it["memory_mb"] for it in data["iterations"]),
-            output_size_per_event_kb=recommended["output_size_per_event_kb"],
-            cpu_efficiency=last_iteration.get("cpu_efficiency", 0.9),
-            events_processed=sum(it["events"] for it in data["iterations"]),
-            steps_profiled=steps,
-            recommended_events_per_job=recommended["events_per_job"],
-            recommended_memory_mb=recommended["memory_mb"],
-            recommended_time_per_job_sec=recommended["time_per_job_sec"],
-        )
-
-    # ── Production DAG Phase ─────────────────────────────────────
-
-    async def plan_and_submit(self, workflow: Workflow, metrics: Optional[PilotMetrics] = None) -> DAG:
-        """Build and submit the production DAG."""
-        # 1. Determine resource parameters
-        if metrics:
-            events_per_job = metrics.recommended_events_per_job
-            memory_mb = metrics.recommended_memory_mb
-            time_per_job = metrics.recommended_time_per_job_sec
-            output_size_per_event = metrics.output_size_per_event_kb
+        # Determine resource parameters from step_metrics or request hints
+        if workflow.step_metrics:
+            # Recovery round — use measured metrics for sizing
+            sm = workflow.step_metrics
+            memory_mb = max(
+                s["rss_mb"] for s in sm["steps"].values()
+            ) + 512  # headroom
+            events_per_job = request.splitting_params.get("events_per_job", 10000)
+            time_per_job = int(request.time_per_event_sec * events_per_job)
+            output_size_per_event = request.size_per_event_kb
         else:
-            request = await self.db.get_request(workflow.request_name)
+            # First round — use request defaults
             events_per_job = request.splitting_params.get("events_per_job", 10000)
             memory_mb = request.memory_mb
             time_per_job = int(request.time_per_event_sec * events_per_job)
@@ -1452,6 +1343,15 @@ class DAGPlanner:
 
         # 5. Generate DAG files (outer DAG + per-group sub-DAGs)
         submit_dir = self._create_submit_dir(workflow)
+
+        # Write step_profile.json if step_metrics exist (recovery round).
+        # The sandbox reads this file for per-step adaptive optimization
+        # (see Section 5.3). Absent on round 1 — sandbox uses defaults.
+        if workflow.step_metrics:
+            profile_path = os.path.join(submit_dir, "step_profile.json")
+            with open(profile_path, "w") as f:
+                json.dump(workflow.step_metrics, f)
+
         dag_file_path = self._generate_dag_files(merge_groups, submit_dir, workflow)
 
         # 6. Create and submit DAG
@@ -1489,8 +1389,9 @@ class DAGPlanner:
         Group processing nodes into work units based on expected output size.
         Each work unit becomes a SUBDAG EXTERNAL (merge group) containing:
           landing node → processing nodes → merge node → cleanup node
-        Group composition is fixed at planning time (from pilot metrics).
-        Site assignment is deferred to runtime (landing node mechanism).
+        Group composition is fixed at planning time (from request hints
+        or step_metrics). Site assignment is deferred to runtime (landing
+        node mechanism).
         """
         groups = []
         current_procs = []
@@ -2311,102 +2212,110 @@ class MetricsCollector:
 
 ---
 
-## 5. Pilot Execution Model
+## 5. Adaptive Execution Model
 
 ### 5.1 Overview
 
-The pilot is a single job that runs the full payload chain with iteratively increasing input sizes to measure performance. It produces real output data (not wasted work) and a structured performance report that the DAG Planner uses to build an optimally configured production DAG.
+WMS2 does not run a separate pilot job. Instead, the first production DAG uses resource hints from the request (TimePerEvent, Memory, SizePerEvent) as defaults. As work units complete, their Framework Job Report (FJR) data — per-step CPU efficiency, peak RSS, wall time — is collected by the sandbox and written to merge manifests. When a recovery round occurs (rescue DAG after clean stop, partial failure, or partial production step), the Lifecycle Manager aggregates this FJR data into `step_metrics` on the workflow, and the DAG Planner writes it to `step_profile.json` in the submit directory. The sandbox reads this file and applies per-step adaptive optimization.
 
-### 5.2 Pilot Behavior
+This design eliminates the latency of a dedicated pilot phase (~8 hours) while converging to optimal resource estimates asymptotically through production data. The existing recovery/rescue DAG mechanism is the natural re-optimization point — no new states, no new components.
+
+### 5.2 Execution Rounds
+
+**Round 1** (fresh submission, no `step_profile.json`):
+- DAG Planner uses request resource hints: `Memory`, `TimePerEvent`, `SizePerEvent`
+- Sandbox runs each job with default resource allocation
+- FJR data is collected per work unit but not yet aggregated
+
+**Round 2+** (rescue DAG after clean stop or partial failure):
+- Lifecycle Manager aggregates FJR data from completed work units into `workflow.step_metrics`
+- DAG Planner writes `step_profile.json` to submit directory
+- Sandbox reads `step_profile.json` and applies per-step optimization:
+  - Memory sizing based on measured peak RSS
+  - Per-step splitting for CPU-inefficient steps (Section 5.3)
+- Rescue DAG skips completed nodes — only remaining work uses updated parameters
 
 ```
-Pilot job lands on worker node with allocated resources.
+Round 1: Request hints → DAG → jobs run → FJR data collected
+              │
+              ▼ (clean stop, partial failure, or production step)
+         Lifecycle Manager: _prepare_recovery()
+              │  Aggregates FJR data → workflow.step_metrics
+              ▼
+Round 2: step_metrics → DAG Planner writes step_profile.json
+              │  Sandbox applies per-step optimization
+              ▼
+         Rescue DAG resumes with adaptive parameters
+              │
+              ▼ (if another recovery round)
+Round 3+: Refined step_metrics → further optimization (diminishing returns)
+```
 
-Iteration 1: Process N events through full chain → measure
-Iteration 2: Process 2N events through full chain → measure
-Iteration 3: Process 4N events through full chain → measure
-...
-Stop when: time budget exhausted OR measurements converged
+### 5.3 Per-Step Splitting Optimization
 
-Output:
-  - Real processed data (feeds into final merge)
-  - Performance report (JSON):
-    {
-      "iterations": [
-        {"events": 1000, "wall_time_sec": 120, "memory_mb": 1800, ...},
-        {"events": 2000, "wall_time_sec": 235, "memory_mb": 1850, ...},
-        {"events": 4000, "wall_time_sec": 470, "memory_mb": 1900, ...}
-      ],
-      "per_step": [
-        {"step": "DIGI", "time_per_event": 0.05, "memory_mb": 1200, ...},
-        {"step": "RECO", "time_per_event": 0.08, "memory_mb": 1900, ...}
-      ],
-      "recommended": {
-        "events_per_job": 25000,
-        "memory_mb": 2048,
-        "time_per_job_sec": 28800,
-        "output_size_per_event_kb": 1.8
-      }
+Per-step splitting is a sandbox-owned optimization. When `step_profile.json` is present, the sandbox can split CPU-inefficient steps into N parallel `cmsRun` processes within a single slot, using `skipEvents`/`maxEvents` partitioning.
+
+**Decision rule**: If a step's CPU efficiency (CPU time / wall time / threads) is below a threshold (e.g., 50%), splitting may help. The number of parallel instances N is constrained by:
+- Memory: N instances must fit within the slot's `request_memory`
+- CPU: N should not exceed `request_cpus` (the allocated cores)
+
+**Example**: A GEN-SIM step running on 8 cores at 20% CPU efficiency (effectively using 1.6 cores). With measured RSS of 800 MB per instance and 4 GB slot memory, the sandbox could run 4 parallel single-threaded cmsRun processes (4 × 800 MB = 3.2 GB < 4 GB), each processing 1/4 of the events via `skipEvents`/`maxEvents`. This is entirely the sandbox's decision — WMS2 only provides the metrics.
+
+### 5.4 Memory Calibration
+
+Memory usage varies with thread count. Two data points enable a simple linear model:
+
+```
+RSS(threads) = base + per_thread × threads
+```
+
+- **Point 1**: Round 1 measurement (e.g., 8 threads, 2400 MB)
+- **Point 2**: Round 2 measurement at a different thread count (if the sandbox adjusts threads)
+
+With only one data point (common case), the DAG Planner adds a conservative headroom buffer (512 MB above measured peak) rather than attempting extrapolation.
+
+### 5.5 Metric Aggregation
+
+The Lifecycle Manager aggregates per-step FJR data from completed work units during `_prepare_recovery()`. The aggregation uses medians to be robust against outliers (e.g., one job hitting a slow node).
+
+**`step_metrics` structure**:
+
+```json
+{
+  "round": 1,
+  "jobs_sampled": 42,
+  "steps": {
+    "DIGI": {
+      "cpu_efficiency": 0.85,
+      "rss_mb": 1800,
+      "wall_sec_per_event": 0.05,
+      "threads": 8
+    },
+    "RECO": {
+      "cpu_efficiency": 0.72,
+      "rss_mb": 2400,
+      "wall_sec_per_event": 0.08,
+      "threads": 8
+    },
+    "MINIAODSIM": {
+      "cpu_efficiency": 0.18,
+      "rss_mb": 800,
+      "wall_sec_per_event": 0.12,
+      "threads": 8
     }
+  }
+}
 ```
 
-### 5.3 Pilot vs Urgent Workflows
+The `round` counter increments with each recovery. On round 2+, previous round metrics are merged (weighted by `jobs_sampled`) so the model accumulates data across rounds.
 
-| Aspect | Normal (with pilot) | Urgent (no pilot) |
-|---|---|---|
-| Performance data | Measured | Requestor-provided estimates |
-| Resource accuracy | Optimal | Potentially suboptimal |
-| Merge planning | Based on actual output sizes | Based on estimated sizes |
-| Time to first DAG | ~8 hours (pilot duration) | Immediate |
-| Use case | Standard campaigns | Time-critical reprocessing |
+### 5.6 Convergence
 
-### 5.4 Pilot as Part of the Sandbox
+- **Round 1**: Request defaults. May be suboptimal but functional.
+- **Round 2**: Most gains realized — memory sized to actual RSS, per-step splitting applied to inefficient steps.
+- **Round 3+**: Diminishing returns. Metrics refined with more data points but parameters are already near-optimal.
 
-The pilot is implemented within the sandbox/wrapper — the same executable as production jobs, running in a "pilot mode" that iterates and measures. WMS2 only needs to submit the pilot job with the right configuration, detect completion, parse the performance report, and feed metrics to the DAG Planner.
-
-### 5.5 Pilot → Production Pipeline
-
-The pilot's measurements flow through a concrete pipeline to produce the production DAG. Each step is owned by a specific component:
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. Lifecycle Manager: _handle_queued()  [Section 4.2]             │
-│     Calls dag_planner.submit_pilot(workflow)                       │
-│     Stores pilot_cluster_id, pilot_schedd, pilot_output_path       │
-│     on the Workflow record. Transitions to PILOT_RUNNING.          │
-│                                                                     │
-│  2. HTCondor runs the pilot job (sandbox in pilot mode)            │
-│     Pilot iterates: N, 2N, 4N events until convergence            │
-│     Writes pilot_metrics.json to pilot_output_path                 │
-│                                                                     │
-│  3. Lifecycle Manager: _handle_pilot_running()  [Section 4.2]      │
-│     Polls pilot_cluster_id on pilot_schedd until completed         │
-│     Calls dag_planner.handle_pilot_completion(workflow, path)      │
-│                                                                     │
-│  4. DAG Planner: _parse_pilot_report()  [Section 4.5]             │
-│     Reads pilot_metrics.json                                        │
-│     Maps JSON → PilotMetrics (Section 3.1.2)                       │
-│     Key value: output_size_per_event_kb                            │
-│                                                                     │
-│  5. DAG Planner: plan_and_submit()  [Section 4.5]                  │
-│     Uses PilotMetrics for resource sizing:                          │
-│       - events_per_job → how many events per processing node       │
-│       - memory_mb → HTCondor request_memory                        │
-│       - time_per_job_sec → max_retries / timeout                   │
-│                                                                     │
-│  6. DAG Planner: _plan_merge_groups()  [Section 4.5]               │
-│     Uses output_size_per_event_kb to determine group composition:  │
-│       group_size = target_merged_size / (events_per_job × kb/evt)  │
-│     Each group: N processing nodes feeding 1 merge node            │
-│     This is the critical pilot-dependent calculation.               │
-│                                                                     │
-│  7. DAG Planner: _generate_dag_files()  [Section 4.5]             │
-│     Each group → SUBDAG EXTERNAL with landing node                 │
-│     Submits to HTCondor. Transitions to ACTIVE.                    │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-**Why this pipeline matters**: Without the pilot, merge group composition is based on estimates. If the estimate for `output_size_per_event_kb` is wrong by 2x, merge outputs will be half or double the target size — either wasting storage (too small) or creating downstream problems (too large). The pilot's iterative convergence gives us a reliable measurement.
+Partial production steps (Section 6.2.1) are natural re-optimization points: after the first 10% completes, the rescue DAG for the remaining 90% carries accumulated metrics. This means the bulk of every workflow benefits from measured data, even on the first submission.
 
 ---
 
@@ -2492,7 +2401,7 @@ Auto clean stop (same as operator stop)
   ├── _prepare_recovery(): consume step, set priority=80000
   │
   ▼
-ACTIVE at priority 80000 (rescue DAG, skips pilot)
+ACTIVE at priority 80000 (rescue DAG, carries step_metrics)
   │  work units complete...
   │  fraction_done >= 0.5
   ▼
@@ -2501,13 +2410,13 @@ Auto clean stop
   ├── _prepare_recovery(): consume step, set priority=50000
   │
   ▼
-ACTIVE at priority 50000 (rescue DAG, skips pilot)
+ACTIVE at priority 50000 (rescue DAG, refined step_metrics)
   │  production_steps is now empty → run to completion
   ▼
 COMPLETED
 ```
 
-**Pilot skip on rescue DAG**: When a request re-enters QUEUED after a clean stop, the rescue DAG already has pilot metrics from the original submission. The `_handle_queued()` handler detects the existing rescue DAG and submits it directly, bypassing the pilot phase.
+**Adaptive optimization on rescue DAG**: When a request re-enters QUEUED after a clean stop, the Lifecycle Manager has aggregated per-step FJR metrics from completed work units into `workflow.step_metrics` (see Section 5.5). The rescue DAG carries these accumulated metrics, and the sandbox uses them for per-step optimization (memory sizing, CPU-efficiency-based splitting). Each successive rescue round refines the estimates further.
 
 **In-flight waste**: When the clean stop triggers, work units already in flight continue briefly until `condor_rm` takes effect. The waste is bounded by `MAXJOBS MergeGroup` (typically ~10 work units) — the actual fraction may slightly overshoot the requested threshold.
 
@@ -2690,11 +2599,13 @@ Response:
     "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
     "request_name": "user_Run2024A_v1_250130_123456",
     "status": "active",
-    "pilot_metrics": {
-        "time_per_event_sec": 0.12,
-        "memory_peak_mb": 1900,
-        "output_size_per_event_kb": 1.8,
-        "recommended_events_per_job": 25000
+    "step_metrics": {
+        "round": 1,
+        "jobs_sampled": 42,
+        "steps": {
+            "DIGI": {"cpu_efficiency": 0.85, "rss_mb": 1800, "wall_sec_per_event": 0.05, "threads": 8},
+            "RECO": {"cpu_efficiency": 0.72, "rss_mb": 2400, "wall_sec_per_event": 0.08, "threads": 8}
+        }
     },
     "dag": {
         "id": "660e8400-e29b-41d4-a716-446655440001",
@@ -2866,9 +2777,9 @@ Token support is an external dependency (HTCondor + WLCG infrastructure), not a 
 
 **Deliverables**: Database migrations working; API skeleton with health endpoints; Lifecycle Manager main loop evaluating requests; Docker compose for local dev; basic test framework.
 
-### 10.2 Phase 2: Pilot + DAG Planning Pipeline (Weeks 5–8)
+### 10.2 Phase 2: DAG Planning Pipeline + Adaptive Metrics (Weeks 5–8)
 
-**Goal**: Request → Pilot → DAG file generation.
+**Goal**: Request → DAG file generation with adaptive optimization.
 
 | Component | Description | Priority |
 |---|---|---|
@@ -2876,13 +2787,14 @@ Token support is an external dependency (HTCondor + WLCG infrastructure), not a 
 | DBS Adapter | Query datasets, get file lists | P0 |
 | Workflow Manager | Create workflows from requests | P0 |
 | Admission Controller | Capacity check and priority ordering | P0 |
-| Pilot Submission | Submit pilot jobs, parse results | P0 |
 | File-Based Splitter | File-based splitting → DAGNodeSpecs | P0 |
 | Event-Based Splitter | Event-based splitting | P1 |
-| Merge Planner | Plan merge nodes from pilot metrics | P0 |
+| Merge Planner | Plan merge nodes from request hints / step_metrics | P0 |
 | DAG File Generator | Generate .dag and .sub files | P0 |
+| Step Metrics Aggregation | Aggregate FJR data from completed work units | P0 |
+| step_profile.json Writer | Write step metrics to submit dir for sandbox | P0 |
 
-**Deliverables**: Can import request from ReqMgr2; pilot job runs and reports metrics; DAG files generated with accurate resource estimates and merge plan; unit tests for splitters and DAG generation.
+**Deliverables**: Can import request from ReqMgr2; DAG files generated with resource estimates from request hints; step metrics aggregation tested; step_profile.json written for recovery rounds; unit tests for splitters and DAG generation.
 
 **Action item**: Evaluate existing CMS micro-services for output registration during this phase.
 
@@ -2918,7 +2830,7 @@ Token support is an external dependency (HTCondor + WLCG infrastructure), not a 
 | Observability | Grafana dashboards | P1 |
 | Documentation | Ops guide, API docs | P1 |
 
-**Deliverables**: Full request lifecycle working (submit → pilot → DAG → outputs registered → transfers complete); clean stop and catastrophic recovery tested; site management; production-like deployment; monitoring dashboards; operator documentation.
+**Deliverables**: Full request lifecycle working (submit → DAG → outputs registered → transfers complete → adaptive optimization on recovery); clean stop and catastrophic recovery tested; site management; production-like deployment; monitoring dashboards; operator documentation.
 
 ---
 
@@ -2977,7 +2889,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 | API Response Time | p99 < 500ms | API latency monitoring |
 | System Uptime | 99.5% | Availability monitoring |
 | Node Success Rate | > 95% | DAGMan metrics |
-| Pilot Accuracy | Resource estimates within 20% of actual | Compare pilot predictions to production metrics |
+| Adaptive Convergence | Resource estimates within 20% of actual by round 2 | Compare round 2 step_metrics-based sizing to measured usage |
 
 ### 13.2 Comparison with WMCore
 
@@ -2987,7 +2899,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 | Components | 15+ threads | 5–8 async workers |
 | Databases | 3 (MySQL, Oracle, CouchDB) | 1 (PostgreSQL) |
 | Job Tracking | Per-job in WMS DB | Delegated to DAGMan |
-| Resource Estimation | Manual (requestor guesses) | Automated (pilot measurement) |
+| Resource Estimation | Manual (requestor guesses) | Adaptive (converges from FJR data) |
 | Setup Time | Hours | Minutes |
 | Debug Difficulty | High | Low (single service + DAGMan logs) |
 
@@ -3003,7 +2915,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 | DAGMan status file parsing brittleness | Medium | Medium | Use condor_q as fallback; version-pin HTCondor |
 | Existing micro-services not reusable for Output Manager | Medium | Medium | Evaluate early (Phase 2); budget time for building if needed |
 | Output Manager complexity | Medium | Medium | Rate limiting, robust error handling, clear state machine |
-| Pilot not representative of full dataset | Low | Medium | Allow manual override; use conservative estimates for merge planning |
+| First-round resource estimates inaccurate | Low | Medium | Auto-corrects from round 2 via step_metrics; conservative memory headroom on round 1 |
 | Feature gaps discovered late | High | Medium | Close collaboration with operations team |
 | Team bandwidth | Medium | High | Phased approach, MVP focus |
 | Silent request stalling | High | Medium | Lifecycle Manager timeout detection alerts when any request exceeds its expected duration in a given status; no request can be "forgotten" |
@@ -3016,7 +2928,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 ## 15. Open Questions
 
 1. **Sandbox/Wrapper Design**: How does the per-node manifest communicate input data to the job? What format? This is tightly coupled to sandbox architecture and needs dedicated design discussion.
-2. **Sandbox Scope**: Exact boundary between WMS2 and sandbox responsibilities — manifest generation, pilot mode, POST script logic.
+2. **Sandbox Scope**: Exact boundary between WMS2 and sandbox responsibilities — manifest generation, adaptive per-step optimization (reading `step_profile.json`, per-step splitting), POST script logic, FJR metric extraction.
 3. **Existing Micro-Services**: Which CMS micro-services currently handle output registration and data placement? Are they reusable with clean APIs?
 4. **DAG Size Partitioning**: If a workflow exceeds practical DAG size limits (discovered during load testing), what's the partitioning strategy?
 5. **DAGMan Status Polling vs. Event-Based**: Should WMS2 poll `.status` files or use event log callbacks? Performance implications at scale. The Lifecycle Manager's main loop uses polling by default; event-based callbacks could replace the poll_dag() call if HTCondor supports efficient event delivery.
@@ -3030,6 +2942,9 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 13. **Landing Node Site Discovery**: Is `MATCH_GLIDEIN_CMSSite` reliably set across all CMS glidein configurations? Are there worker node environments where this classad is missing or named differently?
 14. **Work Unit Granularity**: With few work units (e.g., a workflow with only 5 merge groups), the actual fraction may differ significantly from the requested fraction. A `production_steps` entry of `{"fraction": 0.1}` cannot be honored — the closest achievable step is 20% (1 out of 5). Should WMS2 warn at submission time or silently round?
 15. **Partial Production on ACTIVE Requests**: Can `production_steps` be set via `PATCH /api/v1/requests/{name}` on an already-ACTIVE request? This could trigger an immediate clean stop on the next Lifecycle Manager cycle if the fraction threshold is already met. Should this be allowed, or should `production_steps` be immutable after submission?
+16. **Default Thread Count for First Round**: What default thread count should the sandbox use when no `step_profile.json` exists? Should it match the request's `Multicore` field, or should WMS2 suggest a conservative default? Per-step CPU efficiency data suggests some steps are highly inefficient at high thread counts.
+17. **Metric Aggregation Strategy**: Should `step_metrics` use median or p90 for RSS? Median is robust to outliers but may underestimate memory needs for skewed distributions. P90 is safer but wastes memory for most jobs.
+18. **Minimum Sample Size for Reliable step_metrics**: How many completed work units are needed before `step_metrics` are considered reliable? With only 2–3 work units, one outlier can skew medians significantly. Should there be a minimum sample threshold below which the DAG Planner ignores step_metrics and falls back to request hints?
 
 ---
 
@@ -3053,7 +2968,7 @@ This section captures significant design decisions and the reasoning behind them
 
 **Rejected alternatives**:
 - *WMS2 assigns sites at planning time*: Prevents HTCondor from load balancing. WMS2 would need to replicate the negotiator's logic.
-- *Dynamic merge creation based on where processing outputs land*: Violates the principle of fixing merge group composition at planning time from pilot metrics. Also much more complex.
+- *Dynamic merge creation based on where processing outputs land*: Violates the principle of fixing merge group composition at planning time from resource estimates. Also much more complex.
 - *PRE script site selection with WMS2 API calls*: Creates races between groups; effectively WMS2 doing load balancing through the back door.
 
 ### DD-3: Staggered merge group concurrency via MAXJOBS
@@ -3114,7 +3029,7 @@ This section captures significant design decisions and the reasoning behind them
 
 ### DD-11: Partial production as fair-share scheduling via clean stop
 
-**Decision**: Partial production uses the existing clean stop + rescue DAG mechanism to implement fair-share scheduling. A `production_steps` list on the request defines fraction thresholds; when the Lifecycle Manager detects that enough work units have completed, it auto-triggers a clean stop, consumes the step, demotes the request's priority, and re-enters the admission queue. The rescue DAG skips the pilot phase since metrics already exist.
+**Decision**: Partial production uses the existing clean stop + rescue DAG mechanism to implement fair-share scheduling. A `production_steps` list on the request defines fraction thresholds; when the Lifecycle Manager detects that enough work units have completed, it auto-triggers a clean stop, consumes the step, demotes the request's priority, and re-enters the admission queue. The rescue DAG carries accumulated step_metrics for adaptive optimization.
 
 **Why**: Computing resources cannot sit idle, and users should request their full needs to maximize utilization. But when many requests compete, one large request can monopolize the system while others wait. Partial production ensures every request gets at least a bare-minimum fraction of its results quickly (e.g., 10% for validation), then the remainder is deprioritized so other requests get their share. This is a fairness mechanism, not a scheduling optimization.
 
@@ -3124,6 +3039,14 @@ The design reuses the clean stop flow entirely — no new request states, no new
 - *DAG partitioning at planning time* (split workflow into multiple smaller DAGs per priority tier): Complex, inflexible — the fraction boundary is hard-coded at planning time and can't adapt. Also requires managing multiple DAGs per workflow, violating the one-DAG-per-workflow invariant.
 - *New request status (e.g., DEPRIORITIZED)*: Unnecessary — the existing STOPPING → RESUBMITTING → QUEUED → ACTIVE flow handles everything. Adding states increases the state machine complexity for no benefit.
 - *Separate partial production queue*: Over-engineering. The admission queue already handles priority ordering; demoting the request's priority achieves the same effect.
+
+### DD-12: Adaptive execution instead of dedicated pilot
+
+**Decision**: WMS2 does not run a separate pilot job to measure performance before the production DAG. Instead, the first production DAG uses resource hints from the request (TimePerEvent, Memory, SizePerEvent). As work units complete, per-step FJR data (CPU efficiency, peak RSS, wall time) is aggregated by the Lifecycle Manager. When a recovery round occurs (rescue DAG after clean stop, partial failure, or partial production step), the accumulated metrics are written to `step_profile.json` for the sandbox to use in per-step optimization.
+
+**Why**: A dedicated pilot phase adds ~8 hours of latency before the first production job runs, and the pilot's measurements may not represent the full dataset (different input files, different sites). The adaptive model starts producing real results immediately and converges to optimal parameters asymptotically — most gains are realized by round 2. Partial production steps (Section 6.2.1) are natural re-optimization points, so the bulk of every workflow benefits from measured data even on first submission. This also simplifies the state machine (no `PILOT_RUNNING` status) and removes pilot-specific tracking fields.
+
+**Rejected alternative**: *Dedicated pilot job with iterative measurement*. Adds latency, complexity (extra request/workflow states, pilot tracking fields, pilot parsing logic), and may not be representative. The adaptive approach achieves the same goal (accurate resource estimates) without a separate phase, using production data that is inherently representative.
 
 ---
 
@@ -3142,7 +3065,7 @@ The design reuses the clean stop flow entirely — no new request states, no new
 | RetryManager | DAGMan RETRY + POST script | Fully delegated with intelligent POST script |
 | ResourceControl | Site Manager + DAGMan MAXJOBS + Admission Controller | Multi-level throttling |
 | WMBS | PostgreSQL | No separate DB; no per-job rows |
-| — (manual) | Pilot job | New: automated performance measurement |
+| — (manual) | Adaptive execution (step_metrics) | New: automated performance measurement via production FJR data |
 
 ---
 
