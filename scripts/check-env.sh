@@ -45,8 +45,9 @@ else
     fail "git — not found"
 fi
 
-if command -v psql &>/dev/null; then
-    ok "psql ($(psql --version | awk '{print $3}'))"
+PSQL_BIN=$(command -v psql 2>/dev/null || echo /usr/pgsql-16/bin/psql)
+if [[ -x "$PSQL_BIN" ]]; then
+    ok "psql ($($PSQL_BIN --version | awk '{print $3}')) at $PSQL_BIN"
 else
     fail "psql — not found"
 fi
@@ -62,9 +63,9 @@ echo ""
 # --- Services ---
 echo "--- Services ---"
 
-if systemctl is-active postgresql &>/dev/null; then
+if systemctl is-active postgresql-16 &>/dev/null || systemctl is-active postgresql &>/dev/null; then
     ok "PostgreSQL — running"
-    if PGPASSWORD=wms2dev psql -h 127.0.0.1 -U wms2 -d wms2 -c "SELECT 1" &>/dev/null; then
+    if PGPASSWORD=wms2dev "$PSQL_BIN" -h 127.0.0.1 -U wms2 -d wms2 -c "SELECT 1" &>/dev/null; then
         ok "PostgreSQL wms2 database — accessible"
     else
         warn "PostgreSQL running but wms2 database not accessible"

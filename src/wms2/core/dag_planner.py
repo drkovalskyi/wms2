@@ -1354,7 +1354,7 @@ def parse_fjr_metrics(fjr_path, step_index):
     if perf is None:
         return None
 
-    metrics = {'step': step_index + 1}
+    metrics = {'step': step_index + 1, 'step_index': step_index}
 
     # Helper to extract a metric value
     def get_metric(parent_name, metric_name, cast=float):
@@ -1391,18 +1391,18 @@ def parse_fjr_metrics(fjr_path, step_index):
     metrics['peak_rss_mb'] = get_metric('ApplicationMemory', 'PeakValueRss')
     metrics['peak_vsize_mb'] = get_metric('ApplicationMemory', 'PeakValueVsize')
 
-    # Events
-    nevents = None
-    for inp in root.findall('.//InputFile'):
-        ev = inp.findtext('EventsRead')
-        if ev:
-            try:
-                nevents = (nevents or 0) + int(ev)
-            except ValueError:
-                pass
+    # Events: prefer ProcessingSummary (physics events only, not pileup reads)
+    nevents = get_metric('ProcessingSummary', 'NumberEvents', int)
     if nevents is None:
-        # GEN fallback: no InputFile
-        nevents = get_metric('ProcessingSummary', 'NumberEvents', int)
+        nevents = 0
+        for inp in root.findall('.//InputFile'):
+            ev = inp.findtext('EventsRead')
+            if ev:
+                try:
+                    nevents += int(ev)
+                except ValueError:
+                    pass
+        nevents = nevents or None
     metrics['events_processed'] = nevents
 
     # Time per event
@@ -1435,7 +1435,7 @@ while True:
     step_idx += 1
 
 if all_metrics:
-    out = 'proc_\${NODE_INDEX}_metrics.json'
+    out = 'proc_${NODE_INDEX}_metrics.json'
     with open(out, 'w') as fh:
         json.dump(all_metrics, fh, indent=2)
     print(f'Wrote {out}: {len(all_metrics)} steps')
