@@ -1653,6 +1653,123 @@ Added `TestMetrics` class with 4 tests:
 - **Aggregation in merge script, not WMS2 core**: Keeps WMS2's "no per-job tracking" invariant — the merge job (which already reads per-proc manifests) does the aggregation as a side effect. WMS2 can later read `work_unit_metrics.json` for resource calibration without needing per-job data.
 - **Events use total, not mean**: `events_processed` aggregation reports min/max/total (not mean) since total events per step across all proc jobs is more useful for throughput analysis.
 
+---
+
+## Phase 14 — Test Matrix Framework
+
+**Date**: 2026-02-20
+**Commit**: `fc69159`
+
+### What Was Built
+
+A declarative test matrix module (`tests/matrix/`, 11 files, ~1200 lines) inspired by CMSSW's `runTheMatrix.py`. Provides numbered workflow definitions, predefined sets, environment auto-detection, fault injection, a generic runner reusing the real DAGPlanner + HTCondor, and per-step performance reporting with statistical analysis.
+
+#### Module Structure
+
+| File | Purpose |
+|---|---|
+| `definitions.py` | Core dataclasses: `WorkflowDef`, `FaultSpec`, `VerifySpec` (all frozen) |
+| `derive.py` | `derive()` helper for creating workflow variants |
+| `environment.py` | Capability detection wrapping `tests/environment/checks.py` |
+| `catalog.py` | 6 workflows: 100.x synthetic, 300.x real CMSSW, 500.x fault injection |
+| `sets.py` | Predefined sets: smoke, integration, full, faults, synthetic |
+| `sweeper.py` | Pre/post cleanup of work dirs and LFN output paths |
+| `faults.py` | Post-submission fault injection via `.sub` file patching |
+| `runner.py` | `MatrixRunner` execution engine, perf collection, result persistence |
+| `reporter.py` | Pass/fail table + per-step performance report |
+| `__main__.py` | CLI entry point with `--list`, `--sets`, `--report`, `--results` |
+| `__init__.py` | Package init |
+
+#### Workflow Catalog
+
+| ID | Mode | Title |
+|---|---|---|
+| 100.0 | synthetic | Synthetic 1-job smoke test |
+| 100.1 | synthetic | Synthetic 2-job parallel |
+| 300.0 | cached | NPS 5-step StepChain, 1 work unit (8 jobs × 50 ev) |
+| 500.0 | synthetic | Fault: proc exit 1 (expect retry + rescue DAG) |
+| 501.0 | synthetic | Fault: proc exit 2 (UNLESS-EXIT, no retry) |
+| 510.0 | synthetic | Fault: merge exit 1 (expect rescue DAG) |
+
+#### Performance Collection — 3-Tier Strategy
+
+1. **`proc_N_metrics.json`** — Structured per-job per-step data written by `wms2_proc.sh` FJR parser. Each proc job writes a uniquely-named file (no overwrites). Contains `step_index`, `wall_time_sec`, `cpu_efficiency`, `peak_rss_mb`, `events_processed`, `throughput_ev_s`.
+
+2. **Proc stdout FJR metric lines** — Pattern: `Step N: wall=Xs cpu_eff=Y rss=ZMB events=N`. Available from all proc jobs (each has its own stdout file). Parsed when no metrics JSON files exist.
+
+3. **FJR XML + stdout wall times** — Fallback: parse `report_step*.xml` (only last job's survive due to filename collisions) for CPU eff/RSS, combine with wall times from all proc stdout (`Step X completed in Ns` pattern).
+
+All strategies compute mean ± stddev across jobs using sample standard deviation.
+
+#### Time Breakdown from DAGMan Log
+
+Parses `group.dag.dagman.out` for `ULOG_EXECUTE`/`ULOG_JOB_TERMINATED` timestamps per node type to produce:
+- Processing time (first proc start → last proc end)
+- Merge time (merge start → merge end)
+- Cleanup time
+- Overhead (scheduling gaps between phases)
+
+#### Result Persistence
+
+- Results saved as JSON to `/mnt/shared/work/wms2_matrix/results/` after each run
+- `WorkflowResult`, `PerfData`, `StepPerf` all have `to_dict()`/`from_dict()` serialization
+- Raw per-job per-step data and CPU samples preserved for re-analysis
+- `--report` re-renders from saved data without re-running
+- `--results` lists saved result files
+
+#### Report Output
+
+```
+Performance: 300.0 — NPS 5-step StepChain, 1 work unit (8 jobs x 50 ev)
+  Jobs: 8    Wall: 1230s
+  CPU:  avg 2825% (28.2 cores)  peak 3050% (30.5 cores)  expected 6400%  efficiency 44%
+
+  Step        Wall(s)         CPU Eff           RSS(MB)   Events   Tput(ev/s)    n
+  Step 1  326 ±2 [323-328]   66.1% ±1.1    1870 ±9/1886     400            -    8
+  Step 2  318 ±21 [294-349]  51.1% ±8.8  7280 ±133/7478     400            -    8
+  Step 3  174 ±9 [162-190]   53.0% ±3.7   3901 ±72/4017     400            -    8
+  Step 4  67 ±3 [64-71]      22.5% ±1.0   2336 ±15/2356     400            -    8
+  Step 5  44 ±2 [42-47]      14.8% ±0.2   1706 ±11/1719     400            -    8
+  Total                929s/job
+
+  Overall:
+    CMSSW threading: 52.9% (4.2 / 8 cores used by cmsRun)
+    System-level:    44.1% (28.2 / 64 allocated cores over 1230s)
+    Peak RSS:        7478 MB
+
+  Time breakdown:
+    Processing: 1012s
+    Merge:      89s
+    Overhead:   43s (scheduling, transfer, DAGMan gaps)
+
+  Output: 2 merged files, 29.1 MB  (unmerged cleaned)
+```
+
+### dag_planner.py Fixes
+
+- **`proc_\${NODE_INDEX}_metrics.json` → `proc_${NODE_INDEX}_metrics.json`**: The backslash-escaped `\$` prevented bash variable expansion inside the `python3 -c "..."` block. All proc jobs wrote to the same literal filename instead of `proc_0_metrics.json`, `proc_1_metrics.json`, etc.
+- **Added `step_index` field** to metrics JSON entries (was only `step` with 1-based numbering).
+- **Events counting**: Changed FJR parser to prefer `ProcessingSummary/NumberEvents` over summing `InputFile/EventsRead`. The latter overcounts for DRPremix steps where pileup InputFile entries inflate the count (e.g., 100 instead of 50 for a 50-event job).
+
+### DAGMan Verification Fix
+
+DAGMan always exits with `job_status=4` ("completed") regardless of whether nodes failed — it writes rescue DAGs instead. Fixed `_verify()` to check `actually_succeeded = dag_completed AND rescue_dags == 0`. Rescue DAG search covers both `workflow.dag.rescue*` and `group.dag.rescue*`.
+
+### Verification
+
+- `python -m tests.matrix --list` — Lists all 6 workflows with environment status
+- `python -m tests.matrix -l smoke` — 4/4 passed (100.0, 500.0, 501.0, 510.0)
+- `python -m tests.matrix -l 300.0` — Passed (8 jobs × 50 events × 5 steps, ~20 min)
+- `python -m tests.matrix --report` — Re-renders from saved JSON without re-running
+
+### Design Decisions
+
+- **Declarative over imperative**: Workflow definitions are frozen dataclasses, not procedural test functions. Adding a new test = adding a `WorkflowDef` to the catalog. The runner is generic.
+- **Same code path as production**: Uses `DAGPlanner.plan_production_dag()` and `HTCondorAdapter` directly, not test-specific submission logic. Only mocks are the repository (no DB needed) and DBS/Rucio adapters.
+- **Results persisted, not ephemeral**: Every run saves full results (including raw per-job data) to JSON. Iterating on the report format never requires re-running workflows.
+- **Three efficiency metrics, not one**: CMSSW threading (FJR-based, per-step), system-level CPU (ground truth from `/proc/stat`), and time breakdown (DAGMan log timestamps). Each measures something different; they are not combined into a misleading single number.
+- **Fault injection via .sub patching**: Rather than building fault modes into the wrapper script, faults are injected by rewriting `.sub` files after submission. DAGMan re-reads `.sub` at node start time, so patches take effect on the next execution of that node.
+
 ## What's Next
 
 - Multi-merge-group DAG — Submit workflow with multiple work units
