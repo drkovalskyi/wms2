@@ -14,7 +14,9 @@
 #   - Internet access to CERN, HTCondor repos, PyPI
 #
 # Usage:
-#   sudo bash scripts/setup-dev-vm.sh
+#   sudo WMS2_REPO_URL=https://github.com/your-org/wms2.git bash scripts/setup-dev-vm.sh
+#
+# If the repo is already cloned at /mnt/shared/work/wms2, WMS2_REPO_URL is optional.
 #
 # After completion:
 #   su - agent
@@ -31,6 +33,7 @@ PG_DB="wms2"
 PG_TEST_DB="wms2test"
 PG_USER="wms2"
 PG_PASS="wms2dev"
+REPO_URL="${WMS2_REPO_URL:-}"   # set this or export WMS2_REPO_URL before running
 SITECONF_DIR="/opt/cms/siteconf"
 CONDOR_CONFIG="/etc/condor/config.d/50-wms2-dev.conf"
 
@@ -78,7 +81,7 @@ agent ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable *, /usr/bin/systemctl disabl
 agent ALL=(ALL) NOPASSWD: /usr/bin/dnf install *, /usr/bin/dnf update *, /usr/bin/dnf remove *
 agent ALL=(ALL) NOPASSWD: /usr/bin/chown *, /usr/bin/chmod *
 agent ALL=(ALL) NOPASSWD: /usr/sbin/condor_reconfig
-agent ALL=(ALL) NOPASSWD: /usr/bin/psql -U postgres *
+agent ALL=(ALL) NOPASSWD: /usr/pgsql-16/bin/psql -U postgres *
 SUDOEOF
     chmod 440 "$SUDOERS_FILE"
     ok "Sudoers configured at $SUDOERS_FILE"
@@ -93,14 +96,27 @@ PACKAGES=(
     python3.12-pip
     git
     jq
-    postgresql-server
-    postgresql-contrib
 )
+
+# PostgreSQL 16 repo (the base OS only ships 13, project requires 15+)
+if ! dnf list installed postgresql16-server &>/dev/null; then
+    info "Adding PostgreSQL 16 repo..."
+    dnf install -y -q https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm 2>/dev/null
+    dnf -qy module disable postgresql 2>/dev/null   # disable built-in module to avoid conflicts
+    ok "PostgreSQL 16 repo added"
+else
+    skip "PostgreSQL 16 already installed"
+fi
+
+PACKAGES+=(postgresql16-server postgresql16-contrib)
 
 # HTCondor repo
 if [[ ! -f /etc/yum.repos.d/htcondor.repo ]]; then
     info "Adding HTCondor 24.x repo..."
-    rpm --import https://htcss-downloads.chtc.wisc.edu/repo/keys/RPM-GPG-KEY-HTCondor-24.x
+    mkdir -p /etc/pki/rpm-gpg
+    curl -fsSL -o /etc/pki/rpm-gpg/HTCondor-24.x-Key \
+        https://htcss-downloads.chtc.wisc.edu/repo/keys/HTCondor-24.x-Key
+    rpm --import /etc/pki/rpm-gpg/HTCondor-24.x-Key
     cat > /etc/yum.repos.d/htcondor.repo <<'REPOEOF'
 [htcondor]
 name=HTCondor for Enterprise Linux 9 - Release
@@ -108,7 +124,7 @@ baseurl=https://htcss-downloads.chtc.wisc.edu/repo/24.x/el9/$basearch/release
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-HTCondor-24.x
+gpgkey=file:///etc/pki/rpm-gpg/HTCondor-24.x-Key
 priority=90
 REPOEOF
     ok "HTCondor repo added"
@@ -125,21 +141,22 @@ ok "System packages installed"
 # ── 4. PostgreSQL ─────────────────────────────────────────────
 echo "--- 4. PostgreSQL ---"
 
-PG_DATA="/var/lib/pgsql/data"
+PG_DATA="/var/lib/pgsql/16/data"
+PG_SERVICE="postgresql-16"
 if [[ ! -f "$PG_DATA/PG_VERSION" ]]; then
-    info "Initializing PostgreSQL..."
-    postgresql-setup --initdb
-    ok "PostgreSQL initialized"
+    info "Initializing PostgreSQL 16..."
+    /usr/pgsql-16/bin/postgresql-16-setup initdb
+    ok "PostgreSQL 16 initialized"
 else
-    skip "PostgreSQL already initialized"
+    skip "PostgreSQL 16 already initialized"
 fi
 
 # Configure pg_hba.conf for password auth on TCP
 PG_HBA="$PG_DATA/pg_hba.conf"
-if ! grep -q "scram-sha-256" "$PG_HBA" 2>/dev/null; then
-    # Replace default ident with scram-sha-256 for TCP connections
-    sed -i 's/^host\s\+all\s\+all\s\+127.0.0.1\/32\s\+ident/host    all             all             127.0.0.1\/32            scram-sha-256/' "$PG_HBA"
-    sed -i 's/^host\s\+all\s\+all\s\+::1\/128\s\+ident/host    all             all             ::1\/128                 scram-sha-256/' "$PG_HBA"
+# Match only active rules (not comments) that still use ident or peer for host connections
+if grep -qE '^host\s+all\s+all\s+.*\s+(ident|peer)' "$PG_HBA" 2>/dev/null; then
+    sed -i 's/^host\s\+all\s\+all\s\+127.0.0.1\/32\s\+\(ident\|peer\)/host    all             all             127.0.0.1\/32            scram-sha-256/' "$PG_HBA"
+    sed -i 's/^host\s\+all\s\+all\s\+::1\/128\s\+\(ident\|peer\)/host    all             all             ::1\/128                 scram-sha-256/' "$PG_HBA"
     chown postgres:postgres "$PG_HBA"
     ok "pg_hba.conf configured for scram-sha-256"
 else
@@ -149,24 +166,33 @@ fi
 # Ensure postgres owns its config files
 chown postgres:postgres "$PG_HBA"
 
-# Start PostgreSQL
-systemctl enable --now postgresql
-ok "PostgreSQL running"
+# Stop old PostgreSQL (base OS version) if running
+systemctl stop postgresql 2>/dev/null
+systemctl disable postgresql 2>/dev/null
+
+# Start PostgreSQL 16
+systemctl enable --now "$PG_SERVICE"
+ok "PostgreSQL 16 running"
+
+# Ensure password_encryption matches pg_hba.conf auth method
+su - postgres -c "/usr/pgsql-16/bin/psql -c \"ALTER SYSTEM SET password_encryption = 'scram-sha-256'\"" 2>/dev/null
+systemctl reload "$PG_SERVICE" 2>/dev/null
 
 # Create role and databases
+PG16_PSQL="/usr/pgsql-16/bin/psql"
 info "Creating PostgreSQL role and databases..."
-su - postgres -c "psql -tc \"SELECT 1 FROM pg_roles WHERE rolname='$PG_USER'\"" | grep -q 1 || \
-    su - postgres -c "psql -c \"CREATE ROLE $PG_USER WITH LOGIN PASSWORD '$PG_PASS'\""
+su - postgres -c "$PG16_PSQL -tc \"SELECT 1 FROM pg_roles WHERE rolname='$PG_USER'\"" | grep -q 1 || \
+    su - postgres -c "$PG16_PSQL -c \"CREATE ROLE $PG_USER WITH LOGIN PASSWORD '$PG_PASS'\""
 
-su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='$PG_DB'\"" | grep -q 1 || \
-    su - postgres -c "psql -c \"CREATE DATABASE $PG_DB OWNER $PG_USER\""
+su - postgres -c "$PG16_PSQL -tc \"SELECT 1 FROM pg_database WHERE datname='$PG_DB'\"" | grep -q 1 || \
+    su - postgres -c "$PG16_PSQL -c \"CREATE DATABASE $PG_DB OWNER $PG_USER\""
 
-su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='$PG_TEST_DB'\"" | grep -q 1 || \
-    su - postgres -c "psql -c \"CREATE DATABASE $PG_TEST_DB OWNER $PG_USER\""
+su - postgres -c "$PG16_PSQL -tc \"SELECT 1 FROM pg_database WHERE datname='$PG_TEST_DB'\"" | grep -q 1 || \
+    su - postgres -c "$PG16_PSQL -c \"CREATE DATABASE $PG_TEST_DB OWNER $PG_USER\""
 
 # pgcrypto extension
-su - postgres -c "psql -d $PG_DB -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto'" 2>/dev/null
-su - postgres -c "psql -d $PG_TEST_DB -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto'" 2>/dev/null
+su - postgres -c "$PG16_PSQL -d $PG_DB -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto'" 2>/dev/null
+su - postgres -c "$PG16_PSQL -d $PG_TEST_DB -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto'" 2>/dev/null
 
 ok "PostgreSQL: role=$PG_USER, databases=$PG_DB + $PG_TEST_DB"
 
@@ -315,9 +341,14 @@ ok "Directory ownership configured"
 echo "--- 8. Python venv ---"
 
 if [[ ! -d "$REPO_DIR" ]]; then
-    info "Cloning repo (you may need to set this up manually)..."
-    su - "$DEV_USER" -c "git clone https://github.com/your-org/wms2.git $REPO_DIR" 2>/dev/null || \
-        echo "  NOTE: Clone manually: git clone <repo-url> $REPO_DIR"
+    if [[ -n "$REPO_URL" ]]; then
+        info "Cloning repo from $REPO_URL..."
+        su - "$DEV_USER" -c "git clone '$REPO_URL' '$REPO_DIR'"
+        ok "Repo cloned to $REPO_DIR"
+    else
+        echo -e "  ${YELLOW}WARN${NC}  Repo not cloned — set WMS2_REPO_URL and re-run, or clone manually:"
+        echo "        git clone <repo-url> $REPO_DIR"
+    fi
 fi
 
 if [[ -d "$REPO_DIR" ]]; then
@@ -351,6 +382,7 @@ if ! grep -q "$MARKER" "$PROFILE" 2>/dev/null; then
     cat >> "$PROFILE" <<PROFILEEOF
 
 $MARKER
+export PATH=/usr/pgsql-16/bin:\$PATH
 cd $REPO_DIR 2>/dev/null
 source $VENV_DIR/bin/activate 2>/dev/null
 
@@ -366,12 +398,106 @@ else
     skip "Shell profile already configured"
 fi
 
-# ── 10. Verify ────────────────────────────────────────────────
+# ── 10. Generate environment.local.md ─────────────────────────
+echo "--- 10. Environment profile ---"
+
+LOCAL_ENV="$REPO_DIR/.claude/environment.local.md"
+if [[ -d "$REPO_DIR/.claude" ]]; then
+    HOSTNAME_VAL=$(hostname)
+    OS_VAL=$(source /etc/os-release 2>/dev/null && echo "$NAME $VERSION" || uname -sr)
+    CPUS_VAL=$(nproc)
+    MEM_VAL=$(free -h | awk '/Mem:/{print $2}')
+    DISK_ROOT=$(df -h / | awk 'NR==2{print $2 " total, " $4 " free"}')
+    DISK_SHARED=$(df -h /mnt/shared 2>/dev/null | awk 'NR==2{print $2 " total, " $4 " free"}' || echo "N/A")
+    PG_VER=$(/usr/pgsql-16/bin/psql --version 2>/dev/null | awk '{print $3}' || echo "unknown")
+    CONDOR_VER=$(condor_version 2>/dev/null | head -1 | awk '{print $2}' || echo "unknown")
+    PY_VER=$("$VENV_DIR/bin/python3" --version 2>&1 | awk '{print $2}' || echo "unknown")
+    GIT_VER=$(git --version 2>/dev/null | awk '{print $3}' || echo "unknown")
+    TODAY=$(date +%Y-%m-%d)
+
+    cat > "$LOCAL_ENV" <<ENVEOF
+# WMS2 Local Environment — $HOSTNAME_VAL
+
+Last updated: $TODAY (generated by setup-dev-vm.sh)
+
+## Machine
+- **Hostname**: $HOSTNAME_VAL
+- **OS**: $OS_VAL
+- **CPUs**: $CPUS_VAL
+- **Memory**: $MEM_VAL
+- **Disk**: $DISK_ROOT (root), $DISK_SHARED (/mnt/shared)
+
+## Deployment Style
+dev-local (full local stack)
+
+## Services
+
+### PostgreSQL
+- **Location**: local
+- **Host**: 127.0.0.1
+- **Port**: 5432
+- **Version**: $PG_VER
+- **Status**: running (systemd enabled)
+- **Databases**: \`$PG_DB\` (app), \`$PG_TEST_DB\` (integration tests)
+- **User**: $PG_USER
+- **Credentials**: password \`$PG_PASS\` (TCP via scram-sha-256); peer auth via unix socket for postgres superuser
+- **Extensions**: pgcrypto (in both databases)
+
+### HTCondor
+- **Location**: local
+- **Version**: $CONDOR_VER
+- **Components**: master, collector, negotiator, schedd, startd
+- **Status**: running (systemd enabled)
+- **Config**: $CONDOR_CONFIG
+- **Python bindings**: htcondor2 (pip) — import as \`htcondor2\`
+- **Job submission user**: $DEV_USER
+
+## Tools
+
+### Python
+- **System**: $(python3 --version 2>&1) at $(which python3)
+- **Dev**: Python $PY_VER in venv
+- **Virtual env**: $VENV_DIR
+- **Activate**: \`source $VENV_DIR/bin/activate\`
+
+### Git
+- **Version**: $GIT_VER
+
+### Other tools
+- **psql**: installed ($PG_VER)
+- **jq**: $(jq --version 2>/dev/null || echo "not installed")
+
+## CMS / CMSSW Environment
+
+### Site Configuration
+- **Location**: $SITECONF_DIR
+- **Site name**: T2_LOCAL_DEV
+
+### Environment Variables (set by .bashrc)
+- \`SITECONFIG_PATH=$SITECONF_DIR\`
+- \`X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates\`
+- \`X509_USER_PROXY=/mnt/creds/x509up\`
+
+## Network Access
+- Run \`scripts/check-env.sh\` to test CMS endpoint reachability
+
+## Known Limitations
+- HTCondor Python bindings from pip use \`htcondor2\` module (v2 API), not \`htcondor\` (v1)
+- CMS grid proxy at \`/mnt/creds/x509up\` — must be refreshed periodically
+- CMSSW el8 releases need apptainer container on el9 host
+ENVEOF
+    chown "$DEV_USER:$DEV_USER" "$LOCAL_ENV"
+    ok "Generated $LOCAL_ENV"
+else
+    info "Repo not cloned — skipping environment.local.md"
+fi
+
+# ── 11. Verify ────────────────────────────────────────────────
 echo ""
 echo "--- Verification ---"
 
 # PostgreSQL
-if PGPASSWORD="$PG_PASS" psql -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -c "SELECT 1" &>/dev/null; then
+if PGPASSWORD="$PG_PASS" /usr/pgsql-16/bin/psql -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -c "SELECT 1" &>/dev/null; then
     ok "PostgreSQL: $PG_USER@$PG_DB accessible"
 else
     echo -e "  ${RED}FAIL${NC}  PostgreSQL connection failed"
