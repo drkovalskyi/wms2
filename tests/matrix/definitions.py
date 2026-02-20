@@ -48,3 +48,5 @@ class WorkflowDef:
     fault: FaultSpec | None = None
     verify: VerifySpec = field(default_factory=VerifySpec)
     cached_sandbox_path: str = ""
+    adaptive: bool = False
+    num_work_units: int = 1

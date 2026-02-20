@@ -578,6 +578,172 @@ def _collect_perf(wf: WorkflowDef, wf_dir: Path, cpu_samples: list[float]) -> Pe
     return perf
 
 
+def _collect_adaptive_perf(
+    wf: WorkflowDef, wf_dir: Path, cpu_samples: list[float]
+) -> PerfData:
+    """Collect performance separately from each work unit round.
+
+    Stores per-round step data with prefixed keys ("Round 1: Step N")
+    and tuning decisions in raw_job_step_data["_adaptive"].
+    """
+    perf = PerfData()
+    perf.num_proc_jobs = wf.num_jobs * wf.num_work_units
+
+    # CPU utilization from polling samples
+    active = [p for p in cpu_samples[1:] if p > 50]
+    if active:
+        perf.cpu_avg_pct = sum(active) / len(active)
+        perf.cpu_peak_pct = max(active)
+    perf.cpu_expected_pct = wf.num_jobs * wf.multicore * 100
+
+    job_step_data: dict[str, list[dict]] = {}
+    metrics_pattern = re.compile(r"proc_(\d+)_metrics\.json$")
+
+    mg_dirs = sorted(wf_dir.glob("mg_*"))
+    for round_idx, gd in enumerate(mg_dirs):
+        round_label = f"Round {round_idx + 1}"
+
+        # Collect from group dir and unmerged storage
+        search_dirs = [gd]
+        output_info_path = gd / "output_info.json"
+        if output_info_path.exists():
+            try:
+                oi = json.loads(output_info_path.read_text())
+                pfx = oi.get("local_pfn_prefix", "")
+                gi = oi.get("group_index", 0)
+                for ds in oi.get("output_datasets", []):
+                    ub = ds.get("unmerged_lfn_base", "")
+                    if ub and pfx:
+                        udir = Path(pfx) / ub.lstrip("/") / f"{gi:06d}"
+                        if udir.is_dir():
+                            search_dirs.append(udir)
+            except Exception:
+                pass
+
+        found_metrics = False
+        for search_dir in search_dirs:
+            for mf in sorted(search_dir.glob("proc_*_metrics.json")):
+                if not metrics_pattern.search(mf.name):
+                    continue
+                try:
+                    data = json.loads(mf.read_text())
+                    found_metrics = True
+                    for step_data in data:
+                        if "step_index" not in step_data:
+                            continue
+                        si = step_data["step_index"]
+                        name = f"{round_label}: Step {si + 1}"
+                        job_step_data.setdefault(name, []).append({
+                            "wall": step_data.get("wall_time_sec") or 0,
+                            "cpu_eff": step_data.get("cpu_efficiency") or 0,
+                            "rss": step_data.get("peak_rss_mb") or 0,
+                            "events": step_data.get("events_processed") or 0,
+                            "throughput": step_data.get("throughput_ev_s") or 0,
+                        })
+                except Exception as exc:
+                    logger.warning("Failed to read %s: %s", mf, exc)
+            if found_metrics:
+                break
+
+    # Read replan decisions
+    decisions_path = wf_dir / "replan_decisions.json"
+    adaptive_info: dict = {}
+    if decisions_path.exists():
+        try:
+            adaptive_info = json.loads(decisions_path.read_text())
+        except Exception:
+            pass
+
+    perf.raw_job_step_data = job_step_data
+    perf.raw_job_step_data["_adaptive"] = adaptive_info
+    perf.cpu_samples = cpu_samples
+
+    # Aggregate into StepPerf objects
+    for step_name in sorted(job_step_data.keys()):
+        if step_name.startswith("_"):
+            continue
+        samples = job_step_data[step_name]
+        perf.steps.append(_aggregate_step(step_name, samples, wf.events_per_job))
+
+    # Time breakdown — parse from both merge groups
+    for gd in sorted(wf_dir.glob("mg_*")):
+        _parse_dagman_times_from_dir(gd, perf)
+
+    # Output sizes
+    pfn_prefix = "/mnt/shared"
+    for ds in wf.output_datasets:
+        merged_lfn = ds.get("merged_lfn_base", "")
+        if merged_lfn:
+            pfn = Path(pfn_prefix) / merged_lfn.lstrip("/")
+            if pfn.exists():
+                files = [f for f in pfn.rglob("*") if f.is_file()]
+                perf.merged_files += len(files)
+                perf.merged_bytes += sum(f.stat().st_size for f in files)
+        unmerged_lfn = ds.get("unmerged_lfn_base", "")
+        if unmerged_lfn:
+            pfn = Path(pfn_prefix) / unmerged_lfn.lstrip("/")
+            if not pfn.exists() or not list(pfn.rglob("*")):
+                perf.unmerged_cleaned = True
+
+    return perf
+
+
+def _parse_dagman_times_from_dir(gd: Path, perf: PerfData) -> None:
+    """Parse DAGMan log from a single merge group, accumulating into perf."""
+    from datetime import datetime
+
+    dagman_out = gd / "group.dag.dagman.out"
+    if not dagman_out.exists():
+        return
+    try:
+        content = dagman_out.read_text()
+    except OSError:
+        return
+
+    ts_pattern = re.compile(r"\{(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\}")
+    node_pattern = re.compile(
+        r"ULOG_(EXECUTE|JOB_TERMINATED) for HTCondor Node (\S+)"
+    )
+
+    proc_starts: list[datetime] = []
+    proc_ends: list[datetime] = []
+    merge_start: datetime | None = None
+    merge_end: datetime | None = None
+    cleanup_start: datetime | None = None
+    cleanup_end: datetime | None = None
+
+    for line in content.splitlines():
+        nm = node_pattern.search(line)
+        tm = ts_pattern.search(line)
+        if not nm or not tm:
+            continue
+        event_type, node_name = nm.group(1), nm.group(2)
+        ts = datetime.strptime(tm.group(1), "%m/%d/%y %H:%M:%S")
+
+        if node_name.startswith("proc_"):
+            if event_type == "EXECUTE":
+                proc_starts.append(ts)
+            else:
+                proc_ends.append(ts)
+        elif node_name == "merge":
+            if event_type == "EXECUTE":
+                merge_start = ts
+            else:
+                merge_end = ts
+        elif node_name == "cleanup":
+            if event_type == "EXECUTE":
+                cleanup_start = ts
+            else:
+                cleanup_end = ts
+
+    if proc_starts and proc_ends:
+        perf.time_processing += (max(proc_ends) - min(proc_starts)).total_seconds()
+    if merge_start and merge_end:
+        perf.time_merge += (merge_end - merge_start).total_seconds()
+    if cleanup_start and cleanup_end:
+        perf.time_cleanup += (cleanup_end - cleanup_start).total_seconds()
+
+
 # ── Main runner ──────────────────────────────────────────────
 
 
@@ -649,6 +815,10 @@ class MatrixRunner:
         else:
             create_sandbox(sandbox_path, wf.request_spec, mode=wf.sandbox_mode)
 
+        # Dispatch to adaptive path if enabled
+        if wf.adaptive:
+            return await self._execute_adaptive(wf, result, work_dir, sandbox_path)
+
         # 4. Mock repo + planner
         mock_wf = _make_workflow_mock(wf, sandbox_path)
         repo = _make_mock_repo()
@@ -699,6 +869,134 @@ class MatrixRunner:
         _verify(wf, result, wf_dir)
 
         # 10. Sweep post — keep artifacts on failure
+        sweep_post(wf.wf_id, keep_artifacts=(result.status != "passed"))
+
+        return result
+
+    async def _execute_adaptive(
+        self,
+        wf: WorkflowDef,
+        result: WorkflowResult,
+        work_dir: Path,
+        sandbox_path: str,
+    ) -> WorkflowResult:
+        """Adaptive execution: 2 work units with a replan node between them.
+
+        The replan node analyzes WU0's metrics and patches WU1's manifest
+        with per-step nThreads tuning.  The scheduler-visible job shape
+        (request_cpus, request_memory, num_jobs, events_per_job) stays
+        identical between rounds.
+
+        1. Plan with mock condor adapter (generates files, no submission)
+        2. Generate replan.sub (universe=local)
+        3. Modify workflow.dag: add replan node between WU0 and WU1
+        4. Submit with real condor adapter
+        5. Poll, collect per-round perf, verify, sweep
+        """
+        from wms2.core.dag_planner import DAGPlanner, PilotMetrics
+
+        submit_dir = str(work_dir / "submit")
+
+        # Total events across both work units
+        total_events = wf.events_per_job * wf.num_jobs * wf.num_work_units
+        mock_wf = _make_workflow_mock(wf, sandbox_path)
+        mock_wf.config_data["request_num_events"] = total_events
+        mock_wf.splitting_params["events_per_job"] = wf.events_per_job
+
+        repo = _make_mock_repo()
+
+        settings = self._settings.model_copy(
+            update={
+                "submit_base_dir": submit_dir,
+                "jobs_per_work_unit": max(wf.num_jobs, 1),
+            }
+        )
+
+        # Step 1: Plan with MOCK condor adapter (generates files, no submission)
+        mock_condor = MagicMock()
+        mock_condor.submit_dag = AsyncMock(return_value=("0", "localhost"))
+
+        planner = DAGPlanner(
+            repository=repo,
+            dbs_adapter=MagicMock(),
+            rucio_adapter=MagicMock(),
+            condor_adapter=mock_condor,
+            settings=settings,
+        )
+
+        metrics = PilotMetrics.from_request(mock_wf.config_data)
+        await planner.plan_production_dag(mock_wf, metrics=metrics)
+
+        wf_dir = Path(submit_dir) / str(mock_wf.id)
+        result.submit_dir = str(wf_dir)
+
+        mg_dirs = sorted(wf_dir.glob("mg_*"))
+        if len(mg_dirs) < 2:
+            result.status = "error"
+            result.reason = f"Expected {wf.num_work_units} merge groups, got {len(mg_dirs)}"
+            return result
+
+        logger.info("Planned %d merge groups for adaptive workflow", len(mg_dirs))
+
+        # Step 2: Generate replan.sub (universe=local)
+        wu1_dir = mg_dirs[1]
+        venv_python = str(Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python")
+        replan_args = (
+            f"-m tests.matrix.adaptive replan"
+            f" --wu0-dir {mg_dirs[0]}"
+            f" --wu1-dir {wu1_dir}"
+            f" --request-cpus {wf.multicore}"
+            f" --request-memory {wf.memory_mb}"
+        )
+        replan_sub_path = wf_dir / "replan.sub"
+        replan_sub_path.write_text("\n".join([
+            "# Adaptive replan job (runs between work units)",
+            "universe = local",
+            f"executable = {venv_python}",
+            f"arguments = {replan_args}",
+            f"output = {wf_dir}/replan.out",
+            f"error = {wf_dir}/replan.err",
+            f"log = {wf_dir}/replan.log",
+            "queue 1",
+        ]) + "\n")
+
+        # Step 3: Modify workflow.dag — add replan node between WU0 and WU1
+        dag_path = wf_dir / "workflow.dag"
+        dag_content = dag_path.read_text()
+        wu0_name = mg_dirs[0].name
+        wu1_name = mg_dirs[1].name
+        dag_content += "\n".join([
+            "",
+            "# Adaptive replan between work units",
+            f"JOB replan {replan_sub_path}",
+            f"PARENT {wu0_name} CHILD replan",
+            f"PARENT replan CHILD {wu1_name}",
+        ]) + "\n"
+        dag_path.write_text(dag_content)
+        logger.info("Modified workflow.dag with replan node")
+
+        # Step 4: Submit with REAL condor adapter
+        cluster_id, schedd_name = await self._condor.submit_dag(str(dag_path))
+        if not cluster_id:
+            result.status = "error"
+            result.reason = "no cluster_id after submit_dag"
+            return result
+
+        result.cluster_id = cluster_id
+        logger.info("Submitted adaptive DAG, cluster_id=%s", cluster_id)
+
+        # Step 5: Poll until completion
+        result.dag_status, cpu_samples = await self._poll_dag(
+            schedd_name, cluster_id, wf.timeout_sec
+        )
+
+        # Step 6: Collect per-round performance
+        result.perf = _collect_adaptive_perf(wf, wf_dir, cpu_samples)
+
+        # Step 7: Verify
+        _verify(wf, result, wf_dir)
+
+        # Step 8: Sweep
         sweep_post(wf.wf_id, keep_artifacts=(result.status != "passed"))
 
         return result

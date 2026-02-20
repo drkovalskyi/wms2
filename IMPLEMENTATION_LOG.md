@@ -1827,3 +1827,61 @@ Partial production steps are natural re-optimization points: after the first 10%
 - All `PILOT_RUNNING` enum values removed from both `RequestStatus` and `WorkflowStatus`
 - All pilot tracking fields removed from Workflow model and database schema
 - `step_metrics` field consistently referenced across model, schema, lifecycle manager, DAG planner, API, and Section 5
+
+---
+
+## Phase 16 — Parallel Step 0 Execution (Adaptive) (2026-02-20)
+
+### What Was Built
+
+Implemented parallel cmsRun execution for step 0 (GEN steps) in the adaptive execution model. When replan analysis shows step 0 has low CPU efficiency (e.g., single-threaded LHE generators using 2 of 8 cores), the system now forks multiple parallel cmsRun instances to fill all allocated cores. Each instance processes a subset of events via firstEvent partitioning.
+
+**Key constraint**: Only step 0 is eligible for splitting. Steps 1+ run sequentially with the full original nThreads — reducing their threads would just leave cores idle with nothing to fill them.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `tests/matrix/adaptive.py` | New file: adaptive replan logic — `analyze_wu_metrics()`, `compute_per_step_nthreads()` (with `request_cpus` and `request_memory_mb` for memory-capped n_parallel), `patch_wu_manifests()`, CLI entry point |
+| `src/wms2/core/dag_planner.py` | Added `parse_fjr_output()`, `inject_pset_parallel()`, `run_step0_parallel()` bash functions; step loop branch for parallel step 0; comma-separated PREV_OUTPUT handling for multi-file input to step 1; metrics glob updated for instance FJRs |
+| `tests/matrix/runner.py` | Added adaptive execution mode (`_execute_adaptive()`): two-round DAG with replan node between work units; passes `--request-cpus` and `--request-memory` to replan |
+| `tests/matrix/reporter.py` | Added adaptive comparison report (`_print_adaptive_comparison()`): per-step tuning table with n_par column, round-over-round performance comparison |
+| `tests/matrix/catalog.py` | Added adaptive workflow definitions (350.x series) and `WorkflowDef.memory_mb` field |
+| `tests/matrix/definitions.py` | Added `memory_mb` field to `WorkflowDef` dataclass |
+| `tests/matrix/sets.py` | Added `adaptive` test set |
+
+### Architecture
+
+#### Execution Flow (Round 2, after replan)
+```
+Step 0: fork N instances (firstEvent partitioning) → N output ROOT files
+Step 1: sequential cmsRun, reads all N files as input, original nThreads
+Step 2+: sequential, reads previous step output, original nThreads
+Final: rename, metrics extraction, stage out
+```
+
+#### Instance Subdirectories
+Each parallel instance runs in its own subdir. CMSSW project and sandbox content are symlinked; only the PSet is copied (needs per-instance modification for firstEvent/maxEvents/nThreads):
+```
+WORK_DIR/step1_inst0/  step1_inst1/  step1_inst2/  step1_inst3/
+```
+
+#### Memory-Capped n_parallel
+```
+n_parallel = min(request_cpus // tuned_nthreads,
+                 request_memory_mb // (step0_avg_rss + 512 MB headroom))
+```
+
+### Design Decisions
+
+- **Only step 0 eligible for splitting**: GEN steps are the primary use case (single-threaded LHE generators). Splitting subsequent steps would require cross-step output chaining between variable-parallel instances — dramatically more complex for marginal benefit.
+- **nThreads unchanged for steps 1+**: Reducing threads for sequential steps just leaves cores idle. The freed cores have nothing to fill them since only one cmsRun runs at a time for steps 1+.
+- **n_parallel=1 fallback**: If memory cap or CPU computation yields n_parallel=1, step 0 keeps original nThreads and runs the existing sequential code path. No behavioral change for non-adaptive workflows.
+- **Power-of-2 thread counts**: tuned nThreads uses nearest power of 2 (geometric midpoint rounding) to match CMSSW's preferred thread counts.
+
+### Verification
+
+- Test 350.1 (10 ev/job, 8 cores): replan correctly computes n_parallel=4, step 0 tuned to 2 threads, steps 2-5 keep 8 threads. All rounds pass.
+- Test 350.0 (50 ev/job, 8 cores): replan computes n_parallel=2 (higher CPU eff = 65.6% → 4 effective cores → 4 tuned threads). All rounds pass.
+- Test 300.0 (non-adaptive): unaffected, existing code path unchanged.
+- Performance note: test workflows show limited speedup because CMSSW setup overhead (~120s for gridpack extraction) dominates event processing time. Real production workflows with longer GEN steps will benefit more.

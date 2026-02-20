@@ -239,7 +239,112 @@ def _print_perf_detail(
             out.write("  (unmerged cleaned)")
         out.write("\n")
 
+    # Adaptive comparison (if _adaptive key present)
+    adaptive = perf.raw_job_step_data.get("_adaptive")
+    if adaptive:
+        _print_adaptive_comparison(perf, adaptive, out, use_color)
+
     out.write("\n")
+
+
+def _print_adaptive_comparison(
+    perf: PerfData,
+    adaptive: dict,
+    out: TextIO,
+    use_color: bool,
+) -> None:
+    """Print per-step nThreads tuning and per-round comparison for adaptive workflows."""
+    import re
+
+    out.write(f"\n  {'─' * 70}\n")
+    if use_color:
+        out.write(f"  {_BOLD}Adaptive Tuning (per-step nThreads){_RESET}\n")
+    else:
+        out.write(f"  Adaptive Tuning (per-step nThreads)\n")
+
+    orig_nt = adaptive.get("original_nthreads", "?")
+    per_step = adaptive.get("per_step", {})
+
+    # Per-step tuning table
+    if per_step:
+        out.write(f"\n  {'Step':>6s}  {'CPU Eff':>8s}  {'Eff Cores':>10s}"
+                  f"  {'nThreads':>9s}  {'n_par':>5s}  {'Change':>8s}\n")
+        out.write(f"  {'─' * 6}  {'─' * 8}  {'─' * 10}"
+                  f"  {'─' * 9}  {'─' * 5}  {'─' * 8}\n")
+        for si in sorted(per_step, key=lambda x: int(x)):
+            t = per_step[si]
+            tuned = t.get("tuned_nthreads", orig_nt)
+            n_par = t.get("n_parallel", 1)
+            eff = t.get("cpu_eff", 0)
+            eff_cores = t.get("effective_cores", 0)
+            if isinstance(orig_nt, (int, float)) and orig_nt > 0:
+                pct = ((tuned - orig_nt) / orig_nt) * 100
+                change_str = f"{pct:+.0f}%"
+            else:
+                change_str = "-"
+            out.write(
+                f"  {int(si) + 1:>6d}"
+                f"  {eff * 100:>7.1f}%"
+                f"  {eff_cores:>10.1f}"
+                f"  {orig_nt:>4} -> {tuned:<3}"
+                f"  {n_par:>5d}"
+                f"  {change_str:>8s}\n"
+            )
+
+    # Per-round step comparison
+    round1_steps = {k: v for k, v in perf.raw_job_step_data.items()
+                    if isinstance(k, str) and k.startswith("Round 1:")}
+    round2_steps = {k: v for k, v in perf.raw_job_step_data.items()
+                    if isinstance(k, str) and k.startswith("Round 2:")}
+
+    if round1_steps and round2_steps:
+        out.write(f"\n  Per-round step comparison:\n")
+        out.write(f"  {'Step':<18s}"
+                  f"  {'R1 Wall(s)':>10s}"
+                  f"  {'R2 Wall(s)':>10s}"
+                  f"  {'R1 RSS(MB)':>10s}"
+                  f"  {'R2 RSS(MB)':>10s}"
+                  f"  {'R1 CpuEff':>9s}"
+                  f"  {'R2 CpuEff':>9s}\n")
+        out.write(f"  {'─' * 18}"
+                  f"  {'─' * 10}"
+                  f"  {'─' * 10}"
+                  f"  {'─' * 10}"
+                  f"  {'─' * 10}"
+                  f"  {'─' * 9}"
+                  f"  {'─' * 9}\n")
+
+        step_nums = sorted(set(
+            re.search(r"Step (\d+)", k).group(1)
+            for k in round1_steps if re.search(r"Step (\d+)", k)
+        ))
+
+        def _avg(samples, field):
+            vals = [s[field] for s in samples if s.get(field)]
+            return sum(vals) / len(vals) if vals else 0
+
+        for sn in step_nums:
+            r1_key = f"Round 1: Step {sn}"
+            r2_key = f"Round 2: Step {sn}"
+            r1_data = round1_steps.get(r1_key, [])
+            r2_data = round2_steps.get(r2_key, [])
+
+            r1_wall = _avg(r1_data, "wall")
+            r2_wall = _avg(r2_data, "wall")
+            r1_rss = _avg(r1_data, "rss")
+            r2_rss = _avg(r2_data, "rss")
+            r1_eff = _avg(r1_data, "cpu_eff")
+            r2_eff = _avg(r2_data, "cpu_eff")
+
+            out.write(
+                f"  Step {sn:<13s}"
+                f"  {r1_wall:>10.0f}"
+                f"  {r2_wall:>10.0f}"
+                f"  {r1_rss:>10.0f}"
+                f"  {r2_rss:>10.0f}"
+                f"  {r1_eff * 100:>8.1f}%"
+                f"  {r2_eff * 100:>8.1f}%\n"
+            )
 
 
 def print_catalog_list(

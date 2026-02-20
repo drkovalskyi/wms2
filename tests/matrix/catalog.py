@@ -139,6 +139,70 @@ _WF_300_0 = WorkflowDef(
     ),
 )
 
+# ── Adaptive execution ────────────────────────────────────────
+
+_WF_350_0 = WorkflowDef(
+    wf_id=350.0,
+    title="Adaptive nThreads tuning, 50 ev/job",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_NPS-Run3Summer22EEGS-00049__v1_T_260126_110934_54",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 1.0,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=50,
+    num_jobs=8,
+    num_work_units=2,
+    adaptive=True,
+    output_datasets=_NPS_OUTPUT_DATASETS,
+    memory_mb=16000,
+    multicore=8,
+    size="large",
+    timeout_sec=7200,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_350_1 = WorkflowDef(
+    wf_id=350.1,
+    title="Adaptive nThreads tuning, 10 ev/job",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_NPS-Run3Summer22EEGS-00049__v1_T_260126_110934_54",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 1.0,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=8,
+    num_work_units=2,
+    adaptive=True,
+    output_datasets=_NPS_OUTPUT_DATASETS,
+    memory_mb=16000,
+    multicore=8,
+    size="large",
+    timeout_sec=3600,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 # ── Fault injection ───────────────────────────────────────────
 
 _WF_500_0 = WorkflowDef(
@@ -254,6 +318,8 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_100_0,
         _WF_100_1,
         _WF_300_0,
+        _WF_350_0,
+        _WF_350_1,
         _WF_500_0,
         _WF_501_0,
         _WF_510_0,

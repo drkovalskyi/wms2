@@ -895,6 +895,12 @@ elif [[ -n "$SANDBOX" && ! -f "$SANDBOX" ]]; then
     echo "WARNING: Sandbox not found: $SANDBOX — running without sandbox"
 fi
 
+# Adaptive tuning: apply per-step nThreads from replan
+if [[ -f manifest_tuned.json ]]; then
+    echo "Applying adaptive manifest (per-step nThreads tuning)"
+    cp manifest_tuned.json manifest.json
+fi
+
 # ── Read manifest ─────────────────────────────────────────────
 MODE="synthetic"
 if [[ -f manifest.json ]]; then
@@ -1108,6 +1114,177 @@ if os.path.isfile(manifest_file):
 "
 }
 
+# ── Parse FJR output file path ────────────────────────────────
+parse_fjr_output() {
+    local fjr_path="$1"
+    python3 -c "
+import xml.etree.ElementTree as ET
+try:
+    tree = ET.parse('$fjr_path')
+    candidates = []
+    for f in tree.findall('.//File'):
+        pfn = f.findtext('PFN', '')
+        if pfn.startswith('file:'): pfn = pfn[5:]
+        if not pfn: continue
+        label = f.findtext('ModuleLabel', '')
+        candidates.append((pfn, label))
+    for pfn, label in candidates:
+        if 'LHE' not in label.upper():
+            print(pfn); break
+    else:
+        if candidates: print(candidates[0][0])
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+# ── PSet injection for parallel step 0 instances ──────────────
+inject_pset_parallel() {
+    local pset="$1" first_event="$2" max_events="$3" nthreads="$4"
+    python3 -c "
+pset_path = '$pset'
+lines = ['', '# --- WMS2 parallel instance PSet injection ---']
+lines.append('import FWCore.ParameterSet.Config as cms')
+lines.append('process.maxEvents.input = cms.untracked.int32($max_events)')
+lines.append('process.source.firstEvent = cms.untracked.uint32($first_event)')
+lines.append('if hasattr(process, \"externalLHEProducer\"):')
+lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32($max_events)')
+if $nthreads > 1:
+    lines.append('if not hasattr(process, \"options\"):')
+    lines.append('    process.options = cms.untracked.PSet()')
+    lines.append('process.options.numberOfThreads = cms.untracked.uint32($nthreads)')
+    lines.append('process.options.numberOfStreams = cms.untracked.uint32(0)')
+with open(pset_path, 'a') as f:
+    f.write(chr(10).join(lines) + chr(10))
+"
+}
+
+# ── Parallel step 0 execution ─────────────────────────────────
+run_step0_parallel() {
+    local n_par="$1" nthreads="$2" cmssw="$3" arch="$4" pset="$5" step_name="$6"
+    local events_per_inst=$((EVENTS_PER_JOB / n_par))
+    local remainder=$((EVENTS_PER_JOB % n_par))
+
+    echo "  Parallel execution: $n_par instances, $events_per_inst events each"
+
+    # Resolve container once
+    local CONTAINER
+    CONTAINER=$(resolve_container "$arch")
+
+    # Setup CMSSW project once (before forking instances)
+    if [[ -z "$CONTAINER" ]]; then
+        # Native: setup env in current shell
+        export SCRAM_ARCH="$arch"
+        source /cvmfs/cms.cern.ch/cmsset_default.sh
+        if [[ ! -d "$WORK_DIR/$cmssw/src" ]]; then
+            cd "$WORK_DIR" && scramv1 project CMSSW "$cmssw"
+        fi
+        cd "$WORK_DIR/$cmssw/src" && eval $(scramv1 runtime -sh) && cd "$WORK_DIR"
+        export SITECONFIG_PATH="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+        export CMS_PATH="$SITECONFIG_PATH"
+    else
+        # Apptainer: prepare siteconf and create CMSSW project via container
+        local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+        mkdir -p "$WORK_DIR/_siteconf/JobConfig"
+        cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
+        [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
+        [[ -f "$SITE_CFG/storage.json" ]] && cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+        mkdir -p "$WORK_DIR/_siteconf/SITECONF/local/JobConfig"
+        cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/SITECONF/local/JobConfig/" 2>/dev/null || true
+        [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+
+        cat > "$WORK_DIR/_setup_cmssw.sh" <<SETUPEOF
+#!/bin/bash
+set -e
+export SITECONFIG_PATH=$WORK_DIR/_siteconf
+export CMS_PATH=$WORK_DIR/_siteconf
+export SCRAM_ARCH=$arch
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+cd $WORK_DIR
+if [[ ! -d $cmssw/src ]]; then
+    scramv1 project CMSSW $cmssw
+fi
+SETUPEOF
+        chmod +x "$WORK_DIR/_setup_cmssw.sh"
+        local BIND="/cvmfs,/tmp,$WORK_DIR"
+        [[ -d /mnt/creds ]] && BIND="$BIND,/mnt/creds"
+        [[ -d /mnt/shared ]] && BIND="$BIND,/mnt/shared"
+        [[ -d "$SITE_CFG" ]] && BIND="$BIND,$SITE_CFG"
+        export APPTAINER_BINDPATH="$BIND"
+        echo "  Setting up CMSSW project via apptainer..."
+        apptainer exec --no-home "$CONTAINER" bash "$WORK_DIR/_setup_cmssw.sh"
+    fi
+
+    # Create instance directories and fork
+    local pids=()
+    local pset_base
+    pset_base=$(basename "$pset")
+    for inst in $(seq 0 $((n_par - 1))); do
+        local idir="$WORK_DIR/step1_inst${inst}"
+        mkdir -p "$idir"
+        # Symlink CMSSW project and archive files (gridpacks)
+        ln -sf "$WORK_DIR/$cmssw" "$idir/$cmssw"
+        ln -sf "$WORK_DIR"/*.xz "$WORK_DIR"/*.gz "$idir/" 2>/dev/null || true
+        # Copy PSet (needs per-instance modification)
+        cp "$WORK_DIR/$pset" "$idir/$pset_base"
+
+        # Compute per-instance event range
+        local inst_first=$((FIRST_EVENT + inst * events_per_inst))
+        local inst_events=$events_per_inst
+        [[ $inst -eq $((n_par - 1)) ]] && inst_events=$((events_per_inst + remainder))
+
+        # Inject per-instance params into copied PSet
+        inject_pset_parallel "$idir/$pset_base" "$inst_first" "$inst_events" "$nthreads"
+
+        # Launch instance
+        if [[ -z "$CONTAINER" ]]; then
+            ( cd "$idir" && cmsRun -j report_step1.xml "$pset_base" ) &
+        else
+            cat > "$idir/_step_runner.sh" <<INSTEOF
+#!/bin/bash
+set -e
+export SITECONFIG_PATH=$WORK_DIR/_siteconf
+export CMS_PATH=$WORK_DIR/_siteconf
+export SCRAM_ARCH=$arch
+export X509_USER_PROXY="${X509_USER_PROXY:-}"
+export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+cd $idir/$cmssw/src && eval \$(scramv1 runtime -sh) && cd $idir
+cmsRun -j report_step1.xml $pset_base
+INSTEOF
+            chmod +x "$idir/_step_runner.sh"
+            ( apptainer exec --no-home "$CONTAINER" bash "$idir/_step_runner.sh" ) &
+        fi
+        pids+=($!)
+        echo "  Instance $inst: pid=${pids[-1]} firstEvent=$inst_first maxEvents=$inst_events"
+    done
+
+    # Wait for all instances
+    local failed=0
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=$((failed + 1))
+    done
+    if [[ $failed -gt 0 ]]; then
+        echo "ERROR: $failed/$n_par parallel instances failed" >&2
+        exit 1
+    fi
+    echo "  All $n_par instances completed successfully"
+
+    # Collect outputs and copy FJR files to WORK_DIR
+    PREV_OUTPUT=""
+    for inst in $(seq 0 $((n_par - 1))); do
+        local idir="$WORK_DIR/step1_inst${inst}"
+        local out
+        out=$(parse_fjr_output "$idir/report_step1.xml")
+        if [[ -n "$out" ]]; then
+            [[ -n "$PREV_OUTPUT" ]] && PREV_OUTPUT="${PREV_OUTPUT},"
+            PREV_OUTPUT="${PREV_OUTPUT}${idir}/${out}"
+        fi
+        cp "$idir/report_step1.xml" "$WORK_DIR/report_step1_inst${inst}.xml"
+    done
+    echo "  Collected outputs: $PREV_OUTPUT"
+}
+
 # ── CMSSW mode (per-step CMSSW/ScramArch with apptainer) ─────
 run_cmssw_mode() {
     echo "--- CMSSW mode ---"
@@ -1148,12 +1325,24 @@ run_cmssw_mode() {
         PSET_PATH=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['pset'])")
         INPUT_STEP=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('input_step',''))")
         NTHREADS=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('multicore',1))")
+        N_PARALLEL=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('n_parallel',1))")
 
         echo ""
         echo "--- Step $step_num: $STEP_NAME ---"
         echo "  CMSSW:  $CMSSW_VER"
         echo "  Arch:   $STEP_ARCH"
         echo "  PSet:   $PSET_PATH"
+
+        # Parallel step 0: fork N_PARALLEL cmsRun instances with firstEvent partitioning
+        if [[ $step_idx -eq 0 && "$N_PARALLEL" -gt 1 ]]; then
+            echo "  n_parallel: $N_PARALLEL"
+            STEP_START=$(date +%s)
+            run_step0_parallel "$N_PARALLEL" "$NTHREADS" "$CMSSW_VER" "$STEP_ARCH" "$PSET_PATH" "$STEP_NAME"
+            STEP_END=$(date +%s)
+            STEP_WALL=$((STEP_END - STEP_START))
+            echo "  Step $STEP_NAME completed in ${STEP_WALL}s (parallel, $N_PARALLEL instances)"
+            continue
+        fi
 
         # Build cmsRun command (no command-line overrides — ConfigCache PSets
         # ignore them; inject everything into PSet via python append).
@@ -1162,7 +1351,13 @@ run_cmssw_mode() {
         # Determine input files for PSet injection
         INJECT_INPUT=""
         if [[ -n "$INPUT_STEP" && -n "$PREV_OUTPUT" ]]; then
-            INJECT_INPUT="file:$PREV_OUTPUT"
+            # PREV_OUTPUT may be comma-separated (from parallel step 0)
+            INJECT_INPUT=""
+            IFS=',' read -ra _PO_ARRAY <<< "$PREV_OUTPUT"
+            for _po in "${_PO_ARRAY[@]}"; do
+                [[ -n "$INJECT_INPUT" ]] && INJECT_INPUT="${INJECT_INPUT},"
+                INJECT_INPUT="${INJECT_INPUT}file:${_po}"
+            done
         elif [[ $step_idx -eq 0 && -n "$XROOTD_INPUTS" ]]; then
             INJECT_INPUT="$XROOTD_INPUTS"
         fi
@@ -1419,19 +1614,32 @@ def parse_fjr_metrics(fjr_path, step_index):
 
     return metrics
 
+import glob as _gl
+
 all_metrics = []
 step_idx = 0
 while True:
     fjr = f'report_step{step_idx + 1}.xml'
-    if not os.path.isfile(fjr):
+    inst_fjrs = sorted(_gl.glob(f'report_step{step_idx + 1}_inst*.xml'))
+    if os.path.isfile(fjr):
+        try:
+            m = parse_fjr_metrics(fjr, step_idx)
+            if m:
+                all_metrics.append(m)
+                print(f'  Step {step_idx + 1}: wall={m[\"wall_time_sec\"]}s cpu_eff={m[\"cpu_efficiency\"]} rss={m[\"peak_rss_mb\"]}MB events={m[\"events_processed\"]}')
+        except Exception as e:
+            print(f'  Step {step_idx + 1}: parse error: {e}')
+    elif inst_fjrs:
+        for ifjr in inst_fjrs:
+            try:
+                m = parse_fjr_metrics(ifjr, step_idx)
+                if m:
+                    all_metrics.append(m)
+                    print(f'  Step {step_idx + 1} ({os.path.basename(ifjr)}): wall={m[\"wall_time_sec\"]}s cpu_eff={m[\"cpu_efficiency\"]} rss={m[\"peak_rss_mb\"]}MB events={m[\"events_processed\"]}')
+            except Exception as e:
+                print(f'  Step {step_idx + 1} ({os.path.basename(ifjr)}): parse error: {e}')
+    else:
         break
-    try:
-        m = parse_fjr_metrics(fjr, step_idx)
-        if m:
-            all_metrics.append(m)
-            print(f'  Step {step_idx + 1}: wall={m[\"wall_time_sec\"]}s cpu_eff={m[\"cpu_efficiency\"]} rss={m[\"peak_rss_mb\"]}MB events={m[\"events_processed\"]}')
-    except Exception as e:
-        print(f'  Step {step_idx + 1}: parse error: {e}')
     step_idx += 1
 
 if all_metrics:
