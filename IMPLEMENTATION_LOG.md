@@ -1589,9 +1589,74 @@ The script creates an `agent` user that owns the repo, submits to HTCondor, and 
 
 Usage: `sudo bash scripts/setup-dev-vm.sh`, then `su - agent` for all work.
 
+---
+
+## Phase 14 — Per-Step Resource Utilization Metrics
+
+**Date**: 2026-02-20
+
+### What Was Built
+
+Per-step resource metrics collection pipeline: proc jobs extract metrics from CMSSW FrameworkJobReport (FJR) XML files, stage them alongside outputs, and merge jobs aggregate them into per-work-unit summaries. This enables resource right-sizing (memory, CPU threads) and throughput calibration for future DAG planning.
+
+### Changes
+
+#### 1. Proc wrapper — FJR metrics extraction (`dag_planner.py`)
+
+Added embedded Python in `_write_proc_script()` (after output manifest, before output size collection) that parses each `report_stepN.xml` and writes `proc_N_metrics.json`:
+
+**Metrics extracted per step (12 fields):**
+- `wall_time_sec` — `Timing/TotalJobTime`
+- `cpu_time_sec` — `Timing/TotalJobCPU`
+- `num_threads` — `Timing/NumberOfThreads`
+- `cpu_efficiency` — computed: `cpu_time / (wall_time × num_threads)`
+- `peak_rss_mb` — `ApplicationMemory/PeakValueRss`
+- `peak_vsize_mb` — `ApplicationMemory/PeakValueVsize`
+- `events_processed` — from `InputFile/EventsRead` (sum), GEN fallback via `ProcessingSummary/NumberEvents`
+- `throughput_ev_s` — `Timing/EventThroughput`
+- `avg_event_time_sec` — `Timing/AvgEventTime`
+- `time_per_event_sec` — computed: `wall_time / events`
+- `read_mb`, `write_mb` — `StorageStatistics/Timing-file-{read,write}-totalMegabytes`
+
+Guarded with `2>/dev/null || true` — metrics extraction failure does not affect job success.
+
+#### 2. Proc wrapper — metrics staging (`dag_planner.py`)
+
+In `stage_out_to_unmerged()`, added block that copies `proc_N_metrics.json` to the unmerged directory alongside the output manifest. Only stages if the file exists (no-op for synthetic mode or FJR parse failures).
+
+#### 3. Merge script — metrics aggregation (`dag_planner.py`)
+
+In `_write_merge_script()`:
+- **Collection**: Added `unmerged_metrics` list, collected from unmerged dirs (and group dir fallback) using `proc_*_metrics.json` glob pattern
+- **Aggregation**: After cleanup manifest, reads all per-proc metrics, groups by step number, computes per-step min/max/mean (or min/max/total for event counts), writes `work_unit_metrics.json` to the group directory
+
+#### 4. E2E test — structured metrics display (`e2e_real_condor.py`)
+
+Replaced `[6/7] Per-step timing` with `[6/7] Per-step resource utilization` that reads `work_unit_metrics.json` and displays a formatted table with Wall(s), CPU Eff, RSS(MB), Events, Tput(ev/s) including min-max ranges. Falls back to old text-parsing approach when no structured metrics file exists.
+
+#### 5. Unit tests (`test_dag_generator.py`)
+
+Added `TestMetrics` class with 4 tests:
+- `test_proc_script_has_metrics_extraction` — FJR parsing present with all key metric names
+- `test_proc_script_stages_metrics_file` — metrics staging in stage-out function
+- `test_merge_script_aggregates_metrics` — collection and aggregation references
+- `test_merge_script_metrics_has_aggregates` — min/max/mean structure in aggregation output
+
+### Verification
+
+- `pytest tests/unit/test_dag_generator.py -v` — 44/44 pass (40 existing + 4 new)
+- `pytest tests/unit/ -v` — 233/233 pass
+
+### Design Decisions
+
+- **Metrics are best-effort**: Extraction uses `2>/dev/null || true`, staging is conditional on file existence, aggregation skips unreadable files. A metrics failure never blocks job completion.
+- **Aggregation in merge script, not WMS2 core**: Keeps WMS2's "no per-job tracking" invariant — the merge job (which already reads per-proc manifests) does the aggregation as a side effect. WMS2 can later read `work_unit_metrics.json` for resource calibration without needing per-job data.
+- **Events use total, not mean**: `events_processed` aggregation reports min/max/total (not mean) since total events per step across all proc jobs is more useful for throughput analysis.
+
 ## What's Next
 
 - Multi-merge-group DAG — Submit workflow with multiple work units
 - Output registration — Wire merge outputs to Output Manager (DBS/Rucio)
 - Site Manager — CRIC sync for site status and capacity
 - AODSIM tier handling — proc stages AODSIM to unmerged but no dataset config for it; decide whether to merge or discard
+- Resource calibration — Use `work_unit_metrics.json` to feed back into DAG planning (memory/CPU right-sizing)

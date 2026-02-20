@@ -851,6 +851,7 @@ def _write_proc_script(path: str) -> None:
 # Supports CMSSW mode (per-step cmsRun with apptainer), synthetic mode
 # (sized output), and pilot mode (iterative measurement).
 set -euo pipefail
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # ── Argument parsing ──────────────────────────────────────────
 SANDBOX=""
@@ -1088,7 +1089,7 @@ for filename, finfo in file_map.items():
     shutil.copy2(filename, dest)
     print(f'Staged: {filename} -> {dest}')
 
-# Also stage the output manifest
+# Also stage the output manifest and metrics file
 if os.path.isfile(manifest_file):
     for ds in datasets:
         unmerged_base = ds.get('unmerged_lfn_base', '')
@@ -1097,6 +1098,12 @@ if os.path.isfile(manifest_file):
             os.makedirs(pfn_dir, exist_ok=True)
             dest = os.path.join(pfn_dir, 'proc_${NODE_INDEX}_outputs.json')
             shutil.copy2(manifest_file, dest)
+            # Stage metrics file alongside manifest
+            metrics_file = 'proc_${NODE_INDEX}_metrics.json'
+            if os.path.isfile(metrics_file):
+                mdest = os.path.join(pfn_dir, metrics_file)
+                shutil.copy2(metrics_file, mdest)
+                print(f'Staged metrics: {metrics_file} -> {mdest}')
             break
 "
 }
@@ -1326,6 +1333,114 @@ with open('proc_${NODE_INDEX}_outputs.json', 'w') as fh:
 print('Wrote proc_${NODE_INDEX}_outputs.json:', len(files), 'files')
 for fn, info in files.items():
     print(f'  {fn} -> tier={info[\"tier\"]} step_index={info[\"step_index\"]}')
+" 2>/dev/null || true
+
+    # Extract per-step resource metrics from FJR XML files
+    echo ""
+    echo "--- Extracting per-step metrics from FJR ---"
+    python3 -c "
+import json, os, re
+try:
+    import xml.etree.ElementTree as ET
+except ImportError:
+    print('WARNING: xml.etree not available, skipping metrics')
+    exit(0)
+
+def parse_fjr_metrics(fjr_path, step_index):
+    \"\"\"Extract resource metrics from a single FJR XML file.\"\"\"
+    tree = ET.parse(fjr_path)
+    root = tree.getroot()
+    perf = root.find('.//PerformanceReport/PerformanceSummary')
+    if perf is None:
+        return None
+
+    metrics = {'step': step_index + 1}
+
+    # Helper to extract a metric value
+    def get_metric(parent_name, metric_name, cast=float):
+        for ps in root.findall('.//PerformanceReport/PerformanceSummary'):
+            if ps.get('Metric') == parent_name:
+                for m in ps.findall('Metric'):
+                    if m.get('Name') == metric_name:
+                        try:
+                            return cast(m.get('Value', 0))
+                        except (ValueError, TypeError):
+                            return None
+        return None
+
+    # Timing
+    wall = get_metric('Timing', 'TotalJobTime')
+    cpu = get_metric('Timing', 'TotalJobCPU')
+    nthreads = get_metric('Timing', 'NumberOfThreads', int)
+    throughput = get_metric('Timing', 'EventThroughput')
+    avg_ev_time = get_metric('Timing', 'AvgEventTime')
+
+    metrics['wall_time_sec'] = round(wall, 2) if wall is not None else None
+    metrics['cpu_time_sec'] = round(cpu, 2) if cpu is not None else None
+    metrics['num_threads'] = nthreads
+    metrics['throughput_ev_s'] = round(throughput, 4) if throughput is not None else None
+    metrics['avg_event_time_sec'] = round(avg_ev_time, 4) if avg_ev_time is not None else None
+
+    # CPU efficiency
+    if wall and cpu and nthreads and wall > 0 and nthreads > 0:
+        metrics['cpu_efficiency'] = round(cpu / (wall * nthreads), 4)
+    else:
+        metrics['cpu_efficiency'] = None
+
+    # Memory
+    metrics['peak_rss_mb'] = get_metric('ApplicationMemory', 'PeakValueRss')
+    metrics['peak_vsize_mb'] = get_metric('ApplicationMemory', 'PeakValueVsize')
+
+    # Events
+    nevents = None
+    for inp in root.findall('.//InputFile'):
+        ev = inp.findtext('EventsRead')
+        if ev:
+            try:
+                nevents = (nevents or 0) + int(ev)
+            except ValueError:
+                pass
+    if nevents is None:
+        # GEN fallback: no InputFile
+        nevents = get_metric('ProcessingSummary', 'NumberEvents', int)
+    metrics['events_processed'] = nevents
+
+    # Time per event
+    if wall is not None and nevents and nevents > 0:
+        metrics['time_per_event_sec'] = round(wall / nevents, 4)
+    else:
+        metrics['time_per_event_sec'] = None
+
+    # Storage I/O
+    read_mb = get_metric('StorageStatistics', 'Timing-file-read-totalMegabytes')
+    write_mb = get_metric('StorageStatistics', 'Timing-file-write-totalMegabytes')
+    metrics['read_mb'] = round(read_mb, 2) if read_mb is not None else None
+    metrics['write_mb'] = round(write_mb, 2) if write_mb is not None else None
+
+    return metrics
+
+all_metrics = []
+step_idx = 0
+while True:
+    fjr = f'report_step{step_idx + 1}.xml'
+    if not os.path.isfile(fjr):
+        break
+    try:
+        m = parse_fjr_metrics(fjr, step_idx)
+        if m:
+            all_metrics.append(m)
+            print(f'  Step {step_idx + 1}: wall={m[\"wall_time_sec\"]}s cpu_eff={m[\"cpu_efficiency\"]} rss={m[\"peak_rss_mb\"]}MB events={m[\"events_processed\"]}')
+    except Exception as e:
+        print(f'  Step {step_idx + 1}: parse error: {e}')
+    step_idx += 1
+
+if all_metrics:
+    out = 'proc_\${NODE_INDEX}_metrics.json'
+    with open(out, 'w') as fh:
+        json.dump(all_metrics, fh, indent=2)
+    print(f'Wrote {out}: {len(all_metrics)} steps')
+else:
+    print('No FJR metrics extracted')
 " 2>/dev/null || true
 
     # Collect output sizes
@@ -1963,6 +2078,7 @@ def merge_text_files(datasets, text_files, pfn_prefix, group_index):
 # Each dataset has an unmerged_lfn_base; files are at PFN = pfn_prefix + unmerged_lfn/{group:06d}/
 unmerged_root_files = []  # (pfn_path, tier_info)
 unmerged_manifests = []
+unmerged_metrics = []
 has_unmerged = any(ds.get("unmerged_lfn_base") for ds in datasets)
 
 if has_unmerged:
@@ -1984,6 +2100,9 @@ if has_unmerged:
         # Collect output manifests
         for mf in sorted(glob.glob(os.path.join(unmerged_dir, "proc_*_outputs.json"))):
             unmerged_manifests.append(mf)
+        # Collect metrics files
+        for mf in sorted(glob.glob(os.path.join(unmerged_dir, "proc_*_metrics.json"))):
+            unmerged_metrics.append(mf)
 
 # Fallback: read from group dir (backward compat with old format)
 if not unmerged_root_files:
@@ -1991,6 +2110,7 @@ if not unmerged_root_files:
     if not unmerged_root_files:
         unmerged_root_files = sorted(glob.glob(os.path.join(group_dir, "*.root")))
     unmerged_manifests = sorted(glob.glob(os.path.join(group_dir, "proc_*_outputs.json")))
+    unmerged_metrics = sorted(glob.glob(os.path.join(group_dir, "proc_*_metrics.json")))
 
 # Also check group dir for text files (transferred by HTCondor)
 text_files = sorted(glob.glob(os.path.join(group_dir, "proc_*.out")))
@@ -2103,6 +2223,63 @@ if root_files:
         with open(cleanup_path, "w") as f:
             json.dump(cleanup_manifest, f, indent=2)
         print(f"Wrote cleanup manifest: {cleanup_path} ({len(cleanup_dirs)} dirs)")
+
+    # Aggregate per-step resource metrics from proc jobs
+    if unmerged_metrics:
+        print(f"\\nAggregating metrics from {len(unmerged_metrics)} proc job(s)...")
+        all_proc_metrics = []
+        for mf in unmerged_metrics:
+            try:
+                with open(mf) as f:
+                    all_proc_metrics.append(json.load(f))
+            except Exception as e:
+                print(f"  WARNING: Failed to read {mf}: {e}")
+
+        if all_proc_metrics:
+            # Group by step number
+            step_data = {}  # step_num -> {metric_name -> [values]}
+            for proc in all_proc_metrics:
+                for step_m in proc:
+                    step_num = step_m.get("step", 0)
+                    if step_num not in step_data:
+                        step_data[step_num] = {}
+                    for key, val in step_m.items():
+                        if key == "step":
+                            continue
+                        if val is not None:
+                            step_data[step_num].setdefault(key, []).append(val)
+
+            # Compute aggregates
+            per_step = {}
+            count_metrics = {"events_processed"}  # use total instead of mean
+            for step_num, metrics in sorted(step_data.items()):
+                agg = {"step": step_num, "num_jobs": len(all_proc_metrics)}
+                for key, values in metrics.items():
+                    if not values:
+                        continue
+                    if key in count_metrics:
+                        agg[key] = {
+                            "min": min(values),
+                            "max": max(values),
+                            "total": sum(values),
+                        }
+                    else:
+                        agg[key] = {
+                            "min": round(min(values), 4),
+                            "max": round(max(values), 4),
+                            "mean": round(sum(values) / len(values), 4),
+                        }
+                per_step[str(step_num)] = agg
+
+            work_unit = {
+                "group_index": group_index,
+                "num_proc_jobs": len(all_proc_metrics),
+                "per_step": per_step,
+            }
+            wu_path = os.path.join(group_dir, "work_unit_metrics.json")
+            with open(wu_path, "w") as f:
+                json.dump(work_unit, f, indent=2)
+            print(f"Wrote work_unit_metrics.json: {len(per_step)} step(s), {len(all_proc_metrics)} jobs")
 else:
     print(f"Detected {len(text_files)} text file(s) — using text merge mode")
     merge_text_files(datasets, text_files, local_pfn_prefix, group_index)

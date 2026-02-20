@@ -669,3 +669,65 @@ class TestEventRangeArgs:
         )
         content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
         assert "--node-index 0" in content
+
+
+class TestMetrics:
+    """Tests for per-step resource utilization metrics."""
+
+    def _get_proc_content(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        return (tmp_path / "wms2_proc.sh").read_text()
+
+    def _get_merge_content(self, tmp_path):
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        return (tmp_path / "wms2_merge.py").read_text()
+
+    def test_proc_script_has_metrics_extraction(self, tmp_path):
+        """Proc wrapper parses FJR XML and writes proc_N_metrics.json."""
+        content = self._get_proc_content(tmp_path)
+        assert "parse_fjr_metrics" in content
+        assert "report_step" in content
+        assert "proc_" in content and "_metrics.json" in content
+        assert "TotalJobTime" in content
+        assert "TotalJobCPU" in content
+        assert "PeakValueRss" in content
+        assert "cpu_efficiency" in content
+        assert "wall_time_sec" in content
+        assert "events_processed" in content
+
+    def test_proc_script_stages_metrics_file(self, tmp_path):
+        """Stage-out includes metrics JSON alongside output manifest."""
+        content = self._get_proc_content(tmp_path)
+        assert "_metrics.json" in content
+        assert "Staged metrics" in content
+
+    def test_merge_script_aggregates_metrics(self, tmp_path):
+        """Merge script reads proc_*_metrics.json and writes work_unit_metrics.json."""
+        content = self._get_merge_content(tmp_path)
+        assert "unmerged_metrics" in content
+        assert "proc_*_metrics.json" in content
+        assert "work_unit_metrics.json" in content
+        assert "all_proc_metrics" in content
+
+    def test_merge_script_metrics_has_aggregates(self, tmp_path):
+        """Metrics aggregation computes min/max/mean per step."""
+        content = self._get_merge_content(tmp_path)
+        assert '"min"' in content or "'min'" in content
+        assert '"max"' in content or "'max'" in content
+        assert '"mean"' in content or "'mean'" in content
+        assert "per_step" in content
+        assert "num_proc_jobs" in content

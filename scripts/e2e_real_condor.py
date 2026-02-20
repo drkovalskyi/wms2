@@ -427,36 +427,71 @@ async def run_test(request_name: str, events: int, num_jobs: int = 1):
             print(f"      Expected: {expected_cpu}% ({num_jobs}×{multicore} = {num_jobs*multicore} cores)")
             print(f"      Efficiency: {efficiency:.1f}%")
 
-    # 6. Per-step efficiency
-    print(f"\n[6/7] Per-step timing...")
-    step_times: dict[str, list[float]] = {}  # step_name -> [wall_sec, ...]
-    job_wall_times: list[float] = []
+    # 6. Per-step resource utilization
+    print(f"\n[6/7] Per-step resource utilization...")
 
+    # Try structured metrics first (work_unit_metrics.json from merge aggregation)
+    has_structured_metrics = False
     for gd in group_dirs:
-        for out_file in sorted(gd.glob("proc_*.out")):
-            content = out_file.read_text()
-            # Parse "  Step <name> completed in <N>s"
-            for m in re.finditer(r"Step (\S+) completed in (\d+)s", content):
-                name, secs = m.group(1), float(m.group(2))
-                step_times.setdefault(name, []).append(secs)
-            # Parse "wall_time_sec: <N>"
-            m = re.search(r"wall_time_sec:\s*(\d+)", content)
-            if m:
-                job_wall_times.append(float(m.group(1)))
+        wu_path = gd / "work_unit_metrics.json"
+        if wu_path.exists():
+            has_structured_metrics = True
+            try:
+                wu = json.loads(wu_path.read_text())
+                n_jobs = wu.get("num_proc_jobs", "?")
+                per_step = wu.get("per_step", {})
+                if per_step:
+                    print(f"\n    {gd.name}: {n_jobs} proc jobs, {len(per_step)} steps")
+                    print(f"    {'Step':<6s} {'Wall(s)':<17s} {'CPU Eff':>8s} "
+                          f"{'RSS(MB)':<17s} {'Events':>7s} {'Tput(ev/s)':>11s}")
+                    print(f"    {'-'*6} {'-'*17} {'-'*8} {'-'*17} {'-'*7} {'-'*11}")
+                    for step_num in sorted(per_step.keys(), key=int):
+                        s = per_step[step_num]
+                        wall = s.get("wall_time_sec", {})
+                        eff = s.get("cpu_efficiency", {})
+                        rss = s.get("peak_rss_mb", {})
+                        evts = s.get("events_processed", {})
+                        tput = s.get("throughput_ev_s", {})
 
-    if step_times:
-        print(f"\n    {'Step':<25s} {'Avg':>6s} {'Min':>6s} {'Max':>6s}  (seconds, across {num_jobs} jobs)")
-        print(f"    {'-'*25} {'-'*6} {'-'*6} {'-'*6}")
-        for step_name, times in step_times.items():
-            avg = sum(times) / len(times)
-            print(f"    {step_name:<25s} {avg:6.0f} {min(times):6.0f} {max(times):6.0f}")
-        if job_wall_times:
-            avg_wall = sum(job_wall_times) / len(job_wall_times)
-            step_total = sum(sum(t) / len(t) for t in step_times.values())
-            overhead = avg_wall - step_total
-            print(f"    {'--- Total cmsRun ---':<25s} {step_total:6.0f}")
-            print(f"    {'--- Job wall clock ---':<25s} {avg_wall:6.0f}")
-            print(f"    {'--- Overhead (setup) ---':<25s} {overhead:6.0f}")
+                        wall_str = f"{wall.get('mean', 0):.0f} [{wall.get('min', 0):.0f}-{wall.get('max', 0):.0f}]" if wall else "n/a"
+                        eff_str = f"{eff.get('mean', 0)*100:.1f}%" if eff else "n/a"
+                        rss_str = f"{rss.get('mean', 0):.0f} [{rss.get('min', 0):.0f}-{rss.get('max', 0):.0f}]" if rss else "n/a"
+                        evts_str = f"{evts.get('total', 0)}" if evts else "n/a"
+                        tput_str = f"{tput.get('mean', 0):.2f}" if tput else "n/a"
+
+                        print(f"    {step_num:<6s} {wall_str:<17s} {eff_str:>8s} "
+                              f"{rss_str:<17s} {evts_str:>7s} {tput_str:>11s}")
+            except Exception as e:
+                print(f"    WARNING: Failed to read {wu_path}: {e}")
+
+    # Fallback: parse step timing from proc stdout
+    if not has_structured_metrics:
+        step_times: dict[str, list[float]] = {}
+        job_wall_times: list[float] = []
+
+        for gd in group_dirs:
+            for out_file in sorted(gd.glob("proc_*.out")):
+                content = out_file.read_text()
+                for m in re.finditer(r"Step (\S+) completed in (\d+)s", content):
+                    name, secs = m.group(1), float(m.group(2))
+                    step_times.setdefault(name, []).append(secs)
+                m = re.search(r"wall_time_sec:\s*(\d+)", content)
+                if m:
+                    job_wall_times.append(float(m.group(1)))
+
+        if step_times:
+            print(f"\n    {'Step':<25s} {'Avg':>6s} {'Min':>6s} {'Max':>6s}  (seconds, across {num_jobs} jobs)")
+            print(f"    {'-'*25} {'-'*6} {'-'*6} {'-'*6}")
+            for step_name, times in step_times.items():
+                avg = sum(times) / len(times)
+                print(f"    {step_name:<25s} {avg:6.0f} {min(times):6.0f} {max(times):6.0f}")
+            if job_wall_times:
+                avg_wall = sum(job_wall_times) / len(job_wall_times)
+                step_total = sum(sum(t) / len(t) for t in step_times.values())
+                overhead = avg_wall - step_total
+                print(f"    {'--- Total cmsRun ---':<25s} {step_total:6.0f}")
+                print(f"    {'--- Job wall clock ---':<25s} {avg_wall:6.0f}")
+                print(f"    {'--- Overhead (setup) ---':<25s} {overhead:6.0f}")
 
     # 7. Check results
     print(f"\n[7/7] Checking results...")
