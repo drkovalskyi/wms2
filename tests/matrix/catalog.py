@@ -304,6 +304,35 @@ _WF_380_1 = WorkflowDef(
     ),
 )
 
+_WF_300_1 = WorkflowDef(
+    wf_id=300.1,
+    title="NPS 5-step StepChain, 16-core jobs (4 jobs x 1000 ev)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_NPS-Run3Summer22EEGS-00049__v1_T_260126_110934_54",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 16,
+        "Memory": 32000,
+        "TimePerEvent": 1.0,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=1000,
+    num_jobs=4,
+    output_datasets=_NPS_OUTPUT_DATASETS,
+    memory_mb=32000,
+    multicore=16,
+    size="large",
+    timeout_sec=36000,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 _WF_350_1 = WorkflowDef(
     wf_id=350.1,
     title="Adaptive nThreads tuning, 10 ev/job",
@@ -450,6 +479,7 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_100_0,
         _WF_100_1,
         _WF_300_0,
+        _WF_300_1,
         _WF_350_0,
         _WF_360_0,
         _WF_370_0,

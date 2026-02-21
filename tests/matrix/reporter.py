@@ -91,14 +91,14 @@ def print_summary(
 # ── Throughput computation ───────────────────────────────────
 
 
-def _compute_round_metrics(steps, request_cpus):
+def _compute_round_metrics(steps, total_cores):
     """Compute aggregate throughput metrics for a list of StepPerf objects.
 
     Args:
         steps: list of StepPerf objects for one round
-        request_cpus: allocated cores (for ev/core-hour computation)
+        total_cores: total allocated cores across all concurrent jobs
 
-    Returns dict with events, proc_wall, ev_s, ev_ch, total_cpu_sec.
+    Returns dict with events, proc_wall, ev_s, ev_ch.
     """
     if not steps:
         return {}
@@ -107,7 +107,7 @@ def _compute_round_metrics(steps, request_cpus):
     if proc_wall <= 0 or total_events <= 0:
         return {}
     ev_s = total_events / proc_wall
-    ev_ch = total_events / (request_cpus * proc_wall / 3600)
+    ev_ch = total_events / (total_cores * proc_wall / 3600)
     return {
         "events": total_events,
         "proc_wall": proc_wall,
@@ -121,7 +121,12 @@ def _compute_round_metrics(steps, request_cpus):
 
 def _print_step_table(steps, nthreads_map, out, show_nthreads=True,
                       n_concurrent=1, n_jobs=0, request_cpus=0):
-    """Print a per-step performance table.
+    """Print a per-step performance table with per-job metrics.
+
+    All metrics are per-job (one HTCondor slot):
+      - ev/s:    events_per_job / wall_seconds  (throughput per job)
+      - CPU:     effective_cores / request_cpus  (CPU efficiency per job)
+      - RSS(MB): peak_rss * n_concurrent         (total memory per job)
 
     Args:
         steps: list of StepPerf objects
@@ -129,8 +134,8 @@ def _print_step_table(steps, nthreads_map, out, show_nthreads=True,
         out: output stream
         show_nthreads: whether to include the nT column
         n_concurrent: concurrent cmsRun processes per job (1 or n_pipelines)
-        n_jobs: number of concurrent jobs (for machine total memory)
-        request_cpus: allocated cores per job (for eff cores per job)
+        n_jobs: number of concurrent HTCondor jobs
+        request_cpus: allocated cores per job
     """
     if isinstance(nthreads_map, int):
         nt_val = nthreads_map
@@ -144,8 +149,7 @@ def _print_step_table(steps, nthreads_map, out, show_nthreads=True,
     out.write(f"  {'Step':<8s}{nt_col}"
               f"  {'Wall(s)':>8s}"
               f"  {'ev/s':>7s}"
-              f"  {'CPU Eff':>8s}"
-              f"  {'Eff/Job':>8s}"
+              f"  {'CPU':>8s}"
               f"  {'RSS(MB)':>8s}"
               f"  {'n':>3s}\n")
     nt_sep = "  \u2500\u2500" if show_nthreads else ""
@@ -154,73 +158,71 @@ def _print_step_table(steps, nthreads_map, out, show_nthreads=True,
               f"  {'\u2500' * 7}"
               f"  {'\u2500' * 8}"
               f"  {'\u2500' * 8}"
-              f"  {'\u2500' * 8}"
               f"  {'\u2500' * 3}\n")
 
     total_wall = 0
     total_events = 0
     weighted_eff_num = 0.0
     weighted_eff_den = 0.0
-    peak_rss = 0.0
+    peak_job_rss = 0.0
 
     for i, s in enumerate(steps):
         nt = nthreads_map.get(i, 8)
-        # Aggregate throughput: all events / wall clock for this step
-        agg_ev_s = s.events_total / s.wall_sec_max if s.wall_sec_max > 0 else 0
-        # Effective cores per job: cpu_eff * nthreads * n_concurrent
-        eff_cores_per_job = s.cpu_eff_mean * nt * n_concurrent
+
+        # Per-job throughput: events_per_job / wall
+        events_per_job = s.events_total / n_jobs if n_jobs > 0 else s.events_total
+        job_ev_s = events_per_job / s.wall_sec_max if s.wall_sec_max > 0 else 0
+
+        # Per-job CPU efficiency: effective_cores / request_cpus
+        eff_cores = s.cpu_eff_mean * nt * n_concurrent
+        job_cpu_pct = eff_cores / request_cpus * 100 if request_cpus > 0 else 0
+
+        # Per-job RSS: peak across cmsRun instances * concurrent processes
+        job_rss = s.rss_mb_max * n_concurrent
 
         nt_str = f"  {nt:>2d}" if show_nthreads else ""
-        eff_str = f"{s.cpu_eff_mean * 100:.1f}%" if s.cpu_eff_mean > 0 else "-"
-        eff_job_str = f"{eff_cores_per_job:.1f}/{request_cpus}" if s.cpu_eff_mean > 0 else "-"
-        rss_str = f"{s.rss_mb_max:.0f}" if s.rss_mb_max > 0 else "-"
-        ev_s_str = f"{agg_ev_s:.2f}" if agg_ev_s > 0 else "-"
+        ev_s_str = f"{job_ev_s:.2f}" if job_ev_s > 0 else "-"
+        cpu_str = f"{job_cpu_pct:.0f}%" if job_cpu_pct > 0 else "-"
+        rss_str = f"{job_rss:.0f}" if job_rss > 0 else "-"
 
         step_label = s.step_name
-        # Strip "Round N: " prefix if present
         if ": " in step_label:
             step_label = step_label.split(": ", 1)[1]
 
         out.write(f"  {step_label:<8s}{nt_str}"
                   f"  {s.wall_sec_max:>8.0f}"
                   f"  {ev_s_str:>7s}"
-                  f"  {eff_str:>8s}"
-                  f"  {eff_job_str:>8s}"
+                  f"  {cpu_str:>8s}"
                   f"  {rss_str:>8s}"
                   f"  {s.n_jobs:>3d}\n")
 
         total_wall += s.wall_sec_max
         total_events = max(total_events, s.events_total)
-        peak_rss = max(peak_rss, s.rss_mb_max)
-        if s.cpu_eff_mean > 0 and s.wall_sec_max > 0:
-            weighted_eff_num += eff_cores_per_job * s.wall_sec_max
+        peak_job_rss = max(peak_job_rss, job_rss)
+        if job_cpu_pct > 0 and s.wall_sec_max > 0:
+            weighted_eff_num += job_cpu_pct * s.wall_sec_max
             weighted_eff_den += s.wall_sec_max
 
     # Total row
-    total_ev_s = total_events / total_wall if total_wall > 0 else 0
-    overall_eff = weighted_eff_num / weighted_eff_den if weighted_eff_den > 0 else 0
+    events_per_job = total_events / n_jobs if n_jobs > 0 else total_events
+    total_ev_s = events_per_job / total_wall if total_wall > 0 else 0
+    overall_cpu_pct = weighted_eff_num / weighted_eff_den if weighted_eff_den > 0 else 0
     nt_pad = "    " if show_nthreads else ""
     out.write(f"  {'\u2500' * 8}  {nt_pad}{'\u2500' * 8}  {'\u2500' * 7}"
-              f"  {'\u2500' * 8}  {'\u2500' * 8}  {'\u2500' * 8}\n")
-    eff_total_str = f"{overall_eff:.1f}/{request_cpus}" if overall_eff > 0 else ""
+              f"  {'\u2500' * 8}  {'\u2500' * 8}\n")
+    cpu_total_str = f"{overall_cpu_pct:.0f}%" if overall_cpu_pct > 0 else ""
     out.write(f"  {'Total':<8s}  {nt_pad}{total_wall:>8.0f}"
               f"  {total_ev_s:>7.2f}"
-              f"  {'':>8s}"
-              f"  {eff_total_str:>8s}"
-              f"  {peak_rss:>8.0f}\n")
+              f"  {cpu_total_str:>8s}"
+              f"  {peak_job_rss:>8.0f}\n")
 
-    # Memory summary: per-job and machine total
-    if peak_rss > 0:
-        job_peak = peak_rss * n_concurrent
-        out.write(f"\n  Memory: {peak_rss:.0f} MB/cmsRun peak")
-        if n_concurrent > 1:
-            out.write(f"  \u00d7 {n_concurrent} = {job_peak:.0f} MB/job")
-        if n_jobs > 0:
-            machine_gb = job_peak * n_jobs / 1024
-            out.write(f"  |  {machine_gb:.1f} GB machine total ({n_jobs} jobs)")
-        out.write("\n")
+    # Machine total memory
+    if peak_job_rss > 0 and n_jobs > 0:
+        machine_gb = peak_job_rss * n_jobs / 1024
+        out.write(f"\n  Memory: {peak_job_rss:.0f} MB/job peak  |  "
+                  f"{machine_gb:.1f} GB machine total ({n_jobs} jobs)\n")
 
-    return total_events, total_wall, overall_eff, peak_rss
+    return total_events, total_wall, overall_cpu_pct, peak_job_rss
 
 
 # ── Performance detail ───────────────────────────────────────
@@ -271,14 +273,15 @@ def _print_standard_report(
     nthreads = int(round(ncpus))
 
     # Throughput headline
-    m = _compute_round_metrics(perf.steps, nthreads)
+    n_jobs = perf.num_proc_jobs
+    total_cores = nthreads * n_jobs
+    m = _compute_round_metrics(perf.steps, total_cores)
     if m:
         out.write(f"\n  Throughput: {m['ev_s']:.2f} ev/s  |  "
                   f"{m['ev_ch']:.0f} ev/core-hour  |  "
                   f"{m['events']} events in {m['proc_wall']:.0f}s\n")
 
     # Per-step table
-    n_jobs = perf.num_proc_jobs
     if perf.steps:
         out.write("\n")
         _print_step_table(perf.steps, nthreads, out, n_concurrent=1,
@@ -304,9 +307,13 @@ def _print_adaptive_report(
     round1_steps = [s for s in perf.steps if s.step_name.startswith("Round 1:")]
     round2_steps = [s for s in perf.steps if s.step_name.startswith("Round 2:")]
 
-    # Compute per-round throughput (use request_cpus = orig_nt for both)
-    r1 = _compute_round_metrics(round1_steps, orig_nt)
-    r2 = _compute_round_metrics(round2_steps, orig_nt)
+    # Jobs per round (adaptive always has 2 work units)
+    jobs_per_round = perf.num_proc_jobs // 2 if perf.num_proc_jobs else 0
+    total_cores = orig_nt * jobs_per_round
+
+    # Compute per-round throughput using total allocated cores
+    r1 = _compute_round_metrics(round1_steps, total_cores)
+    r2 = _compute_round_metrics(round2_steps, total_cores)
 
     # Throughput comparison headline
     if r1 and r2:
@@ -341,19 +348,16 @@ def _print_adaptive_report(
         out.write(f", per-step: [{', '.join(str(v) for v in tuned_vals)}]")
     out.write("\n")
 
-    # Jobs per round (adaptive always has 2 work units)
-    jobs_per_round = perf.num_proc_jobs // 2 if perf.num_proc_jobs else 0
-
     # Round 1 table
-    r1_eff_cores = 0.0
+    r1_cpu_pct = 0.0
     if round1_steps:
         out.write(f"\n  Round 1 (baseline, {orig_nt}T):\n")
-        _, _, r1_eff_cores, _ = _print_step_table(
+        _, _, r1_cpu_pct, _ = _print_step_table(
             round1_steps, orig_nt, out, show_nthreads=False,
             n_concurrent=1, n_jobs=jobs_per_round, request_cpus=orig_nt)
 
     # Round 2 table
-    r2_eff_cores = 0.0
+    r2_cpu_pct = 0.0
     if round2_steps:
         # Build nthreads map for R2
         r2_nt_map = {}
@@ -374,19 +378,16 @@ def _print_adaptive_report(
             desc_parts.append("per-step tuned")
 
         out.write(f"\n  Round 2 ({', '.join(desc_parts)}):\n")
-        _, _, r2_eff_cores, _ = _print_step_table(
+        _, _, r2_cpu_pct, _ = _print_step_table(
             round2_steps, r2_nt_map, out, show_nthreads=True,
             n_concurrent=n_pipelines, n_jobs=jobs_per_round, request_cpus=orig_nt)
 
     # Overall CPU efficiency summary
-    if r1_eff_cores > 0:
-        r1_pct = r1_eff_cores / orig_nt * 100
-        out.write(f"\n  CPU efficiency per job: R1 {r1_pct:.0f}% ({r1_eff_cores:.1f}/{orig_nt} cores)")
-        if r2_eff_cores > 0:
-            r2_pct = r2_eff_cores / orig_nt * 100
-            delta = r2_pct - r1_pct
-            out.write(f"  R2 {r2_pct:.0f}% ({r2_eff_cores:.1f}/{orig_nt} cores)"
-                      f"  ({delta:+.0f}pp)")
+    if r1_cpu_pct > 0:
+        out.write(f"\n  CPU efficiency per job: R1 {r1_cpu_pct:.0f}%")
+        if r2_cpu_pct > 0:
+            delta = r2_cpu_pct - r1_cpu_pct
+            out.write(f"  R2 {r2_cpu_pct:.0f}%  ({delta:+.0f}pp)")
         out.write("\n")
 
     # Time breakdown

@@ -6,7 +6,7 @@ from tests.matrix.catalog import CATALOG
 
 # Explicitly listed sets
 _SMOKE_IDS = [100.0, 500.0, 501.0, 510.0]
-_INTEGRATION_IDS = [100.0, 100.1, 300.0, 350.0, 360.0, 370.0, 380.0, 380.1, 350.1, 500.0, 501.0, 510.0]
+_INTEGRATION_IDS = [100.0, 100.1, 300.0, 300.1, 350.0, 360.0, 370.0, 380.0, 380.1, 350.1, 500.0, 501.0, 510.0]
 
 
 def _synthetic_ids() -> list[float]:

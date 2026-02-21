@@ -553,6 +553,24 @@ def _generate_group_dag(
         except Exception:
             pass  # merge will fall back to copy mode without hadd
 
+        # Override per-step multicore in manifest if ncpus differs from sandbox default
+        manifest_path = group_dir / "manifest.json"
+        if ncpus and manifest_path.is_file():
+            try:
+                import json as _json
+                with open(manifest_path) as _f:
+                    _manifest = _json.load(_f)
+                changed = False
+                for step in _manifest.get("steps", []):
+                    if step.get("multicore", 0) != ncpus:
+                        step["multicore"] = ncpus
+                        changed = True
+                if changed:
+                    with open(manifest_path, "w") as _f:
+                        _json.dump(_manifest, _f, indent=2)
+            except Exception:
+                pass
+
     # Pass X509 proxy to jobs if available
     proc_env: dict[str, str] = {}
     x509_proxy = os.environ.get("X509_USER_PROXY", "")
@@ -625,6 +643,8 @@ def _generate_group_dag(
             proc_args += f" --last-event {node.last_event}"
         if node.events_per_job > 0:
             proc_args += f" --events-per-job {node.events_per_job}"
+        if ncpus > 0:
+            proc_args += f" --ncpus {ncpus}"
 
         _write_submit_file(
             str(group_dir / f"{node_name}.sub"),
@@ -862,6 +882,7 @@ EVENTS_PER_JOB=0
 NODE_INDEX=0
 PILOT_MODE=false
 OUTPUT_INFO=""
+OVERRIDE_NCPUS=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -873,6 +894,7 @@ while [[ $# -gt 0 ]]; do
         --node-index) NODE_INDEX="$2";     shift 2 ;;
         --output-info) OUTPUT_INFO="$2";   shift 2 ;;
         --pilot)      PILOT_MODE=true;     shift   ;;
+        --ncpus)      OVERRIDE_NCPUS="$2"; shift 2 ;;
         *)            echo "Unknown arg: $1" >&2; shift ;;
     esac
 done
@@ -899,6 +921,18 @@ fi
 if [[ -f manifest_tuned.json ]]; then
     echo "Applying adaptive manifest (per-step nThreads tuning)"
     cp manifest_tuned.json manifest.json
+fi
+
+# Override per-step multicore if --ncpus was passed
+if [[ "$OVERRIDE_NCPUS" -gt 0 && -f manifest.json ]]; then
+    echo "Overriding manifest multicore to $OVERRIDE_NCPUS"
+    python3 -c "
+import json
+m = json.load(open('manifest.json'))
+for s in m.get('steps', []):
+    s['multicore'] = $OVERRIDE_NCPUS
+json.dump(m, open('manifest.json', 'w'), indent=2)
+"
 fi
 
 # ── Read manifest ─────────────────────────────────────────────
