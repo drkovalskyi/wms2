@@ -283,10 +283,101 @@ def compute_per_step_nthreads(
     }
 
 
+# ── All-step pipeline split ──────────────────────────────────
+
+
+def compute_all_step_split(
+    metrics: dict,
+    original_nthreads: int,
+    request_cpus: int,
+    request_memory_mb: int,
+    uniform: bool = False,
+) -> dict:
+    """Derive N-pipeline split where each pipeline runs ALL steps with tuned nThreads.
+
+    Instead of splitting only step 0, this forks N complete StepChain pipelines
+    within one sandbox. Each processes events/N events through all steps with
+    per-step optimized nThreads.
+
+    Algorithm:
+    1. For each step: ideal_threads = nearest_power_of_2(eff_cores), capped to original
+    2. Iterate n_pipelines from highest feasible down to 1:
+       - threads_cap = request_cpus // n_pipelines
+       - Per-step: tuned = min(ideal_threads, threads_cap)
+       - Per-step: proj_rss = measured_rss - (original - tuned) * 250, floor 500 MB
+       - Memory check: n_pipelines * max(proj_rss) <= request_memory_mb
+       - Take first (highest) n_pipelines that fits
+    3. Return dict with n_pipelines and per-step tuning details.
+    """
+    PER_THREAD_OVERHEAD_MB = 250
+
+    # Step 1: compute ideal threads per step
+    step_ideals = {}
+    step_rss = {}
+    for si in sorted(metrics["steps"]):
+        step = metrics["steps"][si]
+        eff_vals = step["cpu_eff"]
+        rss_vals = step["peak_rss_mb"]
+        if eff_vals:
+            mean_eff = sum(eff_vals) / len(eff_vals)
+            eff_cores = mean_eff * original_nthreads
+        else:
+            mean_eff = 0.0
+            eff_cores = 0.0
+        avg_rss = sum(rss_vals) / len(rss_vals) if rss_vals else 0
+        ideal = _nearest_power_of_2(eff_cores) if eff_cores > 0 else original_nthreads
+        ideal = min(ideal, original_nthreads)
+        step_ideals[si] = {"ideal": ideal, "cpu_eff": mean_eff, "eff_cores": eff_cores}
+        step_rss[si] = avg_rss
+
+    # Step 2: iterate n_pipelines from highest feasible down
+    max_pipelines = request_cpus  # theoretical max (1 thread each)
+    best_n = 1
+    best_per_step = {}
+
+    for n_pipe in range(max_pipelines, 0, -1):
+        threads_cap = request_cpus // n_pipe
+        if threads_cap < 1:
+            continue
+
+        per_step = {}
+        max_proj_rss = 0
+        for si in sorted(step_ideals):
+            tuned = threads_cap if uniform else min(step_ideals[si]["ideal"], threads_cap)
+            tuned = max(tuned, 1)
+            # Project RSS: fewer threads => less memory
+            measured = step_rss[si]
+            thread_reduction = original_nthreads - tuned
+            proj_rss = measured - thread_reduction * PER_THREAD_OVERHEAD_MB
+            proj_rss = max(proj_rss, 500)  # floor at 500 MB
+            max_proj_rss = max(max_proj_rss, proj_rss)
+            per_step[si] = {
+                "tuned_nthreads": tuned,
+                "n_parallel": 1,  # parallelism is at pipeline level
+                "cpu_eff": step_ideals[si]["cpu_eff"],
+                "effective_cores": step_ideals[si]["eff_cores"],
+                "projected_rss_mb": proj_rss,
+                "overcommit_applied": False,
+            }
+
+        # Memory check: all pipelines run simultaneously
+        total_mem = n_pipe * max_proj_rss
+        if total_mem <= request_memory_mb:
+            best_n = n_pipe
+            best_per_step = per_step
+            break
+
+    return {
+        "original_nthreads": original_nthreads,
+        "n_pipelines": best_n,
+        "per_step": best_per_step,
+    }
+
+
 # ── Patch manifests ──────────────────────────────────────────
 
 
-def patch_wu_manifests(group_dir: Path, per_step: dict) -> int:
+def patch_wu_manifests(group_dir: Path, per_step: dict, n_pipelines: int = 1) -> int:
     """Create manifest_tuned.json with per-step nThreads and add to proc submit files.
 
     Reads manifest.json from the group dir (extracted at planning time),
@@ -305,6 +396,9 @@ def patch_wu_manifests(group_dir: Path, per_step: dict) -> int:
         raise FileNotFoundError(f"manifest.json not found in {group_dir}")
 
     manifest = json.loads(manifest_path.read_text())
+
+    if n_pipelines > 1:
+        manifest["n_pipelines"] = n_pipelines
 
     for si_str, tuning in per_step.items():
         si = int(si_str)
@@ -356,6 +450,10 @@ def _replan_cli(args: list[str]) -> None:
                         help="Max CPU overcommit ratio (1.0 = disabled)")
     parser.add_argument("--no-split", action="store_true", default=False,
                         help="Disable step 0 parallel splitting")
+    parser.add_argument("--split-all-steps", action="store_true", default=False,
+                        help="All-step pipeline split (supersedes --no-split)")
+    parser.add_argument("--uniform-threads", action="store_true", default=False,
+                        help="Use uniform nThreads across all steps (with --split-all-steps)")
     opts = parser.parse_args(args)
 
     wu0_dir = Path(opts.wu0_dir)
@@ -391,37 +489,63 @@ def _replan_cli(args: list[str]) -> None:
         print(f"request_cpus: {opts.request_cpus}")
     if opts.request_memory > 0:
         print(f"request_memory: {opts.request_memory} MB")
-    if opts.overcommit_max > 1.0:
-        print(f"overcommit_max: {opts.overcommit_max}")
-    if opts.no_split:
-        print(f"step 0 splitting: disabled")
-    tuning = compute_per_step_nthreads(
-        metrics, original_nthreads,
-        request_cpus=opts.request_cpus,
-        request_memory_mb=opts.request_memory,
-        overcommit_max=opts.overcommit_max,
-        split=not opts.no_split,
-    )
-    for si in sorted(tuning["per_step"]):
-        t = tuning["per_step"][si]
-        par_str = f"  n_parallel={t['n_parallel']}" if t.get("n_parallel", 1) > 1 else ""
-        oc_str = "  [OC]" if t.get("overcommit_applied") else ""
-        proj_str = ""
-        if t.get("projected_rss_mb") is not None:
-            proj_str = f"  proj_rss={t['projected_rss_mb']:.0f}MB"
-        print(f"  Step {si}: cpu_eff={t['cpu_eff']:.1%}"
-              f"  eff_cores={t['effective_cores']:.1f}"
-              f"  -> nThreads={t['tuned_nthreads']}{par_str}{oc_str}{proj_str}")
+
+    n_pipelines = 1
+
+    if opts.split_all_steps:
+        mode_desc = "all-step pipeline split"
+        if opts.uniform_threads:
+            mode_desc += " (uniform threads)"
+        print(f"mode: {mode_desc}")
+        tuning = compute_all_step_split(
+            metrics, original_nthreads,
+            request_cpus=opts.request_cpus,
+            request_memory_mb=opts.request_memory,
+            uniform=opts.uniform_threads,
+        )
+        n_pipelines = tuning.get("n_pipelines", 1)
+        print(f"n_pipelines: {n_pipelines}")
+        for si in sorted(tuning["per_step"]):
+            t = tuning["per_step"][si]
+            proj_str = ""
+            if t.get("projected_rss_mb") is not None:
+                proj_str = f"  proj_rss={t['projected_rss_mb']:.0f}MB"
+            print(f"  Step {si}: cpu_eff={t['cpu_eff']:.1%}"
+                  f"  eff_cores={t['effective_cores']:.1f}"
+                  f"  -> nThreads={t['tuned_nthreads']}  [PIPE]{proj_str}")
+    else:
+        if opts.overcommit_max > 1.0:
+            print(f"overcommit_max: {opts.overcommit_max}")
+        if opts.no_split:
+            print(f"step 0 splitting: disabled")
+        tuning = compute_per_step_nthreads(
+            metrics, original_nthreads,
+            request_cpus=opts.request_cpus,
+            request_memory_mb=opts.request_memory,
+            overcommit_max=opts.overcommit_max,
+            split=not opts.no_split,
+        )
+        for si in sorted(tuning["per_step"]):
+            t = tuning["per_step"][si]
+            par_str = f"  n_parallel={t['n_parallel']}" if t.get("n_parallel", 1) > 1 else ""
+            oc_str = "  [OC]" if t.get("overcommit_applied") else ""
+            proj_str = ""
+            if t.get("projected_rss_mb") is not None:
+                proj_str = f"  proj_rss={t['projected_rss_mb']:.0f}MB"
+            print(f"  Step {si}: cpu_eff={t['cpu_eff']:.1%}"
+                  f"  eff_cores={t['effective_cores']:.1f}"
+                  f"  -> nThreads={t['tuned_nthreads']}{par_str}{oc_str}{proj_str}")
 
     # 3. Patch WU1 manifests
     print(f"\n--- Patching WU1 manifests ---")
-    patched = patch_wu_manifests(wu1_dir, tuning["per_step"])
+    patched = patch_wu_manifests(wu1_dir, tuning["per_step"], n_pipelines=n_pipelines)
     print(f"Patched {patched} proc submit files")
 
     # 4. Write replan decisions for the performance report
     decisions = {
         "original_nthreads": original_nthreads,
         "overcommit_max": opts.overcommit_max,
+        "n_pipelines": n_pipelines,
         "per_step": {
             str(si): t for si, t in tuning["per_step"].items()
         },

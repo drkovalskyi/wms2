@@ -1285,6 +1285,266 @@ INSTEOF
     echo "  Collected outputs: $PREV_OUTPUT"
 }
 
+# ── All-step pipeline split execution ─────────────────────────
+run_all_steps_pipeline() {
+    local n_pipelines="$1"
+    local events_per_pipe=$((EVENTS_PER_JOB / n_pipelines))
+    local remainder=$((EVENTS_PER_JOB % n_pipelines))
+
+    echo "--- Pipeline mode: $n_pipelines pipelines ---"
+    echo "  Events per pipeline: $events_per_pipe (remainder: $remainder)"
+
+    NUM_STEPS=$(python3 -c "import json; print(len(json.load(open('manifest.json'))['steps']))")
+    echo "  Steps: $NUM_STEPS"
+
+    # Read step configs once (shared across pipelines)
+    local step_names=()
+    local step_cmssw=()
+    local step_arch=()
+    local step_pset=()
+    local step_input_step=()
+    local step_nthreads=()
+    for step_idx in $(seq 0 $((NUM_STEPS - 1))); do
+        local sj
+        sj=$(python3 -c "import json; s=json.load(open('manifest.json'))['steps'][$step_idx]; print(json.dumps(s))")
+        step_names+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")")
+        step_cmssw+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['cmssw_version'])")")
+        step_arch+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['scram_arch'])")")
+        step_pset+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['pset'])")")
+        step_input_step+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('input_step',''))")")
+        step_nthreads+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('multicore',1))")")
+    done
+
+    # Setup CMSSW project once (first step's version — all steps may share or re-setup)
+    local first_cmssw="${step_cmssw[0]}"
+    local first_arch="${step_arch[0]}"
+    local CONTAINER
+    CONTAINER=$(resolve_container "$first_arch")
+
+    if [[ -z "$CONTAINER" ]]; then
+        export SCRAM_ARCH="$first_arch"
+        source /cvmfs/cms.cern.ch/cmsset_default.sh
+        if [[ ! -d "$WORK_DIR/$first_cmssw/src" ]]; then
+            cd "$WORK_DIR" && scramv1 project CMSSW "$first_cmssw"
+        fi
+        export SITECONFIG_PATH="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+        export CMS_PATH="$SITECONFIG_PATH"
+    else
+        local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+        mkdir -p "$WORK_DIR/_siteconf/JobConfig"
+        cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
+        [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
+        [[ -f "$SITE_CFG/storage.json" ]] && cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+        mkdir -p "$WORK_DIR/_siteconf/SITECONF/local/JobConfig"
+        cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/SITECONF/local/JobConfig/" 2>/dev/null || true
+        [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+
+        # Setup all unique CMSSW versions
+        local setup_versions=()
+        for si in $(seq 0 $((NUM_STEPS - 1))); do
+            local ver="${step_cmssw[$si]}"
+            local arch="${step_arch[$si]}"
+            local already=0
+            for sv in "${setup_versions[@]}"; do
+                [[ "$sv" == "$ver" ]] && already=1
+            done
+            if [[ $already -eq 0 ]]; then
+                setup_versions+=("$ver")
+                cat > "$WORK_DIR/_setup_cmssw_${ver}.sh" <<SETUPEOF
+#!/bin/bash
+set -e
+export SITECONFIG_PATH=$WORK_DIR/_siteconf
+export CMS_PATH=$WORK_DIR/_siteconf
+export SCRAM_ARCH=$arch
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+cd $WORK_DIR
+if [[ ! -d $ver/src ]]; then
+    scramv1 project CMSSW $ver
+fi
+SETUPEOF
+                chmod +x "$WORK_DIR/_setup_cmssw_${ver}.sh"
+                local BIND="/cvmfs,/tmp,$WORK_DIR"
+                [[ -d /mnt/creds ]] && BIND="$BIND,/mnt/creds"
+                [[ -d /mnt/shared ]] && BIND="$BIND,/mnt/shared"
+                [[ -d "$SITE_CFG" ]] && BIND="$BIND,$SITE_CFG"
+                export APPTAINER_BINDPATH="$BIND"
+                echo "  Setting up CMSSW $ver via apptainer..."
+                apptainer exec --no-home "$CONTAINER" bash "$WORK_DIR/_setup_cmssw_${ver}.sh"
+            fi
+        done
+    fi
+
+    # Fork N pipelines
+    local pids=()
+    for pipe in $(seq 0 $((n_pipelines - 1))); do
+        local pdir="$WORK_DIR/pipeline_${pipe}"
+        mkdir -p "$pdir"
+
+        # Compute per-pipeline event range (step 0 firstEvent partitioning)
+        local pipe_first=$((FIRST_EVENT + pipe * events_per_pipe))
+        local pipe_events=$events_per_pipe
+        [[ $pipe -eq $((n_pipelines - 1)) ]] && pipe_events=$((events_per_pipe + remainder))
+
+        echo "  Pipeline $pipe: firstEvent=$pipe_first maxEvents=$pipe_events"
+
+        # Symlink CMSSW projects and gridpack archives
+        for si in $(seq 0 $((NUM_STEPS - 1))); do
+            ln -sf "$WORK_DIR/${step_cmssw[$si]}" "$pdir/${step_cmssw[$si]}" 2>/dev/null || true
+        done
+        ln -sf "$WORK_DIR"/*.xz "$WORK_DIR"/*.gz "$pdir/" 2>/dev/null || true
+
+        # Copy ALL PSet files into pipeline dir, preserving directory structure
+        # (PSets may share the same basename, e.g. steps/step1/cfg.py, steps/step2/cfg.py)
+        for si in $(seq 0 $((NUM_STEPS - 1))); do
+            local pset_dir
+            pset_dir=$(dirname "${step_pset[$si]}")
+            mkdir -p "$pdir/$pset_dir"
+            cp "$WORK_DIR/${step_pset[$si]}" "$pdir/${step_pset[$si]}"
+        done
+
+        # Launch pipeline subshell
+        (
+            cd "$pdir"
+            local PREV_OUTPUT=""
+
+            for step_idx in $(seq 0 $((NUM_STEPS - 1))); do
+                local step_num=$((step_idx + 1))
+                local sname="${step_names[$step_idx]}"
+                local cmssw="${step_cmssw[$step_idx]}"
+                local arch="${step_arch[$step_idx]}"
+                local pset_file="${step_pset[$step_idx]}"
+                local input_step="${step_input_step[$step_idx]}"
+                local nthreads="${step_nthreads[$step_idx]}"
+
+                echo "  [pipe$pipe] Step $step_num: $sname (nThreads=$nthreads)"
+
+                # Determine input files
+                local INJECT_INPUT=""
+                if [[ -n "$input_step" && -n "$PREV_OUTPUT" ]]; then
+                    IFS=',' read -ra _PO_ARRAY <<< "$PREV_OUTPUT"
+                    for _po in "${_PO_ARRAY[@]}"; do
+                        [[ -n "$INJECT_INPUT" ]] && INJECT_INPUT="${INJECT_INPUT},"
+                        INJECT_INPUT="${INJECT_INPUT}file:${_po}"
+                    done
+                fi
+
+                # Inject runtime overrides into PSet
+                python3 -c "
+import os
+pset = '$pset_file'
+lines = ['', '# --- WMS2 pipeline PSet injection ---']
+lines.append('import FWCore.ParameterSet.Config as cms')
+
+inject_input = '$INJECT_INPUT'
+if inject_input:
+    file_list = inject_input.split(',')
+    quoted = ', '.join(repr(f) for f in file_list)
+    lines.append('process.source.fileNames = cms.untracked.vstring(' + quoted + ')')
+    lines.append('process.source.secondaryFileNames = cms.untracked.vstring()')
+
+step_idx = $step_idx
+pipe_events = $pipe_events
+pipe_first = $pipe_first
+if step_idx == 0 and pipe_events > 0:
+    lines.append('process.maxEvents.input = cms.untracked.int32(' + str(pipe_events) + ')')
+    lines.append('if hasattr(process, \"externalLHEProducer\"):')
+    lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32(' + str(pipe_events) + ')')
+elif step_idx > 0:
+    lines.append('process.maxEvents.input = cms.untracked.int32(-1)')
+if step_idx == 0 and pipe_first > 0:
+    lines.append('process.source.firstEvent = cms.untracked.uint32(' + str(pipe_first) + ')')
+
+nthreads = $nthreads
+if nthreads > 1:
+    lines.append('if not hasattr(process, \"options\"):')
+    lines.append('    process.options = cms.untracked.PSet()')
+    lines.append('process.options.numberOfThreads = cms.untracked.uint32(' + str(nthreads) + ')')
+    lines.append('process.options.numberOfStreams = cms.untracked.uint32(0)')
+
+with open(pset, 'a') as f:
+    f.write(chr(10).join(lines) + chr(10))
+"
+
+                # Execute cmsRun
+                local CMSRUN_ARGS="-j report_step${step_num}.xml $pset_file"
+                local step_container
+                step_container=$(resolve_container "$arch")
+                local STEP_START
+                STEP_START=$(date +%s)
+
+                if [[ -z "$step_container" ]]; then
+                    cd "$pdir/$cmssw/src" && eval $(scramv1 runtime -sh) && cd "$pdir"
+                    cmsRun $CMSRUN_ARGS
+                else
+                    cat > "$pdir/_pipe${pipe}_step${step_num}.sh" <<PIPEEOF
+#!/bin/bash
+set -e
+export SITECONFIG_PATH=$WORK_DIR/_siteconf
+export CMS_PATH=$WORK_DIR/_siteconf
+export SCRAM_ARCH=$arch
+export X509_USER_PROXY="${X509_USER_PROXY:-}"
+export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+cd $pdir/$cmssw/src && eval \$(scramv1 runtime -sh) && cd $pdir
+cmsRun $CMSRUN_ARGS
+PIPEEOF
+                    chmod +x "$pdir/_pipe${pipe}_step${step_num}.sh"
+                    apptainer exec --no-home "$step_container" bash "$pdir/_pipe${pipe}_step${step_num}.sh"
+                fi
+
+                local STEP_RC=$?
+                local STEP_END
+                STEP_END=$(date +%s)
+                local STEP_WALL=$((STEP_END - STEP_START))
+
+                if [[ $STEP_RC -ne 0 ]]; then
+                    echo "  [pipe$pipe] ERROR: Step $sname failed with exit code $STEP_RC" >&2
+                    exit $STEP_RC
+                fi
+                echo "  [pipe$pipe] Step $sname completed in ${STEP_WALL}s"
+
+                # Parse FJR output for next step input
+                PREV_OUTPUT=$(parse_fjr_output "$pdir/report_step${step_num}.xml")
+                echo "  [pipe$pipe] Output: ${PREV_OUTPUT:-none}"
+            done
+        ) &
+        pids+=($!)
+    done
+
+    # Wait for all pipelines
+    local failed=0
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=$((failed + 1))
+    done
+    if [[ $failed -gt 0 ]]; then
+        echo "ERROR: $failed/$n_pipelines pipelines failed" >&2
+        exit 1
+    fi
+    echo "  All $n_pipelines pipelines completed successfully"
+
+    # Collect outputs: copy FJR + ROOT files from pipeline dirs to WORK_DIR
+    for pipe in $(seq 0 $((n_pipelines - 1))); do
+        local pdir="$WORK_DIR/pipeline_${pipe}"
+        # Copy FJR files with pipeline suffix
+        for fjr in "$pdir"/report_step*.xml; do
+            if [[ -f "$fjr" ]]; then
+                local base
+                base=$(basename "$fjr" .xml)
+                cp "$fjr" "$WORK_DIR/${base}_pipe${pipe}.xml"
+            fi
+        done
+        # Copy ROOT files with pipeline prefix
+        for rf in "$pdir"/*.root; do
+            if [[ -f "$rf" ]]; then
+                local base
+                base=$(basename "$rf")
+                cp "$rf" "$WORK_DIR/pipe${pipe}_${base}"
+            fi
+        done
+    done
+    echo "  Collected outputs from $n_pipelines pipelines"
+}
+
 # ── CMSSW mode (per-step CMSSW/ScramArch with apptainer) ─────
 run_cmssw_mode() {
     echo "--- CMSSW mode ---"
@@ -1297,6 +1557,14 @@ run_cmssw_mode() {
         echo "ERROR: /cvmfs/cms.cern.ch not available" >&2
         exit 1
     fi
+
+    # Pipeline mode dispatch: n_pipelines > 1 runs all steps in parallel pipelines
+    N_PIPELINES=$(python3 -c "import json; print(json.load(open('manifest.json')).get('n_pipelines', 1))")
+    if [[ "$N_PIPELINES" -gt 1 ]]; then
+        echo "Pipeline mode: $N_PIPELINES pipelines"
+        run_all_steps_pipeline "$N_PIPELINES"
+        # Fall through to existing output rename + manifest + metrics code
+    else
 
     # Build xrootd input file list for first step
     IFS=',' read -ra LFN_ARRAY <<< "$INPUT_LFNS"
@@ -1468,6 +1736,8 @@ except Exception:
         echo "  Output: ${PREV_OUTPUT:-none}"
     done
 
+    fi  # end of sequential (non-pipeline) mode
+
     # Rename output ROOT files to include node index — prevents collisions
     # when HTCondor transfers outputs from multiple proc jobs to the same dir
     echo ""
@@ -1513,6 +1783,11 @@ for f in sorted(os.listdir('.')):
     if m:
         orig = m.group(1)
         info = orig_to_info.get(orig)
+        # Pipeline mode: orig may be 'pipe0_filename.root' — strip prefix
+        if not info:
+            pipe_m = re.match(r'pipe\d+_(.+)$', orig)
+            if pipe_m:
+                info = orig_to_info.get(pipe_m.group(1))
         if info:
             files[f] = info
         else:
@@ -1621,6 +1896,7 @@ step_idx = 0
 while True:
     fjr = f'report_step{step_idx + 1}.xml'
     inst_fjrs = sorted(_gl.glob(f'report_step{step_idx + 1}_inst*.xml'))
+    pipe_fjrs = sorted(_gl.glob(f'report_step{step_idx + 1}_pipe*.xml'))
     if os.path.isfile(fjr):
         try:
             m = parse_fjr_metrics(fjr, step_idx)
@@ -1638,6 +1914,15 @@ while True:
                     print(f'  Step {step_idx + 1} ({os.path.basename(ifjr)}): wall={m[\"wall_time_sec\"]}s cpu_eff={m[\"cpu_efficiency\"]} rss={m[\"peak_rss_mb\"]}MB events={m[\"events_processed\"]}')
             except Exception as e:
                 print(f'  Step {step_idx + 1} ({os.path.basename(ifjr)}): parse error: {e}')
+    elif pipe_fjrs:
+        for pfjr in pipe_fjrs:
+            try:
+                m = parse_fjr_metrics(pfjr, step_idx)
+                if m:
+                    all_metrics.append(m)
+                    print(f'  Step {step_idx + 1} ({os.path.basename(pfjr)}): wall={m[\"wall_time_sec\"]}s cpu_eff={m[\"cpu_efficiency\"]} rss={m[\"peak_rss_mb\"]}MB events={m[\"events_processed\"]}')
+            except Exception as e:
+                print(f'  Step {step_idx + 1} ({os.path.basename(pfjr)}): parse error: {e}')
     else:
         break
     step_idx += 1

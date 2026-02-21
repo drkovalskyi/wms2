@@ -51,4 +51,6 @@ class WorkflowDef:
     adaptive: bool = False
     num_work_units: int = 1
     adaptive_split: bool = True  # enable step 0 parallel splitting
+    split_all_steps: bool = False  # all-step pipeline split (supersedes adaptive_split)
+    split_uniform_threads: bool = False  # uniform nThreads across all steps in pipeline split
     overcommit_max: float = 1.0  # max CPU overcommit ratio (1.0 = disabled)

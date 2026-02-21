@@ -1941,3 +1941,101 @@ Split and overcommit are independent controls, tested in isolation:
   - 350.0: step 0 gets 4T×2par, steps 1+ keep 8T
   - 360.0: all steps n_par=1, steps in 50-90% band get 10T [OC]
   - 370.0: step 0 gets 5T×2par [OC], steps 1+ in band get 10T [OC]
+
+---
+
+# Phase 10 — All-Step Pipeline Split (380.0)
+
+**Date**: 2026-02-21
+**Spec Version**: 2.4.0
+
+---
+
+## What Was Built
+
+### All-Step Pipeline Split Algorithm (`tests/matrix/adaptive.py`)
+
+New function `compute_all_step_split()` that forks N complete StepChain pipelines within one sandbox, each processing `events/N` events through all steps with per-step optimized nThreads. This is a separate code path from the existing step 0 split (`compute_per_step_nthreads`).
+
+Algorithm:
+1. For each step: compute `ideal_threads = nearest_power_of_2(eff_cores)`, capped to original nThreads
+2. Iterate `n_pipelines` from highest feasible down to 1:
+   - `threads_cap = request_cpus // n_pipelines`
+   - Per-step: `tuned = min(ideal_threads, threads_cap)`
+   - Per-step: `projected_rss = measured_rss - (original - tuned) * 250 MB`, floor 500 MB
+   - Memory check: `n_pipelines * max(projected_rss across steps) <= request_memory_mb`
+   - Take first (highest) n_pipelines that fits memory
+3. Returns `{n_pipelines, per_step: {tuned_nthreads, projected_rss_mb, ...}}`
+
+### Pipeline Mode Proc Script (`src/wms2/core/dag_planner.py`)
+
+New bash function `run_all_steps_pipeline()` in the proc script, dispatched from `run_cmssw_mode()` when `manifest.json` contains `n_pipelines > 1`.
+
+Pipeline execution pattern:
+- CMSSW project setup happens once (shared across pipelines)
+- N subshells fork, each running the complete step chain (steps 0 through N-1)
+- Each pipeline gets a non-overlapping firstEvent range (same pattern as `run_step0_parallel`)
+- Steps 1+ within each pipeline consume only that pipeline's previous step output
+- After all pipelines complete: FJR files are copied as `report_stepN_pipeM.xml`, ROOT files as `pipeM_filename.root`
+- Both pipeline and sequential paths converge at the existing output rename, manifest, and metrics extraction code
+
+### Extended Metrics and Output Manifest
+
+- Metrics extraction now looks for `report_step*_pipe*.xml` alongside existing `_inst*` pattern
+- Output manifest handles `pipe*_` prefix stripping when mapping renamed files to tiers
+
+### Files Changed
+
+| File | Changes |
+|---|---|
+| `tests/matrix/definitions.py` | Added `split_all_steps: bool = False` field (supersedes `adaptive_split` when True) |
+| `tests/matrix/adaptive.py` | New `compute_all_step_split()`, `--split-all-steps` CLI flag, `patch_wu_manifests()` accepts `n_pipelines`, writes `n_pipelines` to manifest and `replan_decisions.json`, `[PIPE]` flag in replan output |
+| `src/wms2/core/dag_planner.py` | New `run_all_steps_pipeline()` bash function, pipeline dispatch in `run_cmssw_mode()`, extended metrics extraction for pipeline FJRs, output manifest handles `pipe*_` prefix |
+| `tests/matrix/catalog.py` | Added `_WF_380_0` (adaptive all-step pipeline split) |
+| `tests/matrix/sets.py` | Added 380.0 to `_INTEGRATION_IDS` |
+| `tests/matrix/runner.py` | Passes `--split-all-steps` to replan args when `wf.split_all_steps` is True |
+| `tests/matrix/reporter.py` | Shows `Pipeline split: N pipelines` when `n_pipelines > 1` in adaptive data |
+
+### Test Workflow
+
+| ID | Split | Pipeline | Overcommit | What it tests |
+|---|---|---|---|---|
+| 380.0 | no | yes | no (1.0) | All-step pipeline split — N pipelines each running full StepChain |
+
+### Design Decisions
+
+- **Separate function, not a mode flag on `compute_per_step_nthreads`**: Pipeline split is a fundamentally different execution model (all steps in parallel vs just step 0). Keeping it as a separate function (`compute_all_step_split`) makes each algorithm self-contained and independently testable.
+- **`n_pipelines` in manifest**: The proc script reads `n_pipelines` from `manifest.json` to decide the execution path. Per-step `n_parallel` stays 1 because parallelism is at the pipeline level, not the step level.
+- **Memory model**: Uses the same conservative 250 MB/thread overhead as the existing split. Projects RSS down when reducing threads, with a 500 MB floor. Memory check uses `max(projected_rss across all steps)` since all steps of one pipeline run sequentially but all pipelines run simultaneously.
+- **Event numbering uniqueness**: Each pipeline's step 0 gets a non-overlapping firstEvent range. Steps 1+ within each pipeline consume only that pipeline's output, so event numbers propagate naturally with no cross-pipeline contamination.
+- **`adaptive_split=False` for 380.0**: Pipeline mode supersedes step 0 splitting. The two are not combined — pipeline mode already optimizes all steps including step 0.
+
+### Bug Fix During Verification
+
+Initial run failed: all pipelines crashed immediately on CMSSW NANO process validation. Root cause: all step PSets shared the same basename (`cfg.py`) in different subdirectories (`steps/step1/cfg.py`, `steps/step2/cfg.py`, etc.). The pipeline code copied them flat to the pipeline directory, causing each to overwrite the previous — the last one (NANO) won, so ALL steps tried to run the NANO config.
+
+Fix: preserve directory structure when copying PSets into pipeline dirs (`mkdir -p "$pdir/$pset_dir"` + copy with full relative path).
+
+### Verification
+
+Workflow 380.0 passed in 2821s. Verification results:
+
+1. **replan_decisions.json**: `n_pipelines: 2`, per-step tuned threads [4, 4, 4, 2, 1]
+2. **replan.out**: `[PIPE]` flags on all 5 steps, `mode: all-step pipeline split`
+3. **Round 2 proc output**: "Pipeline mode: 2 pipelines", both pipelines completed all 5 steps
+4. **Per-step efficiency comparison**:
+
+| Step | R1 Wall | R2 Wall | R1 CpuEff | R2 CpuEff | R1 RSS | R2 RSS |
+|---|---|---|---|---|---|---|
+| 1 (GEN) | 334s | 371s | 64.6% | 69.7% | 1870 MB | 1488 MB |
+| 2 (DR) | 383s | 462s | 58.3% | 69.0% | 7218 MB | 4886 MB |
+| 3 (DRpremix) | 187s | 272s | 55.7% | 52.8% | 3843 MB | 3325 MB |
+| 4 (MINI) | 67s | 78s | 25.2% | 62.8% | 2326 MB | 2078 MB |
+| 5 (NANO) | 48s | 46s | 15.2% | 94.7% | 1696 MB | 1539 MB |
+
+5. **DAG completed**, all outputs merged and cleaned, no OOM, no rescue DAGs
+6. **16 FJR samples in Round 2** (8 jobs × 2 pipelines), confirming all pipelines ran
+
+### Analysis
+
+CPU efficiency improved for 4 of 5 steps — especially step 4 (MINI: 25% → 63%) and step 5 (NANO: 15% → 95%) where fewer threads closely match actual parallelism. Per-pipeline wall time increased ~20% (expected from shared memory bandwidth contention), but 2 simultaneous pipelines yield ~1.6× total throughput over the single-pipeline baseline. Memory stayed well within the 16 GB limit (peak 5005 MB per pipeline for step 2, vs projected 6218 MB).
