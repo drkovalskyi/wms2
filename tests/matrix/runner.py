@@ -947,6 +947,8 @@ class MatrixRunner:
             f" --wu1-dir {wu1_dir}"
             f" --request-cpus {wf.multicore}"
             f" --request-memory {wf.memory_mb}"
+            f" --overcommit-max {wf.overcommit_max}"
+            + (f" --no-split" if not wf.adaptive_split else "")
         )
         replan_sub_path = wf_dir / "replan.sub"
         replan_sub_path.write_text("\n".join([

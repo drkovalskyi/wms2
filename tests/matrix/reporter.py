@@ -263,6 +263,7 @@ def _print_adaptive_comparison(
         out.write(f"  Adaptive Tuning (per-step nThreads)\n")
 
     orig_nt = adaptive.get("original_nthreads", "?")
+    oc_max = adaptive.get("overcommit_max", 1.0)
     per_step = adaptive.get("per_step", {})
 
     # Per-step tuning table
@@ -271,12 +272,18 @@ def _print_adaptive_comparison(
                   f"  {'nThreads':>9s}  {'n_par':>5s}  {'Change':>8s}\n")
         out.write(f"  {'─' * 6}  {'─' * 8}  {'─' * 10}"
                   f"  {'─' * 9}  {'─' * 5}  {'─' * 8}\n")
+        oc_count = 0
+        total_steps = 0
         for si in sorted(per_step, key=lambda x: int(x)):
             t = per_step[si]
             tuned = t.get("tuned_nthreads", orig_nt)
             n_par = t.get("n_parallel", 1)
             eff = t.get("cpu_eff", 0)
             eff_cores = t.get("effective_cores", 0)
+            oc_applied = t.get("overcommit_applied", False)
+            total_steps += 1
+            if oc_applied:
+                oc_count += 1
             if isinstance(orig_nt, (int, float)) and orig_nt > 0:
                 pct = ((tuned - orig_nt) / orig_nt) * 100
                 change_str = f"{pct:+.0f}%"
@@ -290,6 +297,9 @@ def _print_adaptive_comparison(
                 f"  {n_par:>5d}"
                 f"  {change_str:>8s}\n"
             )
+
+        if oc_max > 1.0:
+            out.write(f"\n  Overcommit: max={oc_max}  applied to {oc_count}/{total_steps} steps\n")
 
     # Per-round step comparison
     round1_steps = {k: v for k, v in perf.raw_job_step_data.items()

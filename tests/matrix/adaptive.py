@@ -168,57 +168,113 @@ def compute_per_step_nthreads(
     original_nthreads: int,
     request_cpus: int = 0,
     request_memory_mb: int = 0,
+    overcommit_max: float = 1.0,
+    split: bool = True,
 ) -> dict:
-    """Derive optimal nThreads for step 0 parallel splitting.
+    """Derive optimal nThreads for step 0 parallel splitting and optional overcommit.
 
     The scheduler-visible resource footprint (request_cpus, request_memory,
     num_jobs, events_per_job) stays unchanged.  Only step 0's nThreads is
     reduced — freed cores are filled by running n_parallel cmsRun instances.
 
-    Steps 1+ always keep original_nthreads: they run sequentially, so
-    reducing their threads just leaves cores idle with nothing to fill them.
+    CPU overcommit (overcommit_max > 1.0): give each step MORE threads than
+    its proportional core share, filling I/O bubbles with extra runnable threads.
+    This is memory-safe — extra threads are only added if the projected RSS
+    fits within request_memory_mb.
 
     Memory-capped: each parallel instance needs step0_rss + 512 MB headroom.
 
     Returns dict with per-step tuning details.
     """
+    # Conservative per-thread memory overhead for CMSSW (MB)
+    PER_THREAD_OVERHEAD_MB = 250
+
     per_step = {}
     for si in sorted(metrics["steps"]):
         step = metrics["steps"][si]
         eff_vals = step["cpu_eff"]
+        rss_vals = step["peak_rss_mb"]
         if eff_vals:
             mean_eff = sum(eff_vals) / len(eff_vals)
             eff_cores = mean_eff * original_nthreads
         else:
             mean_eff = 0.0
             eff_cores = 0.0
+        avg_rss = sum(rss_vals) / len(rss_vals) if rss_vals else 0
 
         # Parallel splitting: only step 0 is eligible
         n_par = 1
         tuned = original_nthreads
-        if si == 0 and request_cpus > 0 and eff_cores > 0:
+        overcommit_applied = False
+        projected_rss_mb = None
+
+        if si == 0 and split and request_cpus > 0 and eff_cores > 0:
             tuned = _nearest_power_of_2(eff_cores)
             tuned = min(tuned, original_nthreads)
             tuned = max(tuned, 1)
             n_par = request_cpus // tuned
             # Memory cap: each instance needs step0_rss + headroom
-            if request_memory_mb > 0:
-                step_rss = step["peak_rss_mb"]
-                avg_rss = sum(step_rss) / len(step_rss) if step_rss else 0
-                if avg_rss > 0:
-                    mem_cap = request_memory_mb // int(avg_rss + 512)
-                    n_par = min(n_par, mem_cap)
+            if request_memory_mb > 0 and avg_rss > 0:
+                mem_cap = request_memory_mb // int(avg_rss + 512)
+                n_par = min(n_par, mem_cap)
             n_par = max(n_par, 1)
             # If splitting isn't possible, keep original nThreads
             if n_par <= 1:
                 tuned = original_nthreads
                 n_par = 1
 
+            # Step 0 overcommit: add threads per instance (not more instances)
+            if overcommit_max > 1.0 and n_par > 1 and avg_rss > 0:
+                tuned_oc = min(
+                    round(tuned * overcommit_max),
+                    int(original_nthreads * overcommit_max),
+                )
+                extra_threads = tuned_oc - tuned
+                if extra_threads > 0 and request_memory_mb > 0:
+                    proj_rss = avg_rss + extra_threads * PER_THREAD_OVERHEAD_MB
+                    total_proj = n_par * proj_rss
+                    if total_proj <= request_memory_mb:
+                        projected_rss_mb = proj_rss
+                        tuned = tuned_oc
+                        overcommit_applied = True
+                    else:
+                        # Back off to max safe value
+                        safe_per_inst = request_memory_mb / n_par
+                        safe_extra = max(0, int((safe_per_inst - avg_rss) / PER_THREAD_OVERHEAD_MB))
+                        if safe_extra > 0:
+                            tuned_safe = tuned + safe_extra
+                            projected_rss_mb = avg_rss + safe_extra * PER_THREAD_OVERHEAD_MB
+                            tuned = tuned_safe
+                            overcommit_applied = True
+
+        elif (si > 0 or not split) and overcommit_max > 1.0 and eff_vals and avg_rss > 0:
+            # Steps 1+ overcommit: add threads to sequential step
+            # Only for moderate efficiency (50-90%) — low eff steps won't
+            # benefit, high eff steps are already efficient
+            if 0.50 <= mean_eff < 0.90:
+                oc_threads = round(original_nthreads * overcommit_max)
+                extra_threads = oc_threads - original_nthreads
+                if extra_threads > 0 and request_memory_mb > 0:
+                    proj_rss = avg_rss + extra_threads * PER_THREAD_OVERHEAD_MB
+                    if proj_rss <= request_memory_mb:
+                        tuned = oc_threads
+                        projected_rss_mb = proj_rss
+                        overcommit_applied = True
+                    else:
+                        # Back off to max safe value
+                        safe_extra = max(0, int((request_memory_mb - avg_rss) / PER_THREAD_OVERHEAD_MB))
+                        if safe_extra > 0 and original_nthreads + safe_extra > original_nthreads:
+                            tuned = original_nthreads + safe_extra
+                            projected_rss_mb = avg_rss + safe_extra * PER_THREAD_OVERHEAD_MB
+                            overcommit_applied = True
+
         per_step[si] = {
             "tuned_nthreads": tuned,
             "n_parallel": n_par,
             "cpu_eff": mean_eff,
             "effective_cores": eff_cores,
+            "overcommit_applied": overcommit_applied,
+            "projected_rss_mb": projected_rss_mb,
         }
 
     return {
@@ -296,6 +352,10 @@ def _replan_cli(args: list[str]) -> None:
                         help="Job request_cpus (for n_parallel computation)")
     parser.add_argument("--request-memory", type=int, default=0,
                         help="Job request_memory in MB (for memory-capped n_parallel)")
+    parser.add_argument("--overcommit-max", type=float, default=1.0,
+                        help="Max CPU overcommit ratio (1.0 = disabled)")
+    parser.add_argument("--no-split", action="store_true", default=False,
+                        help="Disable step 0 parallel splitting")
     opts = parser.parse_args(args)
 
     wu0_dir = Path(opts.wu0_dir)
@@ -331,17 +391,27 @@ def _replan_cli(args: list[str]) -> None:
         print(f"request_cpus: {opts.request_cpus}")
     if opts.request_memory > 0:
         print(f"request_memory: {opts.request_memory} MB")
+    if opts.overcommit_max > 1.0:
+        print(f"overcommit_max: {opts.overcommit_max}")
+    if opts.no_split:
+        print(f"step 0 splitting: disabled")
     tuning = compute_per_step_nthreads(
         metrics, original_nthreads,
         request_cpus=opts.request_cpus,
         request_memory_mb=opts.request_memory,
+        overcommit_max=opts.overcommit_max,
+        split=not opts.no_split,
     )
     for si in sorted(tuning["per_step"]):
         t = tuning["per_step"][si]
         par_str = f"  n_parallel={t['n_parallel']}" if t.get("n_parallel", 1) > 1 else ""
+        oc_str = "  [OC]" if t.get("overcommit_applied") else ""
+        proj_str = ""
+        if t.get("projected_rss_mb") is not None:
+            proj_str = f"  proj_rss={t['projected_rss_mb']:.0f}MB"
         print(f"  Step {si}: cpu_eff={t['cpu_eff']:.1%}"
               f"  eff_cores={t['effective_cores']:.1f}"
-              f"  -> nThreads={t['tuned_nthreads']}{par_str}")
+              f"  -> nThreads={t['tuned_nthreads']}{par_str}{oc_str}{proj_str}")
 
     # 3. Patch WU1 manifests
     print(f"\n--- Patching WU1 manifests ---")
@@ -351,6 +421,7 @@ def _replan_cli(args: list[str]) -> None:
     # 4. Write replan decisions for the performance report
     decisions = {
         "original_nthreads": original_nthreads,
+        "overcommit_max": opts.overcommit_max,
         "per_step": {
             str(si): t for si, t in tuning["per_step"].items()
         },

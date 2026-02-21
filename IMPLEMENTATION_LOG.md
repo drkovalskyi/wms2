@@ -1885,3 +1885,39 @@ n_parallel = min(request_cpus // tuned_nthreads,
 - Test 350.0 (50 ev/job, 8 cores): replan computes n_parallel=2 (higher CPU eff = 65.6% → 4 effective cores → 4 tuned threads). All rounds pass.
 - Test 300.0 (non-adaptive): unaffected, existing code path unchanged.
 - Performance note: test workflows show limited speedup because CMSSW setup overhead (~120s for gridpack extraction) dominates event processing time. Real production workflows with longer GEN steps will benefit more.
+
+---
+
+## Phase 17 — Optional CPU Overcommit in Adaptive Execution (2026-02-20)
+
+### What Was Built
+
+Optional CPU overcommit for the adaptive execution model. When `overcommit_max > 1.0`, each cmsRun step can receive more threads than its proportional core share, filling I/O bubbles with extra runnable threads. The feature is off by default (`overcommit_max=1.0`) and memory-safe.
+
+### How It Works
+
+**Step 0 overcommit**: After computing `tuned` nThreads and `n_par` for parallel splitting, if overcommit is enabled, each instance gets up to `tuned * overcommit_max` threads. The number of parallel instances stays unchanged — overcommit adds threads per instance, not more instances. Memory check: `n_par * (avg_rss + extra_threads * 250MB) <= request_memory_mb`.
+
+**Steps 1+ overcommit**: Sequential steps with moderate CPU efficiency (50-90%) get up to `original_nthreads * overcommit_max` threads. Low efficiency steps (<50%) are better served by splitting (step 0) or are left as-is (steps 1+ can't be split). High efficiency steps (>=90%) are already saturating their threads.
+
+**Memory safety**: Per-thread overhead is conservatively estimated at 250 MB (typical for CMSSW). If the projected RSS exceeds `request_memory_mb`, the system backs off to the maximum safe thread count.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `tests/matrix/definitions.py` | Added `overcommit_max: float = 1.0` to `WorkflowDef` |
+| `tests/matrix/adaptive.py` | Added `overcommit_max` param to `compute_per_step_nthreads()`, step 0 and steps 1+ overcommit logic, `overcommit_applied`/`projected_rss_mb` tracking fields, `--overcommit-max` CLI arg, `[OC]` flag in replan output |
+| `tests/matrix/runner.py` | Passes `--overcommit-max {wf.overcommit_max}` to replan args |
+| `tests/matrix/catalog.py` | Added `_WF_360_0` (ID 360.0): adaptive with `overcommit_max=1.25` |
+| `tests/matrix/sets.py` | Added 360.0 to `_INTEGRATION_IDS` |
+| `tests/matrix/reporter.py` | Shows overcommit summary line when `overcommit_max > 1.0` |
+| `docs/spec.md` | Added CPU overcommit paragraph to Section 5.3 |
+
+### Design Decisions
+
+- **Off by default**: `overcommit_max=1.0` means no overcommit. Existing workflows are unaffected. Only workflows explicitly configured with `overcommit_max > 1.0` get the feature.
+- **Conservative per-thread overhead**: 250 MB/thread is a safe default for CMSSW. Real overhead varies by step type but this ensures no OOM.
+- **Moderate efficiency band (50-90%)**: Steps below 50% have fundamental parallelism issues that extra threads won't fix. Steps above 90% are already efficient — marginal benefit from overcommit.
+- **request_cpus unchanged**: Overcommit operates entirely within the sandbox. The scheduler sees the same resource request. This avoids slot fragmentation.
+- **n_par unchanged for step 0**: Overcommit adds threads per instance, not more instances. Adding instances would compound memory pressure.

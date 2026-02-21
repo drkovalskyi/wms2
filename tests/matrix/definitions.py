@@ -50,3 +50,5 @@ class WorkflowDef:
     cached_sandbox_path: str = ""
     adaptive: bool = False
     num_work_units: int = 1
+    adaptive_split: bool = True  # enable step 0 parallel splitting
+    overcommit_max: float = 1.0  # max CPU overcommit ratio (1.0 = disabled)

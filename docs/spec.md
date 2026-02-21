@@ -2261,6 +2261,8 @@ Per-step splitting is a sandbox-owned optimization. When `step_profile.json` is 
 
 **Example**: A GEN-SIM step running on 8 cores at 20% CPU efficiency (effectively using 1.6 cores). With measured RSS of 800 MB per instance and 4 GB slot memory, the sandbox could run 4 parallel single-threaded cmsRun processes (4 × 800 MB = 3.2 GB < 4 GB), each processing 1/4 of the events via `skipEvents`/`maxEvents`. This is entirely the sandbox's decision — WMS2 only provides the metrics.
 
+**CPU overcommit** is a complementary optimization: instead of (or in addition to) splitting, give each cmsRun instance more threads than its proportional core share. The extra threads fill I/O bubbles — when some threads are waiting on disk or network, the overcommitted threads can use the idle CPU. For example, on 8 allocated cores with 2 parallel step 0 instances, each could get 5 threads (10 total, 25% overcommit) instead of 4. Steps 1+ running sequentially could get 10 threads instead of 8. Overcommit is optional (off by default, `overcommit_max=1.0`) and memory-safe: the projected RSS including per-thread overhead (conservatively 250 MB/thread for CMSSW) must fit within `request_memory`. Only steps with moderate CPU efficiency (50–90%) benefit from overcommit — low-efficiency steps need splitting, and high-efficiency steps are already saturating their threads. The scheduler-visible `request_cpus` is unchanged; overcommit operates entirely within the sandbox.
+
 ### 5.4 Memory Calibration
 
 Memory usage varies with thread count. Two data points enable a simple linear model:
