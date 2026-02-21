@@ -1906,18 +1906,38 @@ Optional CPU overcommit for the adaptive execution model. When `overcommit_max >
 
 | File | Change |
 |---|---|
-| `tests/matrix/definitions.py` | Added `overcommit_max: float = 1.0` to `WorkflowDef` |
-| `tests/matrix/adaptive.py` | Added `overcommit_max` param to `compute_per_step_nthreads()`, step 0 and steps 1+ overcommit logic, `overcommit_applied`/`projected_rss_mb` tracking fields, `--overcommit-max` CLI arg, `[OC]` flag in replan output |
-| `tests/matrix/runner.py` | Passes `--overcommit-max {wf.overcommit_max}` to replan args |
-| `tests/matrix/catalog.py` | Added `_WF_360_0` (ID 360.0): adaptive with `overcommit_max=1.25` |
-| `tests/matrix/sets.py` | Added 360.0 to `_INTEGRATION_IDS` |
+| `tests/matrix/definitions.py` | Added `overcommit_max: float = 1.0` and `adaptive_split: bool = True` to `WorkflowDef` |
+| `tests/matrix/adaptive.py` | Added `overcommit_max` and `split` params to `compute_per_step_nthreads()`, step 0 and steps 1+ overcommit logic, `overcommit_applied`/`projected_rss_mb` tracking fields, `--overcommit-max` and `--no-split` CLI args, `[OC]` flag in replan output |
+| `tests/matrix/runner.py` | Passes `--overcommit-max` and `--no-split` to replan args |
+| `tests/matrix/catalog.py` | Added `_WF_360_0` (overcommit only), `_WF_370_0` (split + overcommit) |
+| `tests/matrix/sets.py` | Added 360.0 and 370.0 to `_INTEGRATION_IDS` |
 | `tests/matrix/reporter.py` | Shows overcommit summary line when `overcommit_max > 1.0` |
 | `docs/spec.md` | Added CPU overcommit paragraph to Section 5.3 |
+
+### Test Workflows
+
+Split and overcommit are independent controls, tested in isolation:
+
+| ID | Split | Overcommit | What it tests |
+|---|---|---|---|
+| 350.0 | yes | no (1.0) | Step 0 parallel splitting only |
+| 360.0 | no | yes (1.25) | CPU overcommit only, all steps n_par=1 |
+| 370.0 | yes | yes (1.25) | Both combined |
 
 ### Design Decisions
 
 - **Off by default**: `overcommit_max=1.0` means no overcommit. Existing workflows are unaffected. Only workflows explicitly configured with `overcommit_max > 1.0` get the feature.
+- **Independent controls**: `adaptive_split` and `overcommit_max` are orthogonal. When `adaptive_split=False`, step 0 is treated like steps 1+ for overcommit (moderate efficiency band gets extra threads, but no parallel instances). This allows testing each optimization's contribution independently.
 - **Conservative per-thread overhead**: 250 MB/thread is a safe default for CMSSW. Real overhead varies by step type but this ensures no OOM.
 - **Moderate efficiency band (50-90%)**: Steps below 50% have fundamental parallelism issues that extra threads won't fix. Steps above 90% are already efficient — marginal benefit from overcommit.
 - **request_cpus unchanged**: Overcommit operates entirely within the sandbox. The scheduler sees the same resource request. This avoids slot fragmentation.
 - **n_par unchanged for step 0**: Overcommit adds threads per instance, not more instances. Adding instances would compound memory pressure.
+
+### Verification
+
+- Workflow 360.0 (overcommit only, prior to split isolation): passed in 2556s. Overcommit applied to 3/5 steps (step 0 at 65% eff: 8→5T×2par with OC, steps 1-2 at 50-54% eff: 8→10T). RSS increased as expected (step 2: 7333→8330 MB). No OOM, no rescue DAGs.
+- Throughput impact: overcommit did not improve wall time for this NPS workload — steps are memory-bandwidth bound, not I/O-bubble bound. Step 2 was 15% slower with 10 threads vs 8. This confirms overcommit is workload-dependent and validates the need for per-workflow configurability.
+- Unit tests confirm all three configurations produce expected tuning:
+  - 350.0: step 0 gets 4T×2par, steps 1+ keep 8T
+  - 360.0: all steps n_par=1, steps in 50-90% band get 10T [OC]
+  - 370.0: step 0 gets 5T×2par [OC], steps 1+ in band get 10T [OC]
