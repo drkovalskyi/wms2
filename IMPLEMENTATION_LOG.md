@@ -2229,3 +2229,111 @@ Files using `output_datasets`/`OutputDatasets` as a ReqMgr2 field name (list of 
 - 247/247 unit tests pass
 - DB migration runs cleanly: `processing_blocks` table created, no `output_datasets` table
 - No stale references to old model names in imports or core code
+
+---
+
+## 2026-02-22 — Fix Memory Model for Adaptive Step 0 Split
+
+### Context
+
+Running 351.0 (DY2L, 8 cores, 16 GB, 50 ev/job) with the old memory model caused all 8 Round 2 proc jobs to be held by HTCondor for exceeding the 16 GB cgroup memory limit (peak 15,511 MB). The old algorithm projected step 0 RSS at 2T as `max(1767 - 6×250, 500) = 500 MB`, leading to `4 × (500 + 1500 tmpfs) = 8000 MB` — appeared safe but actual consumption was ~15.5 GB because:
+
+1. **Per-thread reduction was wrong for GEN**: The 250 MB/thread reduction assumes CMSSW thread-scaling overhead. GEN step memory is dominated by the gridpack/MadGraph runtime, which is thread-independent. Reducing threads doesn't reduce RSS.
+2. **Missing sandbox overhead**: CMSSW project area, shared libs, and ROOT framework consume ~3 GB as a constant base, regardless of how many cmsRun instances run.
+
+### What Changed
+
+#### Memory Model (`tests/matrix/adaptive.py`)
+
+Replaced the aggressive per-thread reduction with a conservative model:
+
+```
+Total = SANDBOX_OVERHEAD_MB (3000) + n_par × (measured_RSS + TMPFS_PER_INSTANCE_MB)
+```
+
+- **SANDBOX_OVERHEAD_MB = 3000**: CMSSW project area, shared libs, ROOT — loaded once regardless of instances
+- **measured_RSS**: Used directly, NOT reduced by thread count for GEN step
+- **TMPFS_PER_INSTANCE_MB = 1500**: Gridpack extraction on /dev/shm per instance
+
+Even-division preference: the algorithm tries n_par values that evenly divide request_cpus first (no wasted cores), then falls back to non-even values. This avoids configurations like n_par=3 on 8 cores (2 cores wasted).
+
+Ideal memory reporting: `compute_per_step_nthreads()` now returns `ideal_n_parallel` and `ideal_memory_mb` in step 0 data, so the reporter can show what would be optimal without the memory cap.
+
+#### Per-Core Memory Inputs
+
+Replaced `memory_mb` (single total) and `request_memory`/`request_cpus` CLI args with three clean per-core inputs:
+
+- `memory_per_core_mb` — MB per core for Round 1 request_memory (default 2000)
+- `max_memory_per_core_mb` — max MB per core for Round 2 request_memory (default 2000)
+- CLI: `--ncores`, `--mem-per-core`, `--max-mem-per-core`
+
+Total memory is derived: `round1_memory = mem_per_core × ncores`, `max_memory = max_mem_per_core × ncores`.
+
+#### Manifest Patching (`patch_wu_manifests`)
+
+Simplified from computing `extra_memory = n_par × TMPFS` and adding to base request_memory (which double-counted) to simply setting `request_memory = max_memory_mb` when parallel splitting is active. The algorithm already validated that instances fit within this limit.
+
+Return value changed from `int` (patched count) to `dict` with `patched`, `ideal_memory_mb`, `actual_memory_mb`.
+
+#### Proc Script (`src/wms2/core/dag_planner.py`)
+
+- Added `/dev/shm` to apptainer bind mounts
+- Parallel instance working directories now use tmpfs (`/dev/shm/wms2_step0_$$`) instead of the virtiofs-backed work directory, avoiding file descriptor limits during gridpack extraction (29K+ files each)
+- CVMFS autofs mount trigger before mode dispatch (`ls /cvmfs/cms.cern.ch/`)
+- Mode dispatch is now explicit (`cmssw` / `synthetic` / error) instead of falling back silently
+
+#### Runner (`tests/matrix/runner.py`)
+
+- Pre-flight disk space check (`_check_disk_space`) verifying EXECUTE, output, and /tmp
+- Computes Round 1 and max Round 2 memory from per-core fields
+- Always keeps artifacts (`keep_artifacts=True`) for both pass and fail
+
+#### Reporter (`tests/matrix/reporter.py`)
+
+- Shows memory limits: `Memory: 2000 MB/core (R1), max 2000 MB/core (R2)`
+- Shows ideal vs actual when constrained: `Memory needed: 16290 MB (2036 MB/core) — capped at 16000 MB`
+- Shows step 0 split info: `Step 0 split: 2 instances (ideal: 4, memory-constrained)`
+
+#### Catalog (`tests/matrix/catalog.py`)
+
+- Added 351.0 (DY2L, 50 ev/job) as fast iteration test; renumbered old 351.0 to 351.1 (500 ev/job)
+- All 8 adaptive entries converted from `memory_mb=16000` to `memory_per_core_mb=2000, max_memory_per_core_mb=2000`
+
+### Files Changed (7 files, 334 insertions, 67 deletions)
+
+| File | Changes |
+|---|---|
+| `tests/matrix/adaptive.py` | New memory model with SANDBOX_OVERHEAD, even-division preference, ideal memory tracking, per-core CLI args, `patch_wu_manifests` returns dict with memory info |
+| `tests/matrix/definitions.py` | Added `memory_per_core_mb`, `max_memory_per_core_mb` fields |
+| `tests/matrix/catalog.py` | Added 351.0 (50 ev), renumbered old to 351.1, all entries use per-core fields |
+| `tests/matrix/runner.py` | Disk space checks, per-core memory computation, always keep artifacts |
+| `tests/matrix/reporter.py` | Memory limits display, ideal vs actual, step 0 split info |
+| `tests/matrix/sets.py` | Added 351.1 to integration set |
+| `src/wms2/core/dag_planner.py` | tmpfs for parallel instances, /dev/shm bind, CVMFS trigger, explicit mode dispatch |
+
+### Verification
+
+351.0 passed in 3256s. Replan decisions: step 0 → n_parallel=2 at 4T (ideal was 4, needs 16290 MB > 16000 MB limit).
+
+| | Round 1 | Round 2 | Change |
+|---|---|---|---|
+| Events | 400 | 400 | |
+| Processing wall | 1620s | 1262s | |
+| Throughput (ev/s) | 0.25 | 0.32 | **+28.4%** |
+| Ev/core-hour | 14 | 18 | **+28.4%** |
+
+Per-step comparison:
+
+| Step | R1 nT | R2 nT | R1 Wall | R2 Wall | R1 CPU | R2 CPU | R1 RSS | R2 RSS |
+|---|---|---|---|---|---|---|---|---|
+| 1 (GEN) | 8 | 4 | 1116s | 777s | 18% | 18% | 1891 MB | 1547 MB |
+| 2 (SIM/DIGI) | 8 | 8 | 210s | 205s | 25% | 18% | 7125 MB | 6192 MB |
+| 3 (RECO) | 8 | 8 | 149s | 149s | 23% | 24% | 3838 MB | 3681 MB |
+| 4 (MINI) | 8 | 8 | 95s | 80s | 15% | 17% | 2427 MB | 2413 MB |
+| 5 (NANO) | 8 | 8 | 50s | 52s | 14% | 14% | 1703 MB | 1701 MB |
+
+- **Memory stayed within limits**: 6192 MB peak RSS, well under 16 GB cgroup limit. Zero held jobs.
+- **Step 0 (GEN) wall time**: 1116s → 777s (30% faster from 2 parallel instances at 4T)
+- **Overall +28.4% throughput**: GEN dominates wall time (69% of R1), so halving it with 2 instances gives the biggest single improvement
+- **CPU efficiency flat** (19% → 18%): expected since total core-hours are the same, just overlapping idle cores during GEN
+- Output: 4 merged files (MINIAODSIM + NANOAODSIM × 2 work units), 23.4 MB total
