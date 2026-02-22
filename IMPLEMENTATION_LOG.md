@@ -2337,3 +2337,62 @@ Per-step comparison:
 - **Overall +28.4% throughput**: GEN dominates wall time (69% of R1), so halving it with 2 instances gives the biggest single improvement
 - **CPU efficiency flat** (19% → 18%): expected since total core-hours are the same, just overlapping idle cores during GEN
 - Output: 4 merged files (MINIAODSIM + NANOAODSIM × 2 work units), 23.4 MB total
+
+---
+
+## Phase: NanoAOD Merge Fix & split_tmpfs Switch
+
+**Date**: 2026-02-23
+**Commit**: `0f043b1`
+
+### Problem: Broken NanoAOD Output
+
+The merged NanoAOD from 351.0 contained only HLT trigger branches (616 of 624 total branches). Physics objects (Muon, Electron, Jet, MET, Photon) were completely absent.
+
+### Root Cause
+
+Two tier-matching bugs in `dag_planner.py`:
+
+**1. Staging code (embedded Python in bash `python3 -c "..."`):**
+The staging code maps per-job output files to unmerged store paths by matching file tiers (from FJR) to dataset tiers (from output_info.json). The NANOEDMAODSIM→NANOAODSIM EDM variant match used `"EDM"` in a `replace()` call, but inside a bash double-quoted heredoc, the quotes were interpreted by bash, producing `NameError: name 'EDM' is not defined`. All proc jobs failed at staging, never reaching the merge step.
+
+**2. Merge code (standalone Python `wms2_merge.py`):**
+The merge config selected input files by matching dataset tier to discovered file tiers. Loose bidirectional substring match (`ds_tier in tier or tier in ds_tier`) caused `"AODSIM" in "NANOAODSIM"` → True, picking step 3 AODSIM files instead of step 5 NANOEDMAODSIM files. The merge ran `mergeNANO=True` on AODSIM files, producing a flat NanoAOD tree with only trigger info surviving the format conversion.
+
+### Fix
+
+1. **Staging code**: Escaped quotes `\"EDM\"` for bash context
+2. **Merge code**: Two-phase matching:
+   - First try EDM variant: `tier.replace("EDM","") == ds_tier` (catches NANOEDMAODSIM→NANOAODSIM)
+   - Fallback: substring match with length-difference guard (≤3 chars), preventing AODSIM→NANOAODSIM (diff=4)
+
+### split_tmpfs Switch
+
+Made tmpfs usage for parallel split instances configurable:
+- New field `split_tmpfs: bool = False` in `WorkflowDef`
+- Passed through runner → replan CLI → manifest → proc script
+- `run_step0_parallel()` now takes `use_tmpfs` parameter; uses `/dev/shm` when true, disk when false
+- Enabled for 351.0 and 351.1 (gridpack-based GEN benefits from RAM-disk I/O)
+- Off by default for other workflows
+
+### Verification
+
+Test 300.0 (NPS 5-step StepChain, 8 jobs × 50 events):
+
+| Metric | Before Fix | After Fix |
+|---|---|---|
+| Status | failed (staging NameError) | **passed** |
+| Total branches | 624 | **1675** |
+| HLT branches | 616 | 616 |
+| Muon branches | 0 | **60** |
+| Electron branches | 0 | **55** |
+| Jet branches | 0 | **46** |
+| MET branches | 0 | **12** |
+| Photon branches | 0 | **47** |
+| Events | — | 400 |
+| Merged output | — | 2 files, 30.4 MB |
+
+Performance (300.0, single round, no adaptation):
+- 0.37 ev/s, 21 ev/core-hour
+- 1078s processing, 55s merge, 1270s total
+- Peak RSS: 7348 MB (step 2 DRPremix)
