@@ -1246,7 +1246,7 @@ if [[ ! -d $cmssw/src ]]; then
 fi
 SETUPEOF
         chmod +x "$WORK_DIR/_setup_cmssw.sh"
-        local BIND="/cvmfs,/tmp,$WORK_DIR"
+        local BIND="/cvmfs,/tmp,/dev/shm,$WORK_DIR"
         [[ -d /mnt/creds ]] && BIND="$BIND,/mnt/creds"
         [[ -d /mnt/shared ]] && BIND="$BIND,/mnt/shared"
         [[ -d "$SITE_CFG" ]] && BIND="$BIND,$SITE_CFG"
@@ -1255,13 +1255,23 @@ SETUPEOF
         apptainer exec --no-home "$CONTAINER" bash "$WORK_DIR/_setup_cmssw.sh"
     fi
 
+    # Use tmpfs for instance working directories to avoid virtiofs/FUSE
+    # file descriptor limits during gridpack extraction (29K+ files each).
+    # ExternalLHEProducer extracts gridpacks into cmsRun's CWD, so placing
+    # the CWD on tmpfs keeps extraction entirely in RAM.
+    local TMPFS_BASE="/dev/shm/wms2_step0_$$"
+    mkdir -p "$TMPFS_BASE"
+    trap "rm -rf $TMPFS_BASE 2>/dev/null" EXIT
+    echo "  Using tmpfs for parallel instances: $TMPFS_BASE"
+
     # Create instance directories and fork
     local pids=()
     local pset_base
     pset_base=$(basename "$pset")
     for inst in $(seq 0 $((n_par - 1))); do
-        local idir="$WORK_DIR/step1_inst${inst}"
-        mkdir -p "$idir"
+        local idir="$TMPFS_BASE/step1_inst${inst}"
+        local odir="$WORK_DIR/step1_inst${inst}"
+        mkdir -p "$idir" "$odir"
         # Symlink CMSSW project and archive files (gridpacks)
         ln -sf "$WORK_DIR/$cmssw" "$idir/$cmssw"
         ln -sf "$WORK_DIR"/*.xz "$WORK_DIR"/*.gz "$idir/" 2>/dev/null || true
@@ -1315,19 +1325,27 @@ INSTEOF
     fi
     echo "  All $n_par instances completed successfully"
 
-    # Collect outputs and copy FJR files to WORK_DIR
+    # Collect outputs: copy from tmpfs back to WORK_DIR
     PREV_OUTPUT=""
     for inst in $(seq 0 $((n_par - 1))); do
-        local idir="$WORK_DIR/step1_inst${inst}"
+        local idir="$TMPFS_BASE/step1_inst${inst}"
+        local odir="$WORK_DIR/step1_inst${inst}"
+        # Copy ROOT outputs and FJR from tmpfs to persistent storage
+        cp "$idir"/*.root "$odir/" 2>/dev/null || true
+        cp "$idir/report_step1.xml" "$odir/"
         local out
-        out=$(parse_fjr_output "$idir/report_step1.xml")
+        out=$(parse_fjr_output "$odir/report_step1.xml")
         if [[ -n "$out" ]]; then
             [[ -n "$PREV_OUTPUT" ]] && PREV_OUTPUT="${PREV_OUTPUT},"
-            PREV_OUTPUT="${PREV_OUTPUT}${idir}/${out}"
+            PREV_OUTPUT="${PREV_OUTPUT}${odir}/${out}"
         fi
-        cp "$idir/report_step1.xml" "$WORK_DIR/report_step1_inst${inst}.xml"
+        cp "$odir/report_step1.xml" "$WORK_DIR/report_step1_inst${inst}.xml"
     done
     echo "  Collected outputs: $PREV_OUTPUT"
+
+    # Clean up tmpfs
+    rm -rf "$TMPFS_BASE"
+    echo "  Cleaned up tmpfs"
 }
 
 # ── All-step pipeline split execution ─────────────────────────
@@ -2186,16 +2204,22 @@ print('Wrote:', '$PILOT_JSON')
 }
 
 # ── Main dispatch ─────────────────────────────────────────────
+# Trigger CVMFS autofs mount if needed (ls triggers automount, -d alone may not)
+ls /cvmfs/cms.cern.ch/ > /dev/null 2>&1 || true
+
 if [[ "$PILOT_MODE" == "true" ]]; then
     run_pilot_mode
-elif [[ "$MODE" == "cmssw" && -d /cvmfs/cms.cern.ch ]]; then
-    run_cmssw_mode
-else
-    if [[ "$MODE" == "cmssw" ]]; then
-        echo "WARNING: CMSSW mode requested but /cvmfs/cms.cern.ch not available"
-        echo "         Falling back to synthetic mode"
+elif [[ "$MODE" == "cmssw" ]]; then
+    if [[ ! -d /cvmfs/cms.cern.ch ]]; then
+        echo "ERROR: CMSSW mode requested but /cvmfs/cms.cern.ch not available" >&2
+        exit 1
     fi
+    run_cmssw_mode
+elif [[ "$MODE" == "synthetic" ]]; then
     run_synthetic_mode
+else
+    echo "ERROR: Unknown mode: $MODE" >&2
+    exit 1
 fi
 ''')
     os.chmod(path, 0o755)

@@ -54,3 +54,5 @@ class WorkflowDef:
     split_all_steps: bool = False  # all-step pipeline split (supersedes adaptive_split)
     split_uniform_threads: bool = False  # uniform nThreads across all steps in pipeline split
     overcommit_max: float = 1.0  # max CPU overcommit ratio (1.0 = disabled)
+    memory_per_core_mb: int = 2000  # MB per core for Round 1 request_memory
+    max_memory_per_core_mb: int = 2000  # max MB per core for Round 2 request_memory

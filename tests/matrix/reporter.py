@@ -348,6 +348,31 @@ def _print_adaptive_report(
         out.write(f", per-step: [{', '.join(str(v) for v in tuned_vals)}]")
     out.write("\n")
 
+    # Memory limits
+    mem_per_core = adaptive.get("memory_per_core_mb", 0)
+    max_mem_per_core = adaptive.get("max_memory_per_core_mb", 0)
+    ideal_mem = adaptive.get("ideal_memory_mb", 0)
+    actual_mem = adaptive.get("actual_memory_mb", 0)
+    if mem_per_core > 0:
+        out.write(f"  Memory: {mem_per_core} MB/core (R1)")
+        if max_mem_per_core > 0:
+            out.write(f", max {max_mem_per_core} MB/core (R2)")
+        if ideal_mem > 0 and actual_mem > 0 and ideal_mem > actual_mem:
+            out.write(f"\n  Memory needed: {ideal_mem} MB"
+                      f" ({ideal_mem // orig_nt if orig_nt else 0} MB/core)"
+                      f" — capped at {actual_mem} MB")
+        elif actual_mem > 0 and actual_mem > mem_per_core * orig_nt:
+            out.write(f"\n  R2 request_memory: {actual_mem} MB")
+        out.write("\n")
+
+    # Ideal n_parallel (if memory-constrained)
+    step0_tuning = per_step_tuning.get("0", {})
+    ideal_n_par = step0_tuning.get("ideal_n_parallel", 0)
+    actual_n_par = step0_tuning.get("n_parallel", 1)
+    if ideal_n_par > actual_n_par:
+        out.write(f"  Step 0 split: {actual_n_par} instances"
+                  f" (ideal: {ideal_n_par}, memory-constrained)\n")
+
     # Round 1 table
     r1_cpu_pct = 0.0
     if round1_steps:

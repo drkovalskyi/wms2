@@ -15,6 +15,8 @@ import logging
 import math
 import os
 import re
+import shutil
+import subprocess
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -33,6 +35,56 @@ logger = logging.getLogger(__name__)
 CONDOR_HOST = os.environ.get("WMS2_CONDOR_HOST", "localhost:9618")
 POLL_INTERVAL = 5
 RESULTS_DIR = Path("/mnt/shared/work/wms2_matrix/results")
+
+# Disk space requirements per concurrent CMSSW job (GB).
+# Measured from DY2L 5-step StepChain: sandbox extraction ~1 MB,
+# CMSSW project area ~100 MB, MadGraph working dir ~500 MB,
+# intermediate ROOT files across 5 steps ~300 MB, misc ~100 MB.
+# Total ~1 GB; use 2 GB with safety margin.
+DISK_GB_PER_JOB_EXECUTE = 2
+# Per job output transferred back: ~300 MB ROOT + FJR + metrics.
+DISK_GB_PER_JOB_OUTPUT = 0.5
+# Minimum free space on /tmp for apptainer and system overhead.
+DISK_GB_TMP_MIN = 1
+
+
+def _check_disk_space(num_concurrent_jobs: int, output_dir: Path) -> None:
+    """Pre-flight check: verify sufficient free disk space.
+
+    Raises RuntimeError if any filesystem has insufficient space.
+    """
+    # Resolve HTCondor EXECUTE directory
+    try:
+        result = subprocess.run(
+            ["condor_config_val", "EXECUTE"],
+            capture_output=True, text=True, timeout=5,
+        )
+        execute_dir = Path(result.stdout.strip()) if result.returncode == 0 else Path("/var/lib/condor/execute")
+    except Exception:
+        execute_dir = Path("/var/lib/condor/execute")
+
+    checks: list[tuple[str, Path, float]] = [
+        ("EXECUTE", execute_dir, num_concurrent_jobs * DISK_GB_PER_JOB_EXECUTE),
+        ("output", output_dir, num_concurrent_jobs * DISK_GB_PER_JOB_OUTPUT),
+        ("/tmp", Path("/tmp"), DISK_GB_TMP_MIN),
+    ]
+
+    for label, path, required_gb in checks:
+        try:
+            stat = shutil.disk_usage(path)
+        except OSError:
+            stat = shutil.disk_usage(path.parent)
+        free_gb = stat.free / (1024 ** 3)
+        if free_gb < required_gb:
+            raise RuntimeError(
+                f"Insufficient disk space on {label} ({path}): "
+                f"{free_gb:.1f} GB free, need {required_gb:.1f} GB "
+                f"for {num_concurrent_jobs} concurrent jobs"
+            )
+        logger.info(
+            "Disk check %s (%s): %.1f GB free, need %.1f GB — OK",
+            label, path, free_gb, required_gb,
+        )
 
 
 # ── CPU monitoring ───────────────────────────────────────────
@@ -803,14 +855,17 @@ class MatrixRunner:
         from wms2.core.dag_planner import DAGPlanner, PilotMetrics
         from wms2.core.sandbox import create_sandbox
 
-        # 2. Sweep (also cleans leftover LFN output paths)
+        # 2. Pre-flight disk space check
+        n_concurrent = wf.num_jobs * getattr(wf, "num_work_units", 1)
+        _check_disk_space(n_concurrent, Path(f"/mnt/shared/work/wms2_matrix/wf_{wf.wf_id}"))
+
+        # 3. Sweep (also cleans leftover LFN output paths)
         work_dir = sweep_pre(wf.wf_id, output_datasets=wf.output_datasets)
         submit_dir = str(work_dir / "submit")
 
         # 3. Sandbox
         sandbox_path = str(work_dir / "sandbox.tar.gz")
         if wf.sandbox_mode == "cached" and wf.cached_sandbox_path:
-            import shutil
             shutil.copy2(wf.cached_sandbox_path, sandbox_path)
         else:
             create_sandbox(sandbox_path, wf.request_spec, mode=wf.sandbox_mode)
@@ -868,8 +923,8 @@ class MatrixRunner:
         # 9. Verify
         _verify(wf, result, wf_dir)
 
-        # 10. Sweep post — keep artifacts on failure
-        sweep_post(wf.wf_id, keep_artifacts=(result.status != "passed"))
+        # 10. Sweep post — always keep artifacts for inspection
+        sweep_post(wf.wf_id, keep_artifacts=True)
 
         return result
 
@@ -897,9 +952,14 @@ class MatrixRunner:
 
         submit_dir = str(work_dir / "submit")
 
+        # Compute memory from per-core fields
+        round1_memory_mb = wf.memory_per_core_mb * wf.multicore
+        max_memory_mb = wf.max_memory_per_core_mb * wf.multicore
+
         # Total events across both work units
         total_events = wf.events_per_job * wf.num_jobs * wf.num_work_units
         mock_wf = _make_workflow_mock(wf, sandbox_path)
+        mock_wf.config_data["memory_mb"] = round1_memory_mb
         mock_wf.config_data["request_num_events"] = total_events
         mock_wf.splitting_params["events_per_job"] = wf.events_per_job
 
@@ -945,8 +1005,9 @@ class MatrixRunner:
             f"-m tests.matrix.adaptive replan"
             f" --wu0-dir {mg_dirs[0]}"
             f" --wu1-dir {wu1_dir}"
-            f" --request-cpus {wf.multicore}"
-            f" --request-memory {wf.memory_mb}"
+            f" --ncores {wf.multicore}"
+            f" --mem-per-core {wf.memory_per_core_mb}"
+            f" --max-mem-per-core {wf.max_memory_per_core_mb}"
             f" --overcommit-max {wf.overcommit_max}"
             + (f" --no-split" if not wf.adaptive_split else "")
             + (f" --split-all-steps" if wf.split_all_steps else "")
@@ -1000,7 +1061,7 @@ class MatrixRunner:
         # Step 7: Verify
         _verify(wf, result, wf_dir)
 
-        # Step 8: Sweep (keep artifacts for debugging)
+        # Step 8: Sweep — always keep artifacts for inspection
         sweep_post(wf.wf_id, keep_artifacts=True)
 
         return result

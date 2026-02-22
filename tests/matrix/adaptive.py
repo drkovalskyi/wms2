@@ -167,22 +167,25 @@ def compute_per_step_nthreads(
     metrics: dict,
     original_nthreads: int,
     request_cpus: int = 0,
-    request_memory_mb: int = 0,
+    max_memory_mb: int = 0,
     overcommit_max: float = 1.0,
     split: bool = True,
 ) -> dict:
     """Derive optimal nThreads for step 0 parallel splitting and optional overcommit.
 
-    The scheduler-visible resource footprint (request_cpus, request_memory,
-    num_jobs, events_per_job) stays unchanged.  Only step 0's nThreads is
-    reduced — freed cores are filled by running n_parallel cmsRun instances.
+    Three inputs control the algorithm:
+      request_cpus   — max cores per job (ncores)
+      max_memory_mb  — memory ceiling for Round 2 (max_mem_per_core * ncores)
+      overcommit_max — max CPU overcommit ratio (1.0 = disabled)
+
+    The scheduler-visible resource footprint (request_cpus, num_jobs,
+    events_per_job) stays unchanged.  Only step 0's nThreads is reduced —
+    freed cores are filled by running n_parallel cmsRun instances.
 
     CPU overcommit (overcommit_max > 1.0): give each step MORE threads than
     its proportional core share, filling I/O bubbles with extra runnable threads.
     This is memory-safe — extra threads are only added if the projected RSS
-    fits within request_memory_mb.
-
-    Memory-capped: each parallel instance needs step0_rss + 512 MB headroom.
+    fits within max_memory_mb.
 
     Returns dict with per-step tuning details.
     """
@@ -207,21 +210,73 @@ def compute_per_step_nthreads(
         tuned = original_nthreads
         overcommit_applied = False
         projected_rss_mb = None
+        ideal_n_par = 1
+        ideal_memory = max_memory_mb
 
         if si == 0 and split and request_cpus > 0 and eff_cores > 0:
+            TMPFS_PER_INSTANCE_MB = 1500
             tuned = _nearest_power_of_2(eff_cores)
             tuned = min(tuned, original_nthreads)
-            tuned = max(tuned, 1)
+            # Minimum 2 threads per instance: each parallel instance
+            # extracts a full gridpack (~1.4 GB tmpfs), so fewer larger
+            # instances is better for memory than many 1-thread instances.
+            tuned = max(tuned, 2)
             n_par = request_cpus // tuned
-            # Memory cap: each instance needs step0_rss + headroom
-            if request_memory_mb > 0 and avg_rss > 0:
-                mem_cap = request_memory_mb // int(avg_rss + 512)
-                n_par = min(n_par, mem_cap)
+            # Cap parallel instances to limit tmpfs usage for gridpack
+            # extraction (each uses ~1.4 GB counted against cgroup memory).
+            MAX_PARALLEL = 4
+            n_par = min(n_par, MAX_PARALLEL)
             n_par = max(n_par, 1)
+
+            ideal_n_par = n_par
+            ideal_tuned = tuned
+
+            # Memory-aware reduction: each instance needs RSS + tmpfs.
+            # Reduce n_parallel until total fits within max_memory_mb.
+            #
+            # Memory model: SANDBOX_OVERHEAD + n_par × (RSS + TMPFS)
+            # - SANDBOX_OVERHEAD: CMSSW project area, shared libs, ROOT
+            #   (~3 GB constant, loaded once regardless of instances)
+            # - RSS: measured step 0 RSS (NOT reduced by thread count —
+            #   GEN step memory is dominated by gridpack/MadGraph which
+            #   is thread-independent)
+            # - TMPFS: gridpack extraction on /dev/shm per instance
+            SANDBOX_OVERHEAD_MB = 3000
+            effective_max = max_memory_mb if max_memory_mb > 0 else 0
+            if effective_max > 0 and n_par > 1 and avg_rss > 0:
+                # Prefer n_par that evenly divides cpus (no wasted cores).
+                # Try even-division candidates first, then any n_par as fallback.
+                candidates = sorted(
+                    [p for p in range(n_par, 1, -1) if request_cpus % p == 0],
+                    reverse=True,
+                )
+                # Fallback: any n_par if no even-division candidate fits
+                candidates += sorted(
+                    [p for p in range(n_par, 1, -1) if request_cpus % p != 0],
+                    reverse=True,
+                )
+                found = False
+                for p in candidates:
+                    t = max(request_cpus // p, 2)
+                    total = SANDBOX_OVERHEAD_MB + p * (avg_rss + TMPFS_PER_INSTANCE_MB)
+                    if total <= effective_max:
+                        n_par = p
+                        tuned = t
+                        found = True
+                        break
+                if not found:
+                    n_par = 1
+
             # If splitting isn't possible, keep original nThreads
             if n_par <= 1:
                 tuned = original_nthreads
                 n_par = 1
+
+            # Compute ideal memory for reporting (what we'd want without cap)
+            if ideal_n_par > 1 and avg_rss > 0:
+                ideal_memory = SANDBOX_OVERHEAD_MB + ideal_n_par * (avg_rss + TMPFS_PER_INSTANCE_MB)
+            else:
+                ideal_memory = max_memory_mb
 
             # Step 0 overcommit: add threads per instance (not more instances)
             if overcommit_max > 1.0 and n_par > 1 and avg_rss > 0:
@@ -230,16 +285,17 @@ def compute_per_step_nthreads(
                     int(original_nthreads * overcommit_max),
                 )
                 extra_threads = tuned_oc - tuned
-                if extra_threads > 0 and request_memory_mb > 0:
+                if extra_threads > 0 and max_memory_mb > 0:
                     proj_rss = avg_rss + extra_threads * PER_THREAD_OVERHEAD_MB
-                    total_proj = n_par * proj_rss
-                    if total_proj <= request_memory_mb:
+                    total_proj = SANDBOX_OVERHEAD_MB + n_par * (proj_rss + TMPFS_PER_INSTANCE_MB)
+                    if total_proj <= max_memory_mb:
                         projected_rss_mb = proj_rss
                         tuned = tuned_oc
                         overcommit_applied = True
                     else:
                         # Back off to max safe value
-                        safe_per_inst = request_memory_mb / n_par
+                        avail = max_memory_mb - SANDBOX_OVERHEAD_MB - n_par * TMPFS_PER_INSTANCE_MB
+                        safe_per_inst = avail / n_par if avail > 0 else 0
                         safe_extra = max(0, int((safe_per_inst - avg_rss) / PER_THREAD_OVERHEAD_MB))
                         if safe_extra > 0:
                             tuned_safe = tuned + safe_extra
@@ -254,21 +310,21 @@ def compute_per_step_nthreads(
             if 0.50 <= mean_eff < 0.90:
                 oc_threads = round(original_nthreads * overcommit_max)
                 extra_threads = oc_threads - original_nthreads
-                if extra_threads > 0 and request_memory_mb > 0:
+                if extra_threads > 0 and max_memory_mb > 0:
                     proj_rss = avg_rss + extra_threads * PER_THREAD_OVERHEAD_MB
-                    if proj_rss <= request_memory_mb:
+                    if proj_rss <= max_memory_mb:
                         tuned = oc_threads
                         projected_rss_mb = proj_rss
                         overcommit_applied = True
                     else:
                         # Back off to max safe value
-                        safe_extra = max(0, int((request_memory_mb - avg_rss) / PER_THREAD_OVERHEAD_MB))
+                        safe_extra = max(0, int((max_memory_mb - avg_rss) / PER_THREAD_OVERHEAD_MB))
                         if safe_extra > 0 and original_nthreads + safe_extra > original_nthreads:
                             tuned = original_nthreads + safe_extra
                             projected_rss_mb = avg_rss + safe_extra * PER_THREAD_OVERHEAD_MB
                             overcommit_applied = True
 
-        per_step[si] = {
+        entry = {
             "tuned_nthreads": tuned,
             "n_parallel": n_par,
             "cpu_eff": mean_eff,
@@ -276,6 +332,10 @@ def compute_per_step_nthreads(
             "overcommit_applied": overcommit_applied,
             "projected_rss_mb": projected_rss_mb,
         }
+        if si == 0 and split:
+            entry["ideal_n_parallel"] = ideal_n_par
+            entry["ideal_memory_mb"] = round(ideal_memory)
+        per_step[si] = entry
 
     return {
         "original_nthreads": original_nthreads,
@@ -377,7 +437,10 @@ def compute_all_step_split(
 # ── Patch manifests ──────────────────────────────────────────
 
 
-def patch_wu_manifests(group_dir: Path, per_step: dict, n_pipelines: int = 1) -> int:
+def patch_wu_manifests(
+    group_dir: Path, per_step: dict, n_pipelines: int = 1,
+    max_memory_mb: int = 0,
+) -> dict:
     """Create manifest_tuned.json with per-step nThreads and add to proc submit files.
 
     Reads manifest.json from the group dir (extracted at planning time),
@@ -414,7 +477,19 @@ def patch_wu_manifests(group_dir: Path, per_step: dict, n_pipelines: int = 1) ->
     tuned_path.write_text(json.dumps(manifest, indent=2))
     print(f"Wrote {tuned_path}")
 
-    # Add manifest_tuned.json to transfer_input_files in proc submit files
+    # Determine if parallel splitting is in use
+    max_n_par = max(
+        (t.get("n_parallel", 1) for t in per_step.values()), default=1
+    )
+
+    # Get ideal memory from algorithm (stored in step 0 per_step data)
+    step0_data = per_step.get("0") or per_step.get(0) or {}
+    ideal_memory_mb = step0_data.get("ideal_memory_mb", 0)
+    actual_memory_mb = max_memory_mb if max_memory_mb > 0 else 0
+
+    # Add manifest_tuned.json to transfer_input_files in proc submit files.
+    # When parallel splitting is active, set request_memory = max_memory_mb
+    # (the algorithm already validated that parallel instances fit within this).
     patched = 0
     for sub_file in sorted(group_dir.glob("proc_*.sub")):
         content = sub_file.read_text()
@@ -426,10 +501,34 @@ def patch_wu_manifests(group_dir: Path, per_step: dict, n_pipelines: int = 1) ->
             files = tif_match.group(2).rstrip()
             new_line = f"{prefix}{files}, {tuned_path}"
             content = content[:tif_match.start()] + new_line + content[tif_match.end():]
+        # Set request_memory to max when parallel splitting needs extra memory
+        if max_n_par > 1 and max_memory_mb > 0:
+            mem_match = re.search(
+                r"^(request_memory\s*=\s*)(\d+)", content, re.MULTILINE
+            )
+            if mem_match:
+                old_mem = int(mem_match.group(2))
+                new_mem = max_memory_mb
+                if new_mem > old_mem:
+                    content = (content[:mem_match.start()]
+                               + f"{mem_match.group(1)}{new_mem}"
+                               + content[mem_match.end():])
+                if patched == 0:
+                    if ideal_memory_mb > actual_memory_mb:
+                        print(f"  request_memory: {old_mem} -> {new_mem} MB"
+                              f" (ideal: {ideal_memory_mb} MB, capped at max: {max_memory_mb} MB)")
+                    elif new_mem > old_mem:
+                        print(f"  request_memory: {old_mem} -> {new_mem} MB")
+                    else:
+                        print(f"  request_memory: {old_mem} MB (unchanged)")
         sub_file.write_text(content)
         patched += 1
 
-    return patched
+    return {
+        "patched": patched,
+        "ideal_memory_mb": ideal_memory_mb,
+        "actual_memory_mb": actual_memory_mb,
+    }
 
 
 # ── CLI entry point ──────────────────────────────────────────
@@ -442,10 +541,12 @@ def _replan_cli(args: list[str]) -> None:
     parser = argparse.ArgumentParser(description="WMS2 adaptive replan")
     parser.add_argument("--wu0-dir", required=True, help="Completed WU0 group dir")
     parser.add_argument("--wu1-dir", required=True, help="WU1 group dir to patch")
-    parser.add_argument("--request-cpus", type=int, default=0,
-                        help="Job request_cpus (for n_parallel computation)")
-    parser.add_argument("--request-memory", type=int, default=0,
-                        help="Job request_memory in MB (for memory-capped n_parallel)")
+    parser.add_argument("--ncores", type=int, required=True,
+                        help="Cores per job")
+    parser.add_argument("--mem-per-core", type=int, required=True,
+                        help="MB per core for Round 1")
+    parser.add_argument("--max-mem-per-core", type=int, required=True,
+                        help="Max MB per core for Round 2")
     parser.add_argument("--overcommit-max", type=float, default=1.0,
                         help="Max CPU overcommit ratio (1.0 = disabled)")
     parser.add_argument("--no-split", action="store_true", default=False,
@@ -458,6 +559,13 @@ def _replan_cli(args: list[str]) -> None:
 
     wu0_dir = Path(opts.wu0_dir)
     wu1_dir = Path(opts.wu1_dir)
+
+    # Derive total memory from per-core inputs
+    ncores = opts.ncores
+    mem_per_core = opts.mem_per_core
+    max_mem_per_core = opts.max_mem_per_core
+    request_memory_mb = mem_per_core * ncores
+    max_memory_mb = max_mem_per_core * ncores
 
     print(f"=== WMS2 Adaptive Replan ===")
     print(f"WU0 dir: {wu0_dir}")
@@ -485,10 +593,7 @@ def _replan_cli(args: list[str]) -> None:
 
     # 2. Compute per-step optimal nThreads
     print(f"\n--- Computing per-step nThreads ---")
-    if opts.request_cpus > 0:
-        print(f"request_cpus: {opts.request_cpus}")
-    if opts.request_memory > 0:
-        print(f"request_memory: {opts.request_memory} MB")
+    print(f"ncores: {ncores}  mem/core: {mem_per_core} MB  max mem/core: {max_mem_per_core} MB")
 
     n_pipelines = 1
 
@@ -499,8 +604,8 @@ def _replan_cli(args: list[str]) -> None:
         print(f"mode: {mode_desc}")
         tuning = compute_all_step_split(
             metrics, original_nthreads,
-            request_cpus=opts.request_cpus,
-            request_memory_mb=opts.request_memory,
+            request_cpus=ncores,
+            request_memory_mb=max_memory_mb,
             uniform=opts.uniform_threads,
         )
         n_pipelines = tuning.get("n_pipelines", 1)
@@ -520,8 +625,8 @@ def _replan_cli(args: list[str]) -> None:
             print(f"step 0 splitting: disabled")
         tuning = compute_per_step_nthreads(
             metrics, original_nthreads,
-            request_cpus=opts.request_cpus,
-            request_memory_mb=opts.request_memory,
+            request_cpus=ncores,
+            max_memory_mb=max_memory_mb,
             overcommit_max=opts.overcommit_max,
             split=not opts.no_split,
         )
@@ -532,20 +637,30 @@ def _replan_cli(args: list[str]) -> None:
             proj_str = ""
             if t.get("projected_rss_mb") is not None:
                 proj_str = f"  proj_rss={t['projected_rss_mb']:.0f}MB"
+            ideal_str = ""
+            if t.get("ideal_n_parallel") and t["ideal_n_parallel"] > t.get("n_parallel", 1):
+                ideal_str = f"  (ideal: n_par={t['ideal_n_parallel']}, needs {t['ideal_memory_mb']} MB)"
             print(f"  Step {si}: cpu_eff={t['cpu_eff']:.1%}"
                   f"  eff_cores={t['effective_cores']:.1f}"
-                  f"  -> nThreads={t['tuned_nthreads']}{par_str}{oc_str}{proj_str}")
+                  f"  -> nThreads={t['tuned_nthreads']}{par_str}{oc_str}{proj_str}{ideal_str}")
 
     # 3. Patch WU1 manifests
     print(f"\n--- Patching WU1 manifests ---")
-    patched = patch_wu_manifests(wu1_dir, tuning["per_step"], n_pipelines=n_pipelines)
-    print(f"Patched {patched} proc submit files")
+    patch_result = patch_wu_manifests(
+        wu1_dir, tuning["per_step"], n_pipelines=n_pipelines,
+        max_memory_mb=max_memory_mb,
+    )
+    print(f"Patched {patch_result['patched']} proc submit files")
 
     # 4. Write replan decisions for the performance report
     decisions = {
         "original_nthreads": original_nthreads,
         "overcommit_max": opts.overcommit_max,
         "n_pipelines": n_pipelines,
+        "memory_per_core_mb": mem_per_core,
+        "max_memory_per_core_mb": max_mem_per_core,
+        "ideal_memory_mb": patch_result.get("ideal_memory_mb", 0),
+        "actual_memory_mb": patch_result.get("actual_memory_mb", 0),
         "per_step": {
             str(si): t for si, t in tuning["per_step"].items()
         },
