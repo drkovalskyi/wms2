@@ -2039,3 +2039,64 @@ Workflow 380.0 passed in 2821s. Verification results:
 ### Analysis
 
 CPU efficiency improved for 4 of 5 steps — especially step 4 (MINI: 25% → 63%) and step 5 (NANO: 15% → 95%) where fewer threads closely match actual parallelism. Per-pipeline wall time increased ~20% (expected from shared memory bandwidth contention), but 2 simultaneous pipelines yield ~1.6× total throughput over the single-pipeline baseline. Memory stayed well within the 16 GB limit (peak 5005 MB per pipeline for step 2, vs projected 6218 MB).
+
+---
+
+## 2026-02-22 — DY2L Filtered Workflow (301.0) and X509 Proxy Fix
+
+### What Was Built
+
+#### New Test Workflow: 301.0 (DY2L with Jet Matching Filter)
+
+Added a second real CMSSW workflow to the test matrix: DYto2L-4Jets (Drell-Yan to 2 leptons + up to 4 jets) with MadGraph MLM jet matching. This workflow differs from NPS in two important ways:
+
+1. **ExternalLHEProducer with gridpack**: Step 1 runs MadGraph event generation via a gridpack, which is **single-threaded**. With 8 allocated cores, only 1 is active during the ~50 min MadGraph phase (12.5% utilization).
+
+2. **~10.7% filter efficiency**: The Pythia8ConcurrentHadronizerFilter with jet matching rejects ~90% of generated events. 500 LHE events per job → ~54 surviving to RAWSIM output → steps 2-5 process only 54 events each.
+
+Source request: `cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573` (5-step StepChain, Run3Summer22EE campaign, same pileup as NPS).
+
+**Files:**
+- `tests/matrix/catalog.py` — Added `_WF_301_0` and `_GEN_DY2L_OUTPUT_DATASETS`
+- `tests/matrix/sets.py` — Added 301.0 to integration set
+- Sandbox: `/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz`
+
+#### X509 Proxy Permission Fix in Proc Script
+
+xrootd 5.4.x (used by CMSSW_12_4_16 in DY2L step 2) rejects X509 proxy files with permissions more permissive than 600. The proxy at `/mnt/creds/x509up` has 644 permissions (not changeable). NPS uses CMSSW_12_4_25 with xrootd 5.7.2, which doesn't enforce this check.
+
+**Fix**: All three step runner templates in `dag_planner.py` now copy the proxy to the working directory with 600 permissions before running cmsRun:
+
+```bash
+if [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
+    cp "$X509_USER_PROXY" "$WORK_DIR/_x509up"
+    chmod 600 "$WORK_DIR/_x509up"
+    export X509_USER_PROXY="$WORK_DIR/_x509up"
+fi
+```
+
+This works for any xrootd version and any original proxy permissions/location, since the working directory is always bind-mounted into the apptainer container.
+
+### Verification
+
+301.0 passed in 5121s (85 min):
+
+| Step | Wall(s) | ev/s | CPU | RSS(MB) | Events | n |
+|---|---|---|---|---|---|---|
+| Step 1 (GEN+SIM) | 4044 | 0.12 | 30% | 1750 | 4000 | 8 |
+| Step 2 (DRPremix) | 461 | 0.12 | 62% | 7617 | 429 | 8 |
+| Step 3 (RECO) | 301 | 0.18 | 60% | 4029 | 429 | 8 |
+| Step 4 (MiniAOD) | 107 | 0.50 | 28% | 2466 | 429 | 8 |
+| Step 5 (NanoAOD) | 47 | 1.14 | 17% | 1735 | 429 | 8 |
+
+- Overall: 34% CPU efficiency, 45 ev/core-hour, 59.5 GB machine peak RSS
+- Filter: 4000 generated → 429 output (10.7% efficiency, matching request's 10.2%)
+- Output: 2 merged files, 56.2 MB
+
+### Analysis
+
+Step 1 dominates wall time (81.5%) at only 30% CPU efficiency. The 30% is a weighted average: MadGraph runs single-threaded (~50 min at 12.5%) followed by multi-threaded Pythia+SIM (~17 min at ~80%). This workflow is the ideal candidate for step 0 splitting — parallelizing MadGraph across all allocated cores would reduce step 1 wall time by up to 8×.
+
+### Known Issues
+
+- The `events_per_job` in the report header counts generated (input) events, not filtered (output) events. For filtered workflows this is misleading — 301.0 reports "4000 events" but only 429 survive to output.

@@ -139,6 +139,50 @@ _WF_300_0 = WorkflowDef(
     ),
 )
 
+_GEN_DY2L_OUTPUT_DATASETS = [
+    {
+        "dataset_name": "/DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/Run3Summer22EEMiniAODv4-130X_mcRun3_2022_realistic_postEE_v6-v2/MINIAODSIM",
+        "merged_lfn_base": "/store/mc/Run3Summer22EEMiniAODv4/DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/MINIAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2",
+        "unmerged_lfn_base": "/store/unmerged/Run3Summer22EEMiniAODv4/DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/MINIAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2",
+        "data_tier": "MINIAODSIM",
+    },
+    {
+        "dataset_name": "/DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/Run3Summer22EENanoAODv12-130X_mcRun3_2022_realistic_postEE_v6-v2/NANOAODSIM",
+        "merged_lfn_base": "/store/mc/Run3Summer22EENanoAODv12/DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2",
+        "unmerged_lfn_base": "/store/unmerged/Run3Summer22EENanoAODv12/DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2",
+        "data_tier": "NANOAODSIM",
+    },
+]
+
+_WF_301_0 = WorkflowDef(
+    wf_id=301.0,
+    title="DY2L 5-step StepChain, 8 cores (8 jobs x 500 ev, ~10% filter)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=500,
+    num_jobs=8,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_mb=16000,
+    multicore=8,
+    size="large",
+    timeout_sec=10800,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 # ── Adaptive execution ────────────────────────────────────────
 
 _WF_350_0 = WorkflowDef(
@@ -480,6 +524,7 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_100_1,
         _WF_300_0,
         _WF_300_1,
+        _WF_301_0,
         _WF_350_0,
         _WF_360_0,
         _WF_370_0,

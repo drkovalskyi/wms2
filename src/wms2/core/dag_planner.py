@@ -1044,8 +1044,13 @@ export SITECONFIG_PATH=$WORK_DIR/_siteconf
 export CMS_PATH=$WORK_DIR/_siteconf
 
 export SCRAM_ARCH=$arch
-export X509_USER_PROXY="${X509_USER_PROXY:-}"
 export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+# Copy proxy to working dir with 600 perms (xrootd 5.4.x rejects world-readable certs)
+if [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
+    cp "$X509_USER_PROXY" "$WORK_DIR/_x509up"
+    chmod 600 "$WORK_DIR/_x509up"
+    export X509_USER_PROXY="$WORK_DIR/_x509up"
+fi
 source /cvmfs/cms.cern.ch/cmsset_default.sh
 if [[ ! -d $cmssw/src ]]; then
     scramv1 project CMSSW $cmssw
@@ -1280,8 +1285,13 @@ set -e
 export SITECONFIG_PATH=$WORK_DIR/_siteconf
 export CMS_PATH=$WORK_DIR/_siteconf
 export SCRAM_ARCH=$arch
-export X509_USER_PROXY="${X509_USER_PROXY:-}"
 export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+# Copy proxy to working dir with 600 perms (xrootd 5.4.x rejects world-readable certs)
+if [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
+    cp "$X509_USER_PROXY" "$WORK_DIR/_x509up"
+    chmod 600 "$WORK_DIR/_x509up"
+    export X509_USER_PROXY="$WORK_DIR/_x509up"
+fi
 source /cvmfs/cms.cern.ch/cmsset_default.sh
 cd $idir/$cmssw/src && eval \$(scramv1 runtime -sh) && cd $idir
 cmsRun -j report_step1.xml $pset_base
@@ -1516,8 +1526,13 @@ set -e
 export SITECONFIG_PATH=$WORK_DIR/_siteconf
 export CMS_PATH=$WORK_DIR/_siteconf
 export SCRAM_ARCH=$arch
-export X509_USER_PROXY="${X509_USER_PROXY:-}"
 export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+# Copy proxy to working dir with 600 perms (xrootd 5.4.x rejects world-readable certs)
+if [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
+    cp "$X509_USER_PROXY" "$WORK_DIR/_x509up"
+    chmod 600 "$WORK_DIR/_x509up"
+    export X509_USER_PROXY="$WORK_DIR/_x509up"
+fi
 source /cvmfs/cms.cern.ch/cmsset_default.sh
 cd $pdir/$cmssw/src && eval \$(scramv1 runtime -sh) && cd $pdir
 cmsRun $CMSRUN_ARGS
