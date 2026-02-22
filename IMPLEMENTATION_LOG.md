@@ -2167,3 +2167,65 @@ Also set up a local Rucio 39.3.0 instance for future integration testing:
 - Userpass auth (ddmlab/secret), no X.509 needed
 - Server management: `/mnt/shared/rucio/rucio-server.sh {start|stop|status}`
 - No automatic transfers (no FTS) — manual replica placement + `rucio-judge-evaluator --run-once` for rule evaluation
+
+---
+
+## Output Manager Rewrite — ProcessingBlock Model
+
+**Date**: 2026-02-22
+**Spec Version**: 2.6.0
+
+### What Changed
+
+Replaced the old 10-state `OutputDataset` lifecycle with a 5-state `ProcessingBlock` model per spec v2.6.0. The old design had WMS2 tracking transfers, polling Rucio status, managing source protection lifecycle, and announcing datasets — duplicating Rucio's job. The new design uses fire-and-forget Rucio interaction.
+
+### Files Modified (17 total)
+
+**Models & Enums (3 files)**
+- `src/wms2/models/enums.py` — `OutputStatus` (10 states) → `BlockStatus` (5: OPEN, COMPLETE, ARCHIVED, FAILED, INVALIDATED)
+- `src/wms2/models/processing_block.py` — New model: block_index, total_work_units, completed_work_units, dbs_block_name/open/closed, source_rule_ids, tape_rule_id, rucio retry fields
+- `src/wms2/models/output_dataset.py` — Deleted
+- `src/wms2/models/__init__.py` — Updated exports
+
+**Database (4 files)**
+- `src/wms2/db/tables.py` — `OutputDatasetRow` → `ProcessingBlockRow`
+- `src/wms2/db/repository.py` — 3 old methods → 5 new methods (added `get_processing_block`, `count_processing_blocks_by_status`)
+- `src/wms2/db/migrations/versions/001_initial_schema.py` — `output_datasets` table → `processing_blocks` table
+- `src/wms2/db/migrations/env.py` — Updated import
+
+**Adapters (3 files)**
+- `src/wms2/adapters/base.py` — Added 4 abstract methods: `open_block`, `register_files`, `close_block`, `invalidate_block`
+- `src/wms2/adapters/dbs.py` — Real httpx implementations for block operations
+- `src/wms2/adapters/mock.py` — Mock implementations for block operations
+
+**Core Logic (3 files)**
+- `src/wms2/core/output_manager.py` — Complete rewrite with fire-and-forget Rucio, backoff retry, failure dump
+- `src/wms2/core/lifecycle_manager.py` — `_handle_active` uses `handle_work_unit_completion()`, `process_blocks_for_workflow()`, `all_blocks_archived()`
+- `src/wms2/core/workflow_manager.py` — `get_output_datasets()` → `get_processing_blocks()`
+
+**Tests & Fixtures (4 files)**
+- `tests/unit/test_output_manager.py` — Complete rewrite: 24 tests across 6 classes
+- `tests/unit/test_enums.py` — `OutputStatus` → `BlockStatus` assertions
+- `tests/unit/test_lifecycle.py` — Updated work unit completion mock expectations
+- `tests/unit/conftest.py` — Updated mock repository methods
+- `tests/integration/conftest.py` — Updated import
+
+### Key Design Decisions
+
+1. **Fire-and-forget Rucio**: `handle_work_unit_completion()` creates source protection rules immediately. `_complete_block()` creates tape archival rules. Neither polls for completion — Rucio owns the outcome.
+
+2. **Retry with backoff**: Failed Rucio calls are retried on subsequent lifecycle cycles with exponential backoff (1m → 5m → 30m → 2h → 4h → 8h). After 3 days, blocks are marked FAILED with full context dump.
+
+3. **Block-gated completion**: DAG COMPLETED no longer immediately transitions to request COMPLETED. The lifecycle manager checks `all_blocks_archived()` first — if blocks are still COMPLETE (pending tape rule) or OPEN (pending source protection), the request stays ACTIVE and retries on the next cycle.
+
+4. **DBS block lifecycle**: First work unit opens the DBS block. Each work unit registers files. Block completion closes the DBS block. Catastrophic recovery invalidates blocks.
+
+### NOT Changed
+
+Files using `output_datasets`/`OutputDatasets` as a ReqMgr2 field name (list of dataset names from request config): `cli.py`, `output_lfn.py`, `dag_planner.py`, `sandbox.py`, `request.py`, and all matrix test files. These refer to a different concept.
+
+### Verification
+
+- 247/247 unit tests pass
+- DB migration runs cleanly: `processing_blocks` table created, no `output_datasets` table
+- No stale references to old model names in imports or core code

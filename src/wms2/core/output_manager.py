@@ -1,263 +1,324 @@
-"""Output Manager: post-compute pipeline for completed merge group outputs.
+"""Output Manager: post-compute pipeline for processing blocks.
 
-Owns the full output lifecycle: local file validation, DBS registration,
-Rucio source protection, transfer requests, and announcement.
+Handles the output lifecycle at the processing block level: DBS file
+registration, Rucio source protection, DBS block closure, and tape archival
+rule creation.
 
-All DBS/Rucio calls go through adapter interfaces — mock adapters make every
-step trivial (immediate success), real adapters call the actual services.
+Fire-and-forget design: WMS2 creates Rucio rules and moves on. It does not
+poll transfer status, manage source protection lifecycle, or track tape
+completion. Once a rule is created, Rucio owns the outcome. WMS2's only
+follow-up responsibility is retry with backoff if a Rucio call fails.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 from wms2.adapters.base import DBSAdapter, RucioAdapter
-from wms2.config import Settings
-from wms2.core.output_lfn import derive_merged_lfn_bases, lfn_to_pfn, merged_lfn_for_group
 from wms2.db.repository import Repository
-from wms2.models.enums import OutputStatus
+from wms2.models.enums import BlockStatus
 
 logger = logging.getLogger(__name__)
 
 
 class OutputManager:
-    """Manages the output lifecycle for completed merge groups."""
+    """Manages the output lifecycle for processing blocks.
+
+    Three interactions per work unit completion:
+      1. Register files in DBS (open block if first work unit)
+      2. Create Rucio source protection rule
+
+    One interaction per block completion:
+      3. Close DBS block, create tape archival rule
+
+    Called by the Request Lifecycle Manager — not an independent loop.
+    """
+
+    RUCIO_MAX_RETRY_DURATION = timedelta(days=3)
+    RUCIO_BACKOFF_SCHEDULE = [60, 300, 1800, 7200, 14400, 28800]  # 1m, 5m, 30m, 2h, 4h, 8h
 
     def __init__(
         self,
         repository: Repository,
         dbs_adapter: DBSAdapter,
         rucio_adapter: RucioAdapter,
-        settings: Settings,
     ):
         self.db = repository
         self.dbs = dbs_adapter
         self.rucio = rucio_adapter
-        self.settings = settings
 
-    async def handle_merge_completion(self, workflow, merge_info: dict) -> None:
-        """Called when a merge group SUBDAG completes.
+    async def handle_work_unit_completion(
+        self, workflow_id: UUID, block_id: UUID, merge_info: dict
+    ) -> None:
+        """Called when a work unit completes.
 
-        Creates PENDING OutputDataset records — one per output dataset
-        (per KeepOutput=true step).
-
-        merge_info = {"group_name": "mg_000000", "manifest": dict|None}
+        Registers output files in DBS and creates a Rucio source protection rule.
         """
-        group_name = merge_info["group_name"]
-        # Extract group index from name (mg_NNNNNN → int)
-        group_index = int(group_name.split("_")[1])
-
-        # Get output dataset info from workflow config_data
-        config = workflow.config_data or {}
-        output_datasets = config.get("output_datasets", [])
-
-        if not output_datasets:
-            logger.warning(
-                "No output_datasets in workflow %s config_data, skipping output creation",
-                workflow.id,
-            )
+        block = await self.db.get_processing_block(block_id)
+        if not block:
+            logger.error("Processing block %s not found", block_id)
             return
 
-        for ds_info in output_datasets:
-            dataset_name = ds_info["dataset_name"]
-            merged_base = ds_info["merged_lfn_base"]
+        # 1. Open DBS block on first work unit
+        block_name = block.dbs_block_name
+        if not block.dbs_block_open:
+            block_name = await self.dbs.open_block(
+                block.dataset_name, block.block_index
+            )
+            await self.db.update_processing_block(
+                block.id, dbs_block_name=block_name, dbs_block_open=True
+            )
 
-            # Build the merged LFN for this group
-            lfn = merged_lfn_for_group(merged_base, group_index)
-            local_path = lfn_to_pfn(self.settings.local_pfn_prefix, lfn)
+        # 2. Register files in DBS
+        output_files = merge_info.get("output_files", [])
+        if output_files:
+            await self.dbs.register_files(
+                block_name=block_name or block.dbs_block_name,
+                files=output_files,
+            )
 
-            await self.db.create_output_dataset(
-                workflow_id=workflow.id,
-                dataset_name=dataset_name,
-                source_site="local",
-                status=OutputStatus.PENDING.value,
+        # 3. Create Rucio source protection rule (no lifetime — permanent)
+        rule_id = None
+        try:
+            rule_id = await self.rucio.create_rule(
+                dataset=block.dataset_name,
+                destination=merge_info.get("site", "local"),
+            )
+        except Exception as e:
+            await self._record_rucio_failure(block, e)
+            logger.warning(
+                "Source protection failed for block %s, will retry: %s",
+                block.id, e,
+            )
+
+        # 4. Update block state
+        node_name = merge_info.get("node_name", "unknown")
+        source_rules = dict(block.source_rule_ids or {})
+        if rule_id:
+            source_rules[node_name] = rule_id
+        completed = list(block.completed_work_units or []) + [node_name]
+
+        await self.db.update_processing_block(
+            block.id,
+            completed_work_units=completed,
+            source_rule_ids=source_rules,
+        )
+
+        # 5. Check if block is now complete
+        if len(completed) >= block.total_work_units:
+            await self._complete_block(block)
+
+    async def _complete_block(self, block) -> None:
+        """All work units done. Close DBS block and create tape archival rule."""
+        block_name = block.dbs_block_name
+
+        # Close DBS block
+        if block_name and not block.dbs_block_closed:
+            await self.dbs.close_block(block_name)
+
+        await self.db.update_processing_block(
+            block.id,
+            dbs_block_closed=True,
+            status=BlockStatus.COMPLETE.value,
+        )
+
+        # Create tape archival rule
+        try:
+            tape_rule_id = await self.rucio.create_rule(
+                dataset=block.dataset_name,
+                destination="tier=1&type=TAPE",
+            )
+            await self.db.update_processing_block(
+                block.id,
+                tape_rule_id=tape_rule_id,
+                status=BlockStatus.ARCHIVED.value,
+                rucio_last_error=None,
+                rucio_attempt_count=0,
+            )
+        except Exception as e:
+            await self._record_rucio_failure(block, e)
+            logger.warning(
+                "Tape archival rule failed for block %s, will retry: %s",
+                block.id, e,
+            )
+
+    async def process_blocks_for_workflow(self, workflow_id: UUID) -> None:
+        """Retry blocks with failed Rucio calls.
+
+        Called by the Lifecycle Manager every cycle.
+        """
+        blocks = await self.db.get_processing_blocks(workflow_id)
+        for block in blocks:
+            try:
+                if block.status == BlockStatus.COMPLETE.value:
+                    # Tape rule not yet created — retry
+                    await self._retry_tape_archival(block)
+                elif block.status == BlockStatus.OPEN.value and block.rucio_last_error:
+                    # Source protection failed — retry
+                    await self._retry_source_protection(block)
+            except Exception:
+                logger.exception("Error retrying block %s", block.id)
+
+    async def _retry_tape_archival(self, block) -> None:
+        """Retry tape archival rule creation with backoff."""
+        if not self._should_retry(block):
+            return
+        try:
+            tape_rule_id = await self.rucio.create_rule(
+                dataset=block.dataset_name,
+                destination="tier=1&type=TAPE",
+            )
+            await self.db.update_processing_block(
+                block.id,
+                tape_rule_id=tape_rule_id,
+                status=BlockStatus.ARCHIVED.value,
+                rucio_last_error=None,
+                rucio_attempt_count=0,
+            )
+        except Exception as e:
+            await self._record_rucio_failure(block, e)
+
+    async def _retry_source_protection(self, block) -> None:
+        """Retry failed source protection rule creation with backoff."""
+        if not self._should_retry(block):
+            return
+        try:
+            rule_id = await self.rucio.create_rule(
+                dataset=block.dataset_name,
+                destination="local",
+            )
+            # Clear error state on success
+            await self.db.update_processing_block(
+                block.id,
+                rucio_last_error=None,
+                rucio_attempt_count=0,
             )
             logger.info(
-                "Created output record: workflow=%s dataset=%s group=%s lfn=%s",
-                workflow.id, dataset_name, group_name, lfn,
+                "Source protection retry succeeded for block %s: rule=%s",
+                block.id, rule_id,
             )
+        except Exception as e:
+            await self._record_rucio_failure(block, e)
 
-    async def process_outputs_for_workflow(self, workflow_id) -> None:
-        """Advance all outputs through the full pipeline.
+    def _should_retry(self, block) -> bool:
+        """Check if retry is allowed (within max duration, respecting backoff)."""
+        if not block.last_rucio_attempt:
+            return True
 
-        Called every lifecycle cycle. With mock adapters, all steps succeed
-        immediately — PENDING → ... → ANNOUNCED in one call.
-
-        Priority tiers (per spec Section 4.7):
-          Tier 1 (urgent): PENDING → DBS_REGISTERED → SOURCE_PROTECTED
-          Tier 2 (transfers): SOURCE_PROTECTED → TRANSFERS_REQUESTED
-          Tier 3 (polling): TRANSFERS_REQUESTED → TRANSFERRING → TRANSFERRED
-                            → SOURCE_RELEASED → ANNOUNCED
-        """
-        outputs = await self.db.get_output_datasets(workflow_id)
-
-        for output in outputs:
-            try:
-                await self._advance_output(output)
-            except Exception:
-                logger.exception("Error advancing output %s", output.id)
-
-    async def _advance_output(self, output) -> None:
-        """Advance a single output through all applicable state transitions.
-
-        Uses local variables to track state through the pipeline so multiple
-        transitions can happen in one call (important for mock adapters where
-        every step succeeds immediately).
-        """
-        status = OutputStatus(output.status)
-        transfer_rule_ids: list[str] = list(output.transfer_rule_ids or [])
-        source_rule_id: str | None = output.source_rule_id
-
-        if status == OutputStatus.PENDING:
-            await self._register_in_dbs(output)
-            status = OutputStatus.DBS_REGISTERED
-
-        if status == OutputStatus.DBS_REGISTERED:
-            source_rule_id = await self._protect_source(output)
-            status = OutputStatus.SOURCE_PROTECTED
-
-        if status == OutputStatus.SOURCE_PROTECTED:
-            transfer_rule_ids = await self._request_transfers(output)
-            status = OutputStatus.TRANSFERS_REQUESTED
-
-        if status == OutputStatus.TRANSFERS_REQUESTED:
-            transferred = await self._check_transfer_status(output, transfer_rule_ids)
-            status = OutputStatus.TRANSFERRED if transferred else OutputStatus.TRANSFERRING
-
-        if status == OutputStatus.TRANSFERRING:
-            transferred = await self._check_transfer_status(output, transfer_rule_ids)
-            if not transferred:
-                return
-            status = OutputStatus.TRANSFERRED
-
-        if status == OutputStatus.TRANSFERRED:
-            await self._release_source_protection(output, source_rule_id)
-            status = OutputStatus.SOURCE_RELEASED
-
-        if status == OutputStatus.SOURCE_RELEASED:
-            await self._announce(output)
-
-    async def _register_in_dbs(self, output) -> None:
-        """PENDING → DBS_REGISTERED. Calls dbs.inject_dataset()."""
         now = datetime.now(timezone.utc)
-        await self.dbs.inject_dataset({
-            "dataset_name": output.dataset_name,
-            "workflow_id": str(output.workflow_id),
-        })
-        await self.db.update_output_dataset(
-            output.id,
-            status=OutputStatus.DBS_REGISTERED.value,
-            dbs_registered=True,
-            dbs_registered_at=now,
-        )
-        logger.info("DBS registered: %s", output.dataset_name)
+        created_at = block.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
 
-    async def _protect_source(self, output) -> str:
-        """DBS_REGISTERED → SOURCE_PROTECTED. Calls rucio.create_rule() for source.
-
-        Returns the source rule_id for immediate use by the caller.
-        """
-        rule_id = await self.rucio.create_rule(
-            dataset=output.dataset_name,
-            destination="local",
-            lifetime=86400 * 30,  # 30 days
-        )
-        await self.db.update_output_dataset(
-            output.id,
-            status=OutputStatus.SOURCE_PROTECTED.value,
-            source_protected=True,
-            source_rule_id=rule_id,
-        )
-        logger.info("Source protected: %s rule=%s", output.dataset_name, rule_id)
-        return rule_id
-
-    async def _request_transfers(self, output) -> list[str]:
-        """SOURCE_PROTECTED → TRANSFERS_REQUESTED. Calls rucio.create_rule() per destination.
-
-        Returns the list of rule_ids for immediate use by the caller.
-        """
-        # For now, use a single default destination
-        destinations = ["T1_US_FNAL_Disk"]
-        rule_ids = []
-        for dest in destinations:
-            rule_id = await self.rucio.create_rule(
-                dataset=output.dataset_name,
-                destination=dest,
+        elapsed = now - created_at
+        if elapsed > self.RUCIO_MAX_RETRY_DURATION:
+            logger.error(
+                "Block %s (%s): Rucio retry exhausted after %s. "
+                "Last error: %s. Marking FAILED.",
+                block.id, block.dataset_name, elapsed, block.rucio_last_error,
             )
-            rule_ids.append(rule_id)
+            self._dump_failure_context(block)
+            # Mark as failed — can't use create_task in sync, caller handles
+            return False
 
-        await self.db.update_output_dataset(
-            output.id,
-            status=OutputStatus.TRANSFERS_REQUESTED.value,
-            transfer_rule_ids=rule_ids,
-            transfer_destinations=destinations,
+        last_attempt = block.last_rucio_attempt
+        if last_attempt.tzinfo is None:
+            last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+
+        attempt = min(
+            block.rucio_attempt_count,
+            len(self.RUCIO_BACKOFF_SCHEDULE) - 1,
         )
+        backoff = timedelta(seconds=self.RUCIO_BACKOFF_SCHEDULE[attempt])
+        if now - last_attempt < backoff:
+            return False
+
+        return True
+
+    async def _record_rucio_failure(self, block, error: Exception) -> None:
+        """Record a Rucio call failure for later retry."""
+        now = datetime.now(timezone.utc)
+        await self.db.update_processing_block(
+            block.id,
+            last_rucio_attempt=now,
+            rucio_attempt_count=(block.rucio_attempt_count or 0) + 1,
+            rucio_last_error=str(error),
+        )
+        logger.warning(
+            "Block %s (%s): Rucio call failed (attempt %d): %s",
+            block.id, block.dataset_name,
+            (block.rucio_attempt_count or 0) + 1, error,
+        )
+
+    def _dump_failure_context(self, block) -> None:
+        """Dump full block context for operator diagnosis."""
+        logger.error(
+            "RUCIO FAILURE CONTEXT for block %s:\n"
+            "  dataset: %s\n"
+            "  block_index: %s\n"
+            "  work_units: %d/%d\n"
+            "  dbs_block: %s (closed=%s)\n"
+            "  source_rules: %s\n"
+            "  tape_rule: %s\n"
+            "  attempts: %s\n"
+            "  last_error: %s\n"
+            "  first_attempt: %s\n"
+            "  last_attempt: %s",
+            block.id, block.dataset_name, block.block_index,
+            len(block.completed_work_units or []), block.total_work_units,
+            block.dbs_block_name, block.dbs_block_closed,
+            block.source_rule_ids, block.tape_rule_id,
+            block.rucio_attempt_count, block.rucio_last_error,
+            block.created_at, block.last_rucio_attempt,
+        )
+
+    async def invalidate_blocks(self, workflow_id: UUID, reason: str) -> None:
+        """Invalidate all blocks for catastrophic recovery.
+
+        Deletes Rucio rules and invalidates DBS blocks.
+        """
+        blocks = await self.db.get_processing_blocks(workflow_id)
+        for block in blocks:
+            # Delete source protection rules
+            for node_name, rule_id in (block.source_rule_ids or {}).items():
+                try:
+                    await self.rucio.delete_rule(rule_id)
+                except Exception as e:
+                    logger.warning("Failed to delete source rule %s: %s", rule_id, e)
+
+            # Delete tape archival rule
+            if block.tape_rule_id:
+                try:
+                    await self.rucio.delete_rule(block.tape_rule_id)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to delete tape rule %s: %s", block.tape_rule_id, e
+                    )
+
+            # Invalidate DBS block
+            if block.dbs_block_open and block.dbs_block_name:
+                try:
+                    await self.dbs.invalidate_block(block.dbs_block_name)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to invalidate DBS block %s: %s",
+                        block.dbs_block_name, e,
+                    )
+
+            await self.db.update_processing_block(
+                block.id, status=BlockStatus.INVALIDATED.value
+            )
+
         logger.info(
-            "Transfers requested: %s → %s", output.dataset_name, destinations
+            "Invalidated %d blocks for workflow %s: %s",
+            len(blocks), workflow_id, reason,
         )
-        return rule_ids
 
-    async def _check_transfer_status(self, output, rule_ids: list[str]) -> bool:
-        """TRANSFERS_REQUESTED/TRANSFERRING → TRANSFERRED. Calls rucio.get_rule_status().
-
-        Returns True if all transfers are complete.
-        """
-        all_ok = True
-        for rule_id in rule_ids:
-            status = await self.rucio.get_rule_status(rule_id)
-            if status.get("state") != "OK":
-                all_ok = False
-                break
-
-        now = datetime.now(timezone.utc)
-        if all_ok:
-            await self.db.update_output_dataset(
-                output.id,
-                status=OutputStatus.TRANSFERRED.value,
-                transfers_complete=True,
-                transfers_complete_at=now,
-                last_transfer_check=now,
-            )
-            logger.info("Transfers complete: %s", output.dataset_name)
-        else:
-            await self.db.update_output_dataset(
-                output.id,
-                status=OutputStatus.TRANSFERRING.value,
-                last_transfer_check=now,
-            )
-        return all_ok
-
-    async def _release_source_protection(self, output, source_rule_id: str | None = None) -> None:
-        """TRANSFERRED → SOURCE_RELEASED. Calls rucio.delete_rule()."""
-        rule_id = source_rule_id or output.source_rule_id
-        if rule_id:
-            await self.rucio.delete_rule(rule_id)
-        await self.db.update_output_dataset(
-            output.id,
-            status=OutputStatus.SOURCE_RELEASED.value,
-            source_released=True,
-        )
-        logger.info("Source released: %s", output.dataset_name)
-
-    async def _announce(self, output) -> None:
-        """SOURCE_RELEASED → ANNOUNCED. Terminal success state."""
-        await self.db.update_output_dataset(
-            output.id,
-            status=OutputStatus.ANNOUNCED.value,
-        )
-        logger.info("Announced: %s", output.dataset_name)
-
-    def validate_local_output(self, output_lfn: str) -> bool:
-        """Check if output file exists at local_pfn_prefix + lfn."""
-        path = lfn_to_pfn(self.settings.local_pfn_prefix, output_lfn)
-        return os.path.exists(path)
-
-    async def get_output_summary(self, workflow_id) -> dict[str, int]:
-        """Return output counts by status for display."""
-        outputs = await self.db.get_output_datasets(workflow_id)
-        summary: dict[str, int] = {}
-        for output in outputs:
-            summary[output.status] = summary.get(output.status, 0) + 1
-        return summary
+    async def all_blocks_archived(self, workflow_id: UUID) -> bool:
+        """True if every block for this workflow has status ARCHIVED."""
+        blocks = await self.db.get_processing_blocks(workflow_id)
+        if not blocks:
+            return True
+        return all(b.status == BlockStatus.ARCHIVED.value for b in blocks)

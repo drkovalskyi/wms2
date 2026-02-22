@@ -1,8 +1,8 @@
 from wms2.models.enums import (
+    BlockStatus,
     CleanupPolicy,
     DAGStatus,
     NodeRole,
-    OutputStatus,
     RequestStatus,
     SiteStatus,
     SplittingAlgo,
@@ -39,11 +39,13 @@ def test_dag_status_values():
     assert DAGStatus.STOPPED == "stopped"
 
 
-def test_output_status_values():
-    assert len(OutputStatus) == 10
-    assert OutputStatus.PENDING == "pending"
-    assert OutputStatus.ANNOUNCED == "announced"
-    assert OutputStatus.INVALIDATED == "invalidated"
+def test_block_status_values():
+    assert len(BlockStatus) == 5
+    assert BlockStatus.OPEN == "open"
+    assert BlockStatus.COMPLETE == "complete"
+    assert BlockStatus.ARCHIVED == "archived"
+    assert BlockStatus.FAILED == "failed"
+    assert BlockStatus.INVALIDATED == "invalidated"
 
 
 def test_site_status_values():

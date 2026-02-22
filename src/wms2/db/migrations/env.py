@@ -9,7 +9,7 @@ from wms2.db.base import Base
 from wms2.db.tables import (  # noqa: F401 — import to populate metadata
     DAGHistoryRow,
     DAGRow,
-    OutputDatasetRow,
+    ProcessingBlockRow,
     RequestRow,
     SiteRow,
     WorkflowRow,

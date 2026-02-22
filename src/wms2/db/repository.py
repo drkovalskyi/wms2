@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .tables import (
     DAGHistoryRow,
     DAGRow,
-    OutputDatasetRow,
+    ProcessingBlockRow,
     RequestRow,
     SiteRow,
     WorkflowRow,
@@ -193,32 +193,47 @@ class Repository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    # ── Output Datasets ────────────────────────────────────────
+    # ── Processing Blocks ──────────────────────────────────────
 
-    async def create_output_dataset(self, **kwargs: Any) -> OutputDatasetRow:
-        row = OutputDatasetRow(**kwargs)
+    async def create_processing_block(self, **kwargs: Any) -> ProcessingBlockRow:
+        row = ProcessingBlockRow(**kwargs)
         self.session.add(row)
         await self.session.flush()
         return row
 
-    async def get_output_datasets(self, workflow_id: UUID) -> list[OutputDatasetRow]:
-        stmt = select(OutputDatasetRow).where(OutputDatasetRow.workflow_id == workflow_id)
+    async def get_processing_block(self, block_id: UUID) -> ProcessingBlockRow | None:
+        result = await self.session.execute(
+            select(ProcessingBlockRow).where(ProcessingBlockRow.id == block_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_processing_blocks(self, workflow_id: UUID) -> list[ProcessingBlockRow]:
+        stmt = select(ProcessingBlockRow).where(
+            ProcessingBlockRow.workflow_id == workflow_id
+        )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def update_output_dataset(
-        self, dataset_id: UUID, **kwargs: Any
-    ) -> OutputDatasetRow | None:
+    async def update_processing_block(
+        self, block_id: UUID, **kwargs: Any
+    ) -> ProcessingBlockRow | None:
         kwargs["updated_at"] = datetime.now(timezone.utc)
         stmt = (
-            update(OutputDatasetRow)
-            .where(OutputDatasetRow.id == dataset_id)
+            update(ProcessingBlockRow)
+            .where(ProcessingBlockRow.id == block_id)
             .values(**kwargs)
-            .returning(OutputDatasetRow)
+            .returning(ProcessingBlockRow)
         )
         result = await self.session.execute(stmt)
         await self.session.flush()
         return result.scalar_one_or_none()
+
+    async def count_processing_blocks_by_status(self, status: str) -> int:
+        stmt = select(func.count()).select_from(ProcessingBlockRow).where(
+            ProcessingBlockRow.status == status
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one()
 
     # ── Sites ───────────────────────────────────────────────────
 

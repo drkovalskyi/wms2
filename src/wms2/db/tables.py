@@ -122,31 +122,26 @@ class DAGHistoryRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class OutputDatasetRow(Base):
-    __tablename__ = "output_datasets"
+class ProcessingBlockRow(Base):
+    __tablename__ = "processing_blocks"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     workflow_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("workflows.id")
     )
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False)
     dataset_name: Mapped[str] = mapped_column(String(500), nullable=False)
-    source_site: Mapped[str | None] = mapped_column(String(100))
-    dbs_registered: Mapped[bool] = mapped_column(Boolean, default=False)
-    dbs_registered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    source_rule_id: Mapped[str | None] = mapped_column(String(100))
-    source_protected: Mapped[bool] = mapped_column(Boolean, default=False)
-    transfer_rule_ids: Mapped[list] = mapped_column(JSONB, default=list)
-    transfer_destinations: Mapped[list] = mapped_column(JSONB, default=list)
-    transfers_complete: Mapped[bool] = mapped_column(Boolean, default=False)
-    transfers_complete_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_transfer_check: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    source_released: Mapped[bool] = mapped_column(Boolean, default=False)
-    invalidated: Mapped[bool] = mapped_column(Boolean, default=False)
-    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    invalidation_reason: Mapped[str | None] = mapped_column(Text)
-    dbs_invalidated: Mapped[bool] = mapped_column(Boolean, default=False)
-    rucio_rules_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    total_work_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_work_units: Mapped[list] = mapped_column(JSONB, default=list)
+    dbs_block_name: Mapped[str | None] = mapped_column(String(500))
+    dbs_block_open: Mapped[bool] = mapped_column(Boolean, default=False)
+    dbs_block_closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_rule_ids: Mapped[dict] = mapped_column(JSONB, default=dict)
+    tape_rule_id: Mapped[str | None] = mapped_column(String(100))
+    last_rucio_attempt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rucio_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    rucio_last_error: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="open")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 

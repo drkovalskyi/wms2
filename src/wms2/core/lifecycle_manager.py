@@ -191,13 +191,20 @@ class RequestLifecycleManager:
             # Process completed work units through output manager
             if result.newly_completed_work_units and self.output_manager:
                 for wu in result.newly_completed_work_units:
-                    await self.output_manager.handle_merge_completion(workflow, wu)
-                await self.output_manager.process_outputs_for_workflow(workflow.id)
+                    await self.output_manager.handle_work_unit_completion(
+                        workflow.id, wu["block_id"], wu
+                    )
+
+            # Every cycle: retry failed Rucio calls
+            if self.output_manager:
+                await self.output_manager.process_blocks_for_workflow(workflow.id)
 
             if result.status == DAGStatus.COMPLETED:
-                # Process any final outputs before transitioning
+                # Check blocks before transitioning
                 if self.output_manager:
-                    await self.output_manager.process_outputs_for_workflow(workflow.id)
+                    if not await self.output_manager.all_blocks_archived(workflow.id):
+                        # Stay ACTIVE, retry on next cycle
+                        return
                 await self.transition(request, RequestStatus.COMPLETED)
                 return
             elif result.status == DAGStatus.PARTIAL:

@@ -101,6 +101,19 @@ class MockDBSAdapter(DBSAdapter):
     async def invalidate_dataset(self, dataset_name: str, reason: str) -> None:
         self.calls.append(("invalidate_dataset", (dataset_name, reason), {}))
 
+    async def open_block(self, dataset_name: str, block_index: int) -> str:
+        self.calls.append(("open_block", (dataset_name, block_index), {}))
+        return f"{dataset_name}#block_{block_index}"
+
+    async def register_files(self, block_name: str, files: list[dict]) -> None:
+        self.calls.append(("register_files", (block_name, files), {}))
+
+    async def close_block(self, block_name: str) -> None:
+        self.calls.append(("close_block", (block_name,), {}))
+
+    async def invalidate_block(self, block_name: str) -> None:
+        self.calls.append(("invalidate_block", (block_name,), {}))
+
 
 class MockRucioAdapter(RucioAdapter):
     def __init__(self):

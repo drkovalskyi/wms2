@@ -57,6 +57,22 @@ class DBSAdapter(ABC):
     async def invalidate_dataset(self, dataset_name: str, reason: str) -> None:
         """Invalidate a dataset in DBS."""
 
+    @abstractmethod
+    async def open_block(self, dataset_name: str, block_index: int) -> str:
+        """Create/open a new DBS block. Returns block_name."""
+
+    @abstractmethod
+    async def register_files(self, block_name: str, files: list[dict]) -> None:
+        """Register output files within an open DBS block."""
+
+    @abstractmethod
+    async def close_block(self, block_name: str) -> None:
+        """Close a DBS block (no more files will be added)."""
+
+    @abstractmethod
+    async def invalidate_block(self, block_name: str) -> None:
+        """Invalidate a DBS block and its files."""
+
 
 class RucioAdapter(ABC):
     @abstractmethod

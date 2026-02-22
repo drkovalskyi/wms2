@@ -75,3 +75,42 @@ class DBSClient(DBSAdapter):
         }
         resp = await self._client.put(url, json=payload)
         resp.raise_for_status()
+
+    async def open_block(self, dataset_name: str, block_index: int) -> str:
+        url = f"{self._base_url}/blocks"
+        block_name = f"{dataset_name}#block_{block_index}"
+        payload = {
+            "block_name": block_name,
+            "origin_site_name": "local",
+            "open_for_writing": 1,
+        }
+        resp = await self._client.post(url, json=payload)
+        resp.raise_for_status()
+        return block_name
+
+    async def register_files(self, block_name: str, files: list[dict]) -> None:
+        url = f"{self._base_url}/files"
+        payload = {
+            "block_name": block_name,
+            "files": files,
+        }
+        resp = await self._client.post(url, json=payload)
+        resp.raise_for_status()
+
+    async def close_block(self, block_name: str) -> None:
+        url = f"{self._base_url}/blocks"
+        payload = {
+            "block_name": block_name,
+            "open_for_writing": 0,
+        }
+        resp = await self._client.put(url, json=payload)
+        resp.raise_for_status()
+
+    async def invalidate_block(self, block_name: str) -> None:
+        url = f"{self._base_url}/blocks"
+        payload = {
+            "block_name": block_name,
+            "block_access_type": "INVALID",
+        }
+        resp = await self._client.put(url, json=payload)
+        resp.raise_for_status()

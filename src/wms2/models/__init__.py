@@ -1,21 +1,22 @@
 from .common import StatusTransition
 from .dag import DAG, DAGNodeSpec, InputFile, LumiRange, MergeGroup
 from .enums import (
+    BlockStatus,
     CleanupPolicy,
     DAGStatus,
     NodeRole,
-    OutputStatus,
     RequestStatus,
     SiteStatus,
     SplittingAlgo,
     WorkflowStatus,
 )
-from .output_dataset import OutputDataset
+from .processing_block import ProcessingBlock
 from .request import ProductionStep, Request, RequestCreate, RequestUpdate
 from .site import Site
 from .workflow import PilotMetrics, StepProfile, Workflow
 
 __all__ = [
+    "BlockStatus",
     "CleanupPolicy",
     "DAG",
     "DAGNodeSpec",
@@ -24,9 +25,8 @@ __all__ = [
     "LumiRange",
     "MergeGroup",
     "NodeRole",
-    "OutputDataset",
-    "OutputStatus",
     "PilotMetrics",
+    "ProcessingBlock",
     "ProductionStep",
     "Request",
     "RequestCreate",

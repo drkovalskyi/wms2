@@ -108,9 +108,10 @@ class WorkflowManager:
                     "total_work_units": dag.total_work_units,
                 }
 
-        outputs = await self.db.get_output_datasets(workflow.id)
-        result["outputs"] = [
-            {"dataset": o.dataset_name, "status": o.status} for o in outputs
+        blocks = await self.db.get_processing_blocks(workflow.id)
+        result["processing_blocks"] = [
+            {"dataset": b.dataset_name, "status": b.status, "block_index": b.block_index}
+            for b in blocks
         ]
 
         return result

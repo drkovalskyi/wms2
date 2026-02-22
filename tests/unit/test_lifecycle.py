@@ -284,6 +284,8 @@ async def test_handle_active_processes_work_units(mock_repository, mock_condor, 
     mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
     mock_repository.get_dag = AsyncMock(return_value=dag)
 
+    block_id = uuid.uuid4()
+
     # Mock dag_monitor to return newly completed work units
     mock_dag_monitor = AsyncMock()
     mock_dag_monitor.poll_dag.return_value = DAGPollResult(
@@ -291,7 +293,7 @@ async def test_handle_active_processes_work_units(mock_repository, mock_condor, 
         status=DAGStatus.RUNNING,
         nodes_done=1,
         newly_completed_work_units=[
-            {"group_name": "mg_000000", "manifest": None},
+            {"block_id": block_id, "node_name": "mg_000000", "output_files": []},
         ],
     )
 
@@ -305,8 +307,11 @@ async def test_handle_active_processes_work_units(mock_repository, mock_condor, 
     await lm.evaluate_request(request)
 
     # Output manager called for the completed work unit
-    mock_output_manager.handle_merge_completion.assert_called_once()
-    mock_output_manager.process_outputs_for_workflow.assert_called_once_with(workflow.id)
+    mock_output_manager.handle_work_unit_completion.assert_called_once_with(
+        workflow.id, block_id,
+        {"block_id": block_id, "node_name": "mg_000000", "output_files": []},
+    )
+    mock_output_manager.process_blocks_for_workflow.assert_called_once_with(workflow.id)
 
 
 async def test_handle_active_no_output_manager_skips(mock_repository, mock_condor, settings):
@@ -320,13 +325,14 @@ async def test_handle_active_no_output_manager_skips(mock_repository, mock_condo
     mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
     mock_repository.get_dag = AsyncMock(return_value=dag)
 
+    block_id = uuid.uuid4()
     mock_dag_monitor = AsyncMock()
     mock_dag_monitor.poll_dag.return_value = DAGPollResult(
         dag_id=str(dag.id),
         status=DAGStatus.RUNNING,
         nodes_done=1,
         newly_completed_work_units=[
-            {"group_name": "mg_000000", "manifest": None},
+            {"block_id": block_id, "node_name": "mg_000000", "output_files": []},
         ],
     )
 

@@ -7,7 +7,7 @@ from wms2.db.repository import Repository
 from wms2.db.tables import (  # noqa: F401
     DAGHistoryRow,
     DAGRow,
-    OutputDatasetRow,
+    ProcessingBlockRow,
     RequestRow,
     SiteRow,
     WorkflowRow,

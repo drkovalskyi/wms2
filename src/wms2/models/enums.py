@@ -42,17 +42,12 @@ class DAGStatus(str, Enum):
     STOPPED = "stopped"
 
 
-class OutputStatus(str, Enum):
-    PENDING = "pending"
-    DBS_REGISTERED = "dbs_registered"
-    SOURCE_PROTECTED = "source_protected"
-    TRANSFERS_REQUESTED = "transfers_requested"
-    TRANSFERRING = "transferring"
-    TRANSFERRED = "transferred"
-    SOURCE_RELEASED = "source_released"
-    ANNOUNCED = "announced"
-    INVALIDATED = "invalidated"
+class BlockStatus(str, Enum):
+    OPEN = "open"
+    COMPLETE = "complete"
+    ARCHIVED = "archived"
     FAILED = "failed"
+    INVALIDATED = "invalidated"
 
 
 class SiteStatus(str, Enum):

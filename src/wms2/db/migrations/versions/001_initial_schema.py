@@ -114,29 +114,24 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
     )
 
-    # output_datasets
+    # processing_blocks
     op.create_table(
-        "output_datasets",
+        "processing_blocks",
         sa.Column("id", UUID(as_uuid=True), server_default=sa.text("gen_random_uuid()"), primary_key=True),
         sa.Column("workflow_id", UUID(as_uuid=True), sa.ForeignKey("workflows.id")),
+        sa.Column("block_index", sa.Integer, nullable=False),
         sa.Column("dataset_name", sa.String(500), nullable=False),
-        sa.Column("source_site", sa.String(100)),
-        sa.Column("dbs_registered", sa.Boolean, server_default="false"),
-        sa.Column("dbs_registered_at", sa.DateTime(timezone=True)),
-        sa.Column("source_rule_id", sa.String(100)),
-        sa.Column("source_protected", sa.Boolean, server_default="false"),
-        sa.Column("transfer_rule_ids", JSONB, server_default=sa.text("'[]'::jsonb")),
-        sa.Column("transfer_destinations", JSONB, server_default=sa.text("'[]'::jsonb")),
-        sa.Column("transfers_complete", sa.Boolean, server_default="false"),
-        sa.Column("transfers_complete_at", sa.DateTime(timezone=True)),
-        sa.Column("last_transfer_check", sa.DateTime(timezone=True)),
-        sa.Column("source_released", sa.Boolean, server_default="false"),
-        sa.Column("invalidated", sa.Boolean, server_default="false"),
-        sa.Column("invalidated_at", sa.DateTime(timezone=True)),
-        sa.Column("invalidation_reason", sa.Text),
-        sa.Column("dbs_invalidated", sa.Boolean, server_default="false"),
-        sa.Column("rucio_rules_deleted", sa.Boolean, server_default="false"),
-        sa.Column("status", sa.String(50), nullable=False, server_default="pending"),
+        sa.Column("total_work_units", sa.Integer, nullable=False),
+        sa.Column("completed_work_units", JSONB, server_default=sa.text("'[]'::jsonb")),
+        sa.Column("dbs_block_name", sa.String(500)),
+        sa.Column("dbs_block_open", sa.Boolean, server_default="false"),
+        sa.Column("dbs_block_closed", sa.Boolean, server_default="false"),
+        sa.Column("source_rule_ids", JSONB, server_default=sa.text("'{}'::jsonb")),
+        sa.Column("tape_rule_id", sa.String(100)),
+        sa.Column("last_rucio_attempt", sa.DateTime(timezone=True)),
+        sa.Column("rucio_attempt_count", sa.Integer, server_default="0"),
+        sa.Column("rucio_last_error", sa.Text),
+        sa.Column("status", sa.String(50), nullable=False, server_default="open"),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
     )
@@ -184,13 +179,13 @@ def upgrade() -> None:
         postgresql_where=sa.text("previous_version_request IS NOT NULL"),
     )
     op.create_index("idx_dag_history_dag", "dag_history", ["dag_id"])
-    op.create_index("idx_output_datasets_workflow", "output_datasets", ["workflow_id"])
-    op.create_index("idx_output_datasets_status", "output_datasets", ["status"])
+    op.create_index("idx_processing_blocks_workflow", "processing_blocks", ["workflow_id"])
+    op.create_index("idx_processing_blocks_status", "processing_blocks", ["status"])
 
 
 def downgrade() -> None:
     op.drop_table("dag_history")
-    op.drop_table("output_datasets")
+    op.drop_table("processing_blocks")
     op.drop_table("dags")
     op.drop_table("workflows")
     op.drop_table("sites")
