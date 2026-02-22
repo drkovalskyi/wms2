@@ -620,14 +620,16 @@ def _collect_adaptive_perf(
             except Exception:
                 pass
 
-        found_metrics = False
+        seen_metrics: set[str] = set()  # deduplicate by filename
         for search_dir in search_dirs:
             for mf in sorted(search_dir.glob("proc_*_metrics.json")):
                 if not metrics_pattern.search(mf.name):
                     continue
+                if mf.name in seen_metrics:
+                    continue
                 try:
                     data = json.loads(mf.read_text())
-                    found_metrics = True
+                    seen_metrics.add(mf.name)
                     for step_data in data:
                         if "step_index" not in step_data:
                             continue
@@ -642,8 +644,6 @@ def _collect_adaptive_perf(
                         })
                 except Exception as exc:
                     logger.warning("Failed to read %s: %s", mf, exc)
-            if found_metrics:
-                break
 
     # Read replan decisions
     decisions_path = wf_dir / "replan_decisions.json"
@@ -1000,8 +1000,8 @@ class MatrixRunner:
         # Step 7: Verify
         _verify(wf, result, wf_dir)
 
-        # Step 8: Sweep
-        sweep_post(wf.wf_id, keep_artifacts=(result.status != "passed"))
+        # Step 8: Sweep (keep artifacts for debugging)
+        sweep_post(wf.wf_id, keep_artifacts=True)
 
         return result
 

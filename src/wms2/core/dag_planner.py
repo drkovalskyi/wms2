@@ -924,7 +924,8 @@ if [[ -f manifest_tuned.json ]]; then
 fi
 
 # Override per-step multicore if --ncpus was passed
-if [[ "$OVERRIDE_NCPUS" -gt 0 && -f manifest.json ]]; then
+# Skip when adaptive tuning is active (manifest_tuned.json has per-step values)
+if [[ "$OVERRIDE_NCPUS" -gt 0 && -f manifest.json && ! -f manifest_tuned.json ]]; then
     echo "Overriding manifest multicore to $OVERRIDE_NCPUS"
     python3 -c "
 import json
