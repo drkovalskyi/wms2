@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.5.0 |
+| **Spec Version** | 2.6.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-20 |
+| **Date** | 2026-02-22 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -154,6 +154,8 @@ on the worker node.
 The sandbox/wrapper is part of the WMS2 system but its development is decoupled — it can be improved independently without changes to WMS2 core or DAGMan.
 
 **Work unit**: The atomic unit of progress in WMS2. A work unit is a self-contained set of processing jobs whose outputs feed a single merge job, producing one usable merged output. Each work unit is implemented as a merge group — a SUBDAG EXTERNAL containing a landing node, processing nodes, a merge node, and a cleanup node. WMS2 measures progress, calculates partial production fractions, and reports completion in terms of work units. A DAG consists of many work units running concurrently (throttled by `MAXJOBS`).
+
+**Processing block**: A group of work units that form the unit of DBS block registration and tape archival. When a request is split into work units, those work units are grouped into processing blocks based on expected output size and tape-friendliness criteria. A processing block maps 1:1 to a DBS block and a tape archival unit. As individual work units within a block complete, their files are registered in DBS (opening the block on first completion) and protected at the source site via Rucio. When all work units in a block complete, the DBS block is closed and a tape archival rule is created for the entire block as a single unit — ensuring contiguous tape writes and efficient recall. WMS2 prioritizes completing in-progress blocks before starting new ones.
 
 ### 2.4 Capacity Planning
 
@@ -490,63 +492,59 @@ class LumiRange(BaseModel):
     lumi_end: int
 ```
 
-#### 3.1.4 Output Dataset
+#### 3.1.4 Processing Block
 
 ```python
-class OutputDataset(BaseModel):
+class ProcessingBlock(BaseModel):
     """
-    Tracks an output dataset through the registration and transfer pipeline.
-    Created when merge nodes complete.
+    A group of work units that form the unit of DBS block registration and
+    tape archival. Maps 1:1 to a DBS block and a tape archival unit.
+
+    Lifecycle:
+      OPEN → work units complete, files registered in DBS, source protection rules created
+      COMPLETE → all work units done, DBS block closed, tape archival rule created
+      ARCHIVED → tape rule created successfully (terminal)
+      FAILED → Rucio call failed after all retries exhausted
     """
     id: UUID
     workflow_id: UUID
-    dataset_name: str              # /Primary/Processed/Tier
+    block_index: int                         # 0-based index within the workflow
+    dataset_name: str                        # /Primary/Processed/Tier
 
-    # DBS registration
-    dbs_registered: bool = False
-    dbs_registered_at: Optional[datetime]
+    # Work unit tracking
+    total_work_units: int                    # Number of work units in this block
+    completed_work_units: List[str] = []     # Node names of completed work units
 
-    # Rucio source protection
-    source_site: str
-    source_rule_id: Optional[str]
-    source_protected: bool = False
+    # DBS block
+    dbs_block_name: Optional[str]            # DBS block name (set on first file registration)
+    dbs_block_open: bool = False             # Block created in DBS
+    dbs_block_closed: bool = False           # Block closed in DBS (all files registered)
 
-    # Rucio transfer
-    transfer_rule_ids: List[str] = []
-    transfer_destinations: List[str] = []
-    transfers_complete: bool = False
-    transfers_complete_at: Optional[datetime]
-    last_transfer_check: Optional[datetime]  # Rate-limit transfer status polling
+    # Rucio source protection (one rule per completed work unit)
+    source_rule_ids: Dict[str, str] = {}     # work_unit_node_name → rule_id
 
-    # Source cleanup
-    source_released: bool = False
+    # Rucio tape archival (created when block completes)
+    tape_rule_id: Optional[str]              # Rucio rule ID for tape archival
 
-    # Invalidation tracking (for catastrophic failure recovery)
-    invalidated: bool = False
-    invalidated_at: Optional[datetime]
-    invalidation_reason: Optional[str]
-    dbs_invalidated: bool = False
-    rucio_rules_deleted: bool = False
+    # Retry tracking for Rucio failures
+    last_rucio_attempt: Optional[datetime]
+    rucio_attempt_count: int = 0
+    rucio_last_error: Optional[str]
 
     # State
-    status: OutputStatus
+    status: BlockStatus
 
     # Timestamps
     created_at: datetime
     updated_at: datetime
 
 
-class OutputStatus(str, Enum):
-    PENDING = "pending"
-    DBS_REGISTERED = "dbs_registered"
-    SOURCE_PROTECTED = "source_protected"
-    TRANSFERS_REQUESTED = "transfers_requested"
-    TRANSFERRING = "transferring"
-    TRANSFERRED = "transferred"
-    SOURCE_RELEASED = "source_released"
-    ANNOUNCED = "announced"
-    INVALIDATED = "invalidated"        # Outputs invalidated during catastrophic recovery
-    FAILED = "failed"
+class BlockStatus(str, Enum):
+    OPEN = "open"                  # Accepting work unit completions
+    COMPLETE = "complete"          # All work units done, ready for tape archival
+    ARCHIVED = "archived"          # Tape archival rule created (terminal)
+    FAILED = "failed"              # Rucio call failed after max retries
+    INVALIDATED = "invalidated"    # Outputs invalidated during catastrophic recovery
 ```
 
 #### 3.1.5 Site
@@ -662,28 +660,28 @@ CREATE TABLE dag_history (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE output_datasets (
+CREATE TABLE processing_blocks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workflow_id UUID REFERENCES workflows(id),
+    block_index INTEGER NOT NULL,
     dataset_name VARCHAR(500) NOT NULL,
-    source_site VARCHAR(100),
-    dbs_registered BOOLEAN DEFAULT FALSE,
-    dbs_registered_at TIMESTAMPTZ,
-    source_rule_id VARCHAR(100),
-    source_protected BOOLEAN DEFAULT FALSE,
-    transfer_rule_ids JSONB DEFAULT '[]',
-    transfer_destinations JSONB DEFAULT '[]',
-    transfers_complete BOOLEAN DEFAULT FALSE,
-    transfers_complete_at TIMESTAMPTZ,
-    last_transfer_check TIMESTAMPTZ,
-    source_released BOOLEAN DEFAULT FALSE,
-    -- Invalidation tracking (catastrophic failure recovery)
-    invalidated BOOLEAN DEFAULT FALSE,
-    invalidated_at TIMESTAMPTZ,
-    invalidation_reason TEXT,
-    dbs_invalidated BOOLEAN DEFAULT FALSE,
-    rucio_rules_deleted BOOLEAN DEFAULT FALSE,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    -- Work unit tracking
+    total_work_units INTEGER NOT NULL,
+    completed_work_units JSONB DEFAULT '[]',
+    -- DBS block
+    dbs_block_name VARCHAR(500),
+    dbs_block_open BOOLEAN DEFAULT FALSE,
+    dbs_block_closed BOOLEAN DEFAULT FALSE,
+    -- Rucio source protection (work_unit_name → rule_id)
+    source_rule_ids JSONB DEFAULT '{}',
+    -- Rucio tape archival
+    tape_rule_id VARCHAR(100),
+    -- Retry tracking for Rucio failures
+    last_rucio_attempt TIMESTAMPTZ,
+    rucio_attempt_count INTEGER DEFAULT 0,
+    rucio_last_error TEXT,
+    -- State
+    status VARCHAR(50) NOT NULL DEFAULT 'open',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -719,8 +717,8 @@ CREATE INDEX idx_requests_non_terminal ON requests(status)
 CREATE INDEX idx_requests_version_link ON requests(previous_version_request)
     WHERE previous_version_request IS NOT NULL;
 CREATE INDEX idx_dag_history_dag ON dag_history(dag_id);
-CREATE INDEX idx_output_datasets_workflow ON output_datasets(workflow_id);
-CREATE INDEX idx_output_datasets_status ON output_datasets(status);
+CREATE INDEX idx_processing_blocks_workflow ON processing_blocks(workflow_id);
+CREATE INDEX idx_processing_blocks_status ON processing_blocks(status);
 ```
 
 ---
@@ -764,14 +762,12 @@ CREATE INDEX idx_output_datasets_status ON output_datasets(status);
 │     - Return results to Lifecycle Manager for routing           │
 │                                                                 │
 │  6. Output Manager                                              │
-│     - Register outputs in DBS                                   │
-│     - Create Rucio source protection rules                      │
-│     - Request Rucio transfers to final destinations             │
-│     - Poll Rucio until transfers complete                       │
-│     - Release source protection                                 │
+│     - Register output files in DBS as work units complete       │
+│     - Create Rucio source protection rules per work unit        │
+│     - Close DBS block and create tape archival rule when        │
+│       processing block completes                                │
+│     - Retry Rucio calls with backoff on failure                 │
 │     - Invalidate outputs for catastrophic failure recovery      │
-│     - Rate-limit all DBS/Rucio API calls globally               │
-│     - Evaluate existing CMS micro-services before building      │
 │                                                                 │
 │  7. Site Manager                                                │
 │     - Track site resources                                      │
@@ -786,7 +782,7 @@ CREATE INDEX idx_output_datasets_status ON output_datasets(status);
 │  9. Metrics Collector                                           │
 │     - Workflow/DAG lifecycle metrics                             │
 │     - Admission queue state                                     │
-│     - Output Manager progress                                   │
+│     - Processing block progress                                 │
 │     - WMS2 service health                                       │
 │     - Note: per-job and pool metrics handled externally          │
 │                                                                 │
@@ -915,8 +911,8 @@ class RequestLifecycleManager:
 
             if result.status == DAGStatus.RUNNING:
                 for work_unit in result.newly_completed_work_units:
-                    await self.output_manager.handle_merge_completion(
-                        workflow.id, work_unit
+                    await self.output_manager.handle_work_unit_completion(
+                        workflow.id, work_unit["block_id"], work_unit
                     )
 
                 # Partial production: auto-stop when next step's fraction threshold reached
@@ -936,20 +932,23 @@ class RequestLifecycleManager:
             elif result.status == DAGStatus.FAILED:
                 await self.transition(request, RequestStatus.FAILED)
 
-        # Process outputs every cycle — don't wait for DAG to finish.
-        # As each work unit completes, its output needs DBS registration
-        # and Rucio source protection immediately to prevent data loss.
-        await self.output_manager.process_outputs_for_workflow(workflow.id)
+        # Process blocks every cycle — retry failed Rucio calls
+        await self.output_manager.process_blocks_for_workflow(workflow.id)
 
-        # Check if everything is done (DAG complete + all outputs announced)
+        # Check if everything is done (DAG complete + all blocks archived)
         if dag.status == DAGStatus.COMPLETED:
-            if await self._all_outputs_announced(workflow.id):
+            if await self._all_blocks_archived(workflow.id):
                 await self.transition(request, RequestStatus.COMPLETED)
-                # Clean up previous version outputs if this is a version increment
+                # Clean up previous version blocks if this is a version increment
                 if request.previous_version_request:
-                    await self.output_manager.cleanup_previous_version_outputs(
-                        request.previous_version_request, request.cleanup_policy
-                    )
+                    if request.cleanup_policy == CleanupPolicy.IMMEDIATE_CLEANUP:
+                        prev_wf = await self.db.get_workflow_by_request(
+                            request.previous_version_request)
+                        if prev_wf:
+                            await self.output_manager.invalidate_blocks(
+                                prev_wf.id,
+                                reason=f"Superseded by new version, immediate cleanup"
+                            )
 
     async def _handle_stopping(self, request: Request):
         """Monitor clean stop progress, prepare recovery when done."""
@@ -1053,9 +1052,9 @@ class RequestLifecycleManager:
         """
         request = await self.db.get_request(request_name)
 
-        # Invalidate outputs from failed version
+        # Invalidate processing blocks from failed version
         workflow = await self.db.get_workflow_by_request(request_name)
-        await self.output_manager.invalidate_outputs(
+        await self.output_manager.invalidate_blocks(
             workflow.id, reason=f"Catastrophic failure of {request_name}"
         )
 
@@ -1190,10 +1189,10 @@ class RequestLifecycleManager:
 
     # ── Helpers ─────────────────────────────────────────────────
 
-    async def _all_outputs_announced(self, workflow_id: UUID) -> bool:
-        """Check if all outputs for a workflow have reached ANNOUNCED status."""
-        outputs = await self.db.get_output_datasets(workflow_id)
-        return all(o.status == OutputStatus.ANNOUNCED for o in outputs)
+    async def _all_blocks_archived(self, workflow_id: UUID) -> bool:
+        """Check if all processing blocks for a workflow have reached ARCHIVED status."""
+        blocks = await self.db.get_processing_blocks(workflow_id)
+        return all(b.status == BlockStatus.ARCHIVED for b in blocks)
 
     # ── State Transition ────────────────────────────────────────
 
@@ -1232,11 +1231,11 @@ class WorkflowManager:
     async def get_workflow_status(self, workflow_id: UUID) -> WorkflowStatusReport:
         workflow = await self.db.get_workflow(workflow_id)
         dag = await self.db.get_dag(workflow.dag_id) if workflow.dag_id else None
-        outputs = await self.db.get_output_datasets(workflow_id)
+        blocks = await self.db.get_processing_blocks(workflow_id)
         return WorkflowStatusReport(
-            workflow=workflow, dag=dag, outputs=outputs,
-            progress_percent=self._calc_progress(dag, outputs),
-            estimated_completion=self._estimate_completion(workflow, dag, outputs),
+            workflow=workflow, dag=dag, blocks=blocks,
+            progress_percent=self._calc_progress(dag, blocks),
+            estimated_completion=self._estimate_completion(workflow, dag, blocks),
         )
 ```
 
@@ -1788,7 +1787,7 @@ class DAGMonitor:
         output manifest to get the dataset name and site, then record it as
         completed so it's not re-emitted on the next cycle.
 
-        Returns a list of dicts suitable for OutputManager.handle_merge_completion().
+        Returns a list of dicts suitable for OutputManager.handle_work_unit_completion().
         """
         already_completed = set(dag.completed_work_units or [])
         newly_completed = []
@@ -1808,9 +1807,10 @@ class DAGMonitor:
             if manifest:
                 newly_completed.append({
                     "node_name": node_name,
+                    "block_id": manifest["block_id"],
                     "dataset_name": manifest["dataset_name"],
                     "site": manifest["site"],
-                    "merge_output_lfn": manifest.get("output_lfn"),
+                    "output_files": manifest.get("output_files", []),
                 })
             already_completed.add(node_name)
 
@@ -1828,7 +1828,8 @@ class DAGMonitor:
 
         Each merge group's cleanup node writes a JSON manifest at a
         predictable path: <submit_dir>/<group_name>/merge_output.json
-        containing: dataset_name, site, output_lfn, file_count, total_bytes.
+        containing: block_id, dataset_name, site, output_files (list of
+        {lfn, size, checksum}), file_count, total_bytes.
         """
         manifest_path = f"{dag.submit_dir}/{group_node_name}/merge_output.json"
         try:
@@ -1917,218 +1918,227 @@ class DAGMonitor:
 
 ### 4.7 Output Manager
 
-The Output Manager handles the post-compute pipeline: DBS registration, Rucio source protection, transfer requests, transfer monitoring, and source release. This is the one area where WMS2 cannot be thin — it owns a long-lived, stateful process that outlives DAG execution and may take hours or days.
+The Output Manager handles the post-compute data pipeline: DBS file registration, Rucio source protection, DBS block closure, and tape archival rule creation. It operates at the **processing block** level — groups of work units that map 1:1 to DBS blocks and tape archival units.
 
-**Important**: Before building this component, existing CMS micro-services that handle output registration and data placement should be evaluated. If they are reusable with clean APIs, the Output Manager becomes a thin orchestrator calling those services.
+The design is fire-and-forget: WMS2 creates Rucio rules and moves on. It does not poll transfer status, manage source protection lifecycle, or track tape completion. Once a rule is created, Rucio owns the outcome. WMS2's only follow-up responsibility is retry with backoff if a Rucio call fails.
 
 ```python
 class OutputManager:
     """
-    Handles the post-compute pipeline: DBS registration, Rucio source
-    protection, transfer requests, transfer monitoring, and source release.
+    Handles the post-compute data pipeline at the processing block level.
+
+    Three interactions per work unit completion:
+      1. Register files in DBS (open block if first work unit)
+      2. Create Rucio source protection rule
+
+    One interaction per block completion:
+      3. Close DBS block, create tape archival rule
 
     Called by the Request Lifecycle Manager — not an independent loop.
     """
 
-    async def handle_merge_completion(self, workflow_id, merge_info):
-        output = OutputDataset(
-            workflow_id=workflow_id,
-            dataset_name=merge_info["dataset_name"],
-            source_site=merge_info["site"],
-            status=OutputStatus.PENDING,
-        )
-        await self.db.create_output_dataset(output)
+    # Retry configuration for Rucio failures
+    RUCIO_MAX_RETRY_DURATION = timedelta(days=3)    # Keep retrying for up to 3 days
+    RUCIO_BACKOFF_SCHEDULE = [60, 300, 1800, 7200, 14400, 28800]  # seconds: 1m, 5m, 30m, 2h, 4h, 8h
 
-    # Transfer status polling interval — avoid hammering Rucio every cycle
-    TRANSFER_POLL_INTERVAL = timedelta(minutes=5)
-
-    async def process_outputs_for_workflow(self, workflow_id: UUID):
+    async def handle_work_unit_completion(self, workflow_id: UUID, block_id: UUID,
+                                          merge_info: dict):
         """
-        Process all outputs for a single workflow through the output pipeline.
-
-        Priority ordering: DBS registration and Rucio source protection are
-        urgent (prevent data loss if the source site cleans up scratch space).
-        Transfer requests are next. Transfer status polling is lowest priority
-        and rate-limited to avoid excessive Rucio API calls.
-
-        Skips terminal outputs (ANNOUNCED, INVALIDATED, SOURCE_RELEASED).
+        Called when a work unit completes. Registers output files in DBS
+        and creates a Rucio source protection rule.
         """
-        outputs = await self.db.get_output_datasets(workflow_id)
+        block = await self.db.get_processing_block(block_id)
 
-        # Partition into priority tiers — process urgent work first
-        urgent = []        # PENDING, DBS_REGISTERED (need protection ASAP)
-        transfers = []     # SOURCE_PROTECTED (need transfer rules created)
-        polling = []       # TRANSFERS_REQUESTED, TRANSFERRING (can wait)
-        for output in outputs:
-            if output.status in (OutputStatus.PENDING, OutputStatus.DBS_REGISTERED):
-                urgent.append(output)
-            elif output.status == OutputStatus.SOURCE_PROTECTED:
-                transfers.append(output)
-            elif output.status in (OutputStatus.TRANSFERS_REQUESTED,
-                                   OutputStatus.TRANSFERRING):
-                polling.append(output)
-            # Skip terminal: ANNOUNCED, INVALIDATED, SOURCE_RELEASED
-
-        # Tier 1: DBS registration + source protection (highest priority)
-        for output in urgent:
-            try:
-                if output.status == OutputStatus.PENDING:
-                    await self._register_in_dbs(output)
-                elif output.status == OutputStatus.DBS_REGISTERED:
-                    await self._protect_source(output)
-            except RateLimitExceeded:
-                return  # Back off entirely — retry next cycle
-            except Exception as e:
-                logger.error(f"Output {output.id} protection failed: {e}")
-
-        # Tier 2: Create transfer rules
-        for output in transfers:
-            try:
-                await self._request_transfers(output)
-            except RateLimitExceeded:
-                return
-            except Exception as e:
-                logger.error(f"Output {output.id} transfer request failed: {e}")
-
-        # Tier 3: Poll transfer status (rate-limited per output)
-        now = datetime.utcnow()
-        for output in polling:
-            if (output.last_transfer_check and
-                    now - output.last_transfer_check < self.TRANSFER_POLL_INTERVAL):
-                continue  # Cooldown not elapsed — skip this output
-            try:
-                all_complete = await self._check_transfer_status(output)
-                if all_complete:
-                    await self._release_source_protection(output)
-                    await self.db.update_output_dataset(
-                        output.id, status=OutputStatus.ANNOUNCED
-                    )
-            except RateLimitExceeded:
-                return
-            except Exception as e:
-                logger.error(f"Output {output.id} transfer poll failed: {e}")
-
-    async def invalidate_outputs(self, workflow_id: UUID, reason: str):
-        """Invalidate all outputs for a workflow — DBS invalidation + Rucio rule deletion."""
-        outputs = await self.db.get_output_datasets(workflow_id)
-        for output in outputs:
-            # Invalidate in DBS
-            if output.dbs_registered:
-                await self.dbs_adapter.invalidate_dataset(output.dataset_name)
-
-            # Delete Rucio rules
-            rules_deleted = False
-            if output.source_rule_id:
-                await self.rucio_adapter.delete_rule(output.source_rule_id)
-                rules_deleted = True
-            for rule_id in output.transfer_rule_ids:
-                await self.rucio_adapter.delete_rule(rule_id)
-                rules_deleted = True
-
-            await self.db.update_output_dataset(output.id,
-                invalidated=True,
-                invalidated_at=datetime.utcnow(),
-                invalidation_reason=reason,
-                dbs_invalidated=output.dbs_registered,
-                rucio_rules_deleted=rules_deleted,
-                status=OutputStatus.INVALIDATED,
+        # 1. Register files in DBS (opens DBS block on first work unit)
+        if not block.dbs_block_open:
+            block_name = await self.dbs_adapter.open_block(
+                block.dataset_name, block.block_index,
+            )
+            await self.db.update_processing_block(block.id,
+                dbs_block_name=block_name, dbs_block_open=True,
             )
 
-    async def cleanup_previous_version_outputs(self, prev_request_name: str,
-                                               cleanup_policy: CleanupPolicy):
+        await self.dbs_adapter.register_files(
+            block_name=block.dbs_block_name or block_name,
+            files=merge_info["output_files"],
+        )
+
+        # 2. Create Rucio source protection rule
+        rule_id = await self._rucio_call_with_retry(
+            block, "create_rule",
+            self.rucio_adapter.create_rule,
+            dataset=block.dataset_name,
+            site=merge_info["site"],
+            lifetime=None,
+        )
+
+        # 3. Update block state
+        node_name = merge_info["node_name"]
+        source_rules = dict(block.source_rule_ids)
+        source_rules[node_name] = rule_id
+        completed = list(block.completed_work_units) + [node_name]
+
+        await self.db.update_processing_block(block.id,
+            completed_work_units=completed,
+            source_rule_ids=source_rules,
+        )
+
+        # 4. Check if block is now complete
+        if len(completed) >= block.total_work_units:
+            await self._complete_block(block)
+
+    async def _complete_block(self, block: ProcessingBlock):
         """
-        Called when a version-incremented request completes successfully.
-        Handles outputs from the previous version based on cleanup_policy.
+        All work units in the block are done. Close the DBS block
+        and create a tape archival rule for the entire block.
         """
-        prev_workflow = await self.db.get_workflow_by_request(prev_request_name)
-        if not prev_workflow:
+        # Close DBS block
+        await self.dbs_adapter.close_block(block.dbs_block_name)
+        await self.db.update_processing_block(block.id,
+            dbs_block_closed=True, status=BlockStatus.COMPLETE,
+        )
+
+        # Create tape archival rule for the whole block
+        tape_rule_id = await self._rucio_call_with_retry(
+            block, "create_tape_rule",
+            self.rucio_adapter.create_rule,
+            dataset=block.dataset_name,
+            rse_expression="tier=1&type=TAPE",  # Tape RSE expression
+        )
+
+        await self.db.update_processing_block(block.id,
+            tape_rule_id=tape_rule_id, status=BlockStatus.ARCHIVED,
+        )
+
+    async def process_blocks_for_workflow(self, workflow_id: UUID):
+        """
+        Process any blocks that need retry for failed Rucio calls.
+        Called by the Lifecycle Manager every cycle.
+        """
+        blocks = await self.db.get_processing_blocks(workflow_id)
+        for block in blocks:
+            if block.status == BlockStatus.COMPLETE:
+                # Block complete but tape rule not yet created — retry
+                await self._retry_tape_archival(block)
+            elif block.status == BlockStatus.OPEN and block.rucio_last_error:
+                # Source protection failed for a work unit — retry
+                await self._retry_source_protection(block)
+
+    async def _retry_tape_archival(self, block: ProcessingBlock):
+        """Retry tape archival rule creation with backoff."""
+        if not self._should_retry(block):
             return
-
-        if cleanup_policy == CleanupPolicy.IMMEDIATE_CLEANUP:
-            await self.invalidate_outputs(
-                prev_workflow.id,
-                reason=f"Superseded by new version, immediate cleanup"
+        try:
+            tape_rule_id = await self.rucio_adapter.create_rule(
+                dataset=block.dataset_name,
+                rse_expression="tier=1&type=TAPE",
             )
-        elif cleanup_policy == CleanupPolicy.KEEP_UNTIL_REPLACED:
-            # Outputs remain valid until explicitly cleaned up
-            logger.info(
-                f"Previous version {prev_request_name} outputs kept "
-                f"(keep_until_replaced policy)"
+            await self.db.update_processing_block(block.id,
+                tape_rule_id=tape_rule_id, status=BlockStatus.ARCHIVED,
+                rucio_last_error=None, rucio_attempt_count=0,
             )
+        except Exception as e:
+            await self._record_rucio_failure(block, e)
 
-    async def _register_in_dbs(self, output):
-        await self.dbs_adapter.inject_dataset(output.dataset_name, output.source_site)
-        await self.db.update_output_dataset(output.id,
-            dbs_registered=True, dbs_registered_at=datetime.utcnow(),
-            status=OutputStatus.DBS_REGISTERED,
-        )
+    async def _rucio_call_with_retry(self, block, operation, func, **kwargs):
+        """
+        Attempt a Rucio call. On failure, record the error for retry
+        on the next Lifecycle Manager cycle.
+        """
+        try:
+            result = await func(**kwargs)
+            return result
+        except Exception as e:
+            await self._record_rucio_failure(block, e)
+            raise
 
-    async def _protect_source(self, output):
-        rule_id = await self.rucio_adapter.create_rule(
-            dataset=output.dataset_name, site=output.source_site, lifetime=None,
-        )
-        await self.db.update_output_dataset(output.id,
-            source_rule_id=rule_id, source_protected=True,
-            status=OutputStatus.SOURCE_PROTECTED,
-        )
+    def _should_retry(self, block: ProcessingBlock) -> bool:
+        """Check if retry is allowed (within max duration, respecting backoff)."""
+        if not block.last_rucio_attempt:
+            return True
 
-    async def _request_transfers(self, output):
-        destinations = await self._determine_destinations(output)
-        rule_ids = []
-        for dest in destinations:
-            rule_ids.append(await self.rucio_adapter.create_rule(
-                dataset=output.dataset_name, site=dest,
+        # Check max duration
+        elapsed = datetime.utcnow() - block.created_at
+        if elapsed > self.RUCIO_MAX_RETRY_DURATION:
+            logger.error(
+                f"Block {block.id} ({block.dataset_name}): Rucio retry "
+                f"exhausted after {elapsed}. Last error: {block.rucio_last_error}. "
+                f"Marking FAILED. Manual intervention required."
+            )
+            # Dump full context for operator
+            self._dump_failure_context(block)
+            asyncio.create_task(self.db.update_processing_block(
+                block.id, status=BlockStatus.FAILED,
             ))
-        await self.db.update_output_dataset(output.id,
-            transfer_rule_ids=rule_ids, transfer_destinations=destinations,
-            status=OutputStatus.TRANSFERS_REQUESTED,
+            return False
+
+        # Check backoff schedule
+        attempt = min(block.rucio_attempt_count, len(self.RUCIO_BACKOFF_SCHEDULE) - 1)
+        backoff = timedelta(seconds=self.RUCIO_BACKOFF_SCHEDULE[attempt])
+        if datetime.utcnow() - block.last_rucio_attempt < backoff:
+            return False  # Backoff not elapsed
+
+        return True
+
+    async def _record_rucio_failure(self, block, error):
+        """Record a Rucio call failure for later retry."""
+        await self.db.update_processing_block(block.id,
+            last_rucio_attempt=datetime.utcnow(),
+            rucio_attempt_count=block.rucio_attempt_count + 1,
+            rucio_last_error=str(error),
+        )
+        logger.warning(
+            f"Block {block.id} ({block.dataset_name}): Rucio call failed "
+            f"(attempt {block.rucio_attempt_count + 1}): {error}"
         )
 
-    async def _check_transfer_status(self, output) -> bool:
-        all_ok = True
-        for rule_id in output.transfer_rule_ids:
-            if await self.rucio_adapter.get_rule_status(rule_id) != "OK":
-                all_ok = False
-                break
-        await self.db.update_output_dataset(output.id,
-            status=OutputStatus.TRANSFERRING if not all_ok else output.status,
-            last_transfer_check=datetime.utcnow(),
+    def _dump_failure_context(self, block: ProcessingBlock):
+        """Dump full block context for operator diagnosis."""
+        logger.error(
+            f"RUCIO FAILURE CONTEXT for block {block.id}:\n"
+            f"  dataset: {block.dataset_name}\n"
+            f"  block_index: {block.block_index}\n"
+            f"  work_units: {len(block.completed_work_units)}/{block.total_work_units}\n"
+            f"  dbs_block: {block.dbs_block_name} (closed={block.dbs_block_closed})\n"
+            f"  source_rules: {block.source_rule_ids}\n"
+            f"  tape_rule: {block.tape_rule_id}\n"
+            f"  attempts: {block.rucio_attempt_count}\n"
+            f"  last_error: {block.rucio_last_error}\n"
+            f"  first_attempt: {block.created_at}\n"
+            f"  last_attempt: {block.last_rucio_attempt}"
         )
-        return all_ok
 
-    async def _determine_destinations(self, output) -> List[str]:
+    async def invalidate_blocks(self, workflow_id: UUID, reason: str):
         """
-        Determine where to place replicas of a completed output dataset.
-
-        CMS data placement follows Rucio subscription rules defined by
-        Physics and Computing coordination. WMS2 does NOT decide placement
-        policy — it queries Rucio for existing subscriptions that match the
-        dataset pattern and creates transfer rules accordingly.
-
-        If no Rucio subscriptions match (e.g., test workflows or custom
-        user datasets), the output stays at the source site only.
+        Invalidate all processing blocks for a workflow during catastrophic
+        recovery. Deletes Rucio rules and invalidates DBS entries.
         """
-        # Query Rucio for subscriptions matching this dataset pattern
-        subscriptions = await self.rucio_adapter.list_matching_subscriptions(
-            dataset=output.dataset_name,
-        )
+        blocks = await self.db.get_processing_blocks(workflow_id)
+        for block in blocks:
+            # Delete Rucio source protection rules
+            for node_name, rule_id in block.source_rule_ids.items():
+                try:
+                    await self.rucio_adapter.delete_rule(rule_id)
+                except Exception as e:
+                    logger.warning(f"Failed to delete source rule {rule_id}: {e}")
 
-        destinations = set()
-        for sub in subscriptions:
-            # Each subscription specifies RSE expressions (e.g., "tier=1")
-            # Resolve to concrete sites
-            rses = await self.rucio_adapter.resolve_rse_expression(sub.rse_expression)
-            destinations.update(rses)
+            # Delete tape archival rule
+            if block.tape_rule_id:
+                try:
+                    await self.rucio_adapter.delete_rule(block.tape_rule_id)
+                except Exception as e:
+                    logger.warning(f"Failed to delete tape rule {block.tape_rule_id}: {e}")
 
-        # Never transfer to the source site (already has a replica)
-        destinations.discard(output.source_site)
-        return list(destinations)
+            # Invalidate DBS block
+            if block.dbs_block_open:
+                try:
+                    await self.dbs_adapter.invalidate_block(block.dbs_block_name)
+                except Exception as e:
+                    logger.warning(f"Failed to invalidate DBS block {block.dbs_block_name}: {e}")
 
-    async def _release_source_protection(self, output):
-        await self.rucio_adapter.delete_rule(output.source_rule_id)
-        await self.db.update_output_dataset(output.id,
-            source_released=True, status=OutputStatus.SOURCE_RELEASED,
-        )
+            await self.db.update_processing_block(block.id,
+                status=BlockStatus.INVALIDATED,
+            )
 ```
 
 ### 4.8 Error Handler (Workflow-Level)
@@ -2205,9 +2215,9 @@ class MetricsCollector:
             progress = dag.nodes_done / max(dag.total_nodes, 1)
             self.gauge("wms2_dag_progress", progress, labels={"dag_id": str(dag.id)})
 
-        for status in OutputStatus:
-            count = await self.db.count_output_datasets_by_status(status)
-            self.gauge("wms2_outputs", count, labels={"status": status.value})
+        for status in BlockStatus:
+            count = await self.db.count_processing_blocks_by_status(status)
+            self.gauge("wms2_blocks", count, labels={"status": status.value})
 ```
 
 ---
@@ -2422,7 +2432,7 @@ COMPLETED
 
 **In-flight waste**: When the clean stop triggers, work units already in flight continue briefly until `condor_rm` takes effect. The waste is bounded by `MAXJOBS MergeGroup` (typically ~10 work units) — the actual fraction may slightly overshoot the requested threshold.
 
-**Output continuity**: Work units that completed before the stop already have their outputs registered in DBS and protected in Rucio (per DD-4). The rescue DAG skips these completed work units. No outputs are lost or duplicated across stops.
+**Output continuity**: Work units that completed before the stop already have their files registered in DBS and source-protected in Rucio (per DD-4). Completed processing blocks have their tape archival rules created. The rescue DAG skips these completed work units. No outputs are lost or duplicated across stops.
 
 ### 6.3 Catastrophic Failure Recovery
 
@@ -2435,9 +2445,9 @@ Operator calls POST /api/v1/requests/{name}/restart
   │
   ▼
 Lifecycle Manager: handle_catastrophic_failure()
-  ├── Invalidate outputs from failed version:
-  │     ├── DBS: invalidate dataset entries
-  │     └── Rucio: delete protection and transfer rules
+  ├── Invalidate processing blocks from failed version:
+  │     ├── DBS: invalidate block entries
+  │     └── Rucio: delete source protection and tape archival rules
   ├── Create new request with processing_version + 1
   │     ├── Link: new.previous_version_request = old.request_name
   │     └── Link: old.superseded_by_request = new.request_name
@@ -2452,18 +2462,13 @@ Lifecycle Manager: handle_catastrophic_failure()
 | `keep_until_replaced` | Previous outputs remain valid and accessible until explicitly cleaned up | Safe default; allows manual verification before removing old data |
 | `immediate_cleanup` | Previous outputs are invalidated as soon as the new version completes | When storage pressure is high or outputs are known to be corrupt |
 
-**Output invalidation rollback table** — every forward output state has a corresponding undo operation:
+**Block invalidation rollback table** — every forward block state has a corresponding undo operation:
 
 | Forward State | Undo Operation |
 |---|---|
-| `PENDING` | Delete record (no external state) |
-| `DBS_REGISTERED` | `dbs_adapter.invalidate_dataset()` |
-| `SOURCE_PROTECTED` | `rucio_adapter.delete_rule(source_rule_id)` |
-| `TRANSFERS_REQUESTED` | `rucio_adapter.delete_rule()` for each transfer rule |
-| `TRANSFERRING` | `rucio_adapter.delete_rule()` for each transfer rule |
-| `TRANSFERRED` | `rucio_adapter.delete_rule()` for source + transfer rules |
-| `SOURCE_RELEASED` | No source rule to delete; delete transfer rules |
-| `ANNOUNCED` | `dbs_adapter.invalidate_dataset()` + delete remaining rules |
+| `OPEN` | Delete Rucio source protection rules for completed work units; invalidate DBS block if open |
+| `COMPLETE` | Delete Rucio source protection rules; invalidate DBS block |
+| `ARCHIVED` | Delete Rucio source protection rules + tape archival rule; invalidate DBS block |
 
 ### 6.4 POST Script Design
 
@@ -2619,11 +2624,12 @@ Response:
         "nodes_done": 4000,
         "nodes_failed": 60
     },
-    "outputs": [
+    "blocks": [
         {
             "dataset_name": "/Run2024A/RECO/v1",
-            "status": "transferring",
-            "transfers_complete": false
+            "block_index": 0,
+            "status": "open",
+            "work_units": "12/25"
         }
     ],
     "progress_percent": 41.8,
@@ -2824,15 +2830,15 @@ Token support is an external dependency (HTCondor + WLCG infrastructure), not a 
 
 | Component | Description | Priority |
 |---|---|---|
-| Output Manager | DBS registration, Rucio transfers | P0 |
-| Rucio Adapter | Rule creation, status, deletion | P0 |
-| Output Invalidation | DBS invalidation + Rucio rule cleanup for catastrophic recovery | P1 |
+| Output Manager | DBS registration, Rucio source protection, tape archival | P0 |
+| Rucio Adapter | Rule creation, deletion | P0 |
+| Block Invalidation | DBS invalidation + Rucio rule cleanup for catastrophic recovery | P1 |
 | Site Manager | CRIC sync, site control | P0 |
 | Dashboard API | Frontend data endpoints | P1 |
 | Observability | Grafana dashboards | P1 |
 | Documentation | Ops guide, API docs | P1 |
 
-**Deliverables**: Full request lifecycle working (submit → DAG → outputs registered → transfers complete → adaptive optimization on recovery); clean stop and catastrophic recovery tested; site management; production-like deployment; monitoring dashboards; operator documentation.
+**Deliverables**: Full request lifecycle working (submit → DAG → outputs registered → blocks archived → adaptive optimization on recovery); clean stop and catastrophic recovery tested; site management; production-like deployment; monitoring dashboards; operator documentation.
 
 ---
 
@@ -2915,8 +2921,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 | HTCondor API changes | High | Low | Abstract behind adapter, version pinning |
 | ReqMgr2 schema changes | Medium | Medium | Flexible JSONB storage, validation layer |
 | DAGMan status file parsing brittleness | Medium | Medium | Use condor_q as fallback; version-pin HTCondor |
-| Existing micro-services not reusable for Output Manager | Medium | Medium | Evaluate early (Phase 2); budget time for building if needed |
-| Output Manager complexity | Medium | Medium | Rate limiting, robust error handling, clear state machine |
+| Processing block sizing | Medium | Medium | Block too small → tape fragmentation; block too large → data sits on disk too long. Needs tuning with real production patterns |
 | First-round resource estimates inaccurate | Low | Medium | Auto-corrects from round 2 via step_metrics; conservative memory headroom on round 1 |
 | Feature gaps discovered late | High | Medium | Close collaboration with operations team |
 | Team bandwidth | Medium | High | Phased approach, MVP focus |
@@ -2947,6 +2952,9 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 16. **Default Thread Count for First Round**: What default thread count should the sandbox use when no `step_profile.json` exists? Should it match the request's `Multicore` field, or should WMS2 suggest a conservative default? Per-step CPU efficiency data suggests some steps are highly inefficient at high thread counts.
 17. **Metric Aggregation Strategy**: Should `step_metrics` use median or p90 for RSS? Median is robust to outliers but may underestimate memory needs for skewed distributions. P90 is safer but wastes memory for most jobs.
 18. **Minimum Sample Size for Reliable step_metrics**: How many completed work units are needed before `step_metrics` are considered reliable? With only 2–3 work units, one outlier can skew medians significantly. Should there be a minimum sample threshold below which the DAG Planner ignores step_metrics and falls back to request hints?
+19. **Processing Block Sizing**: What criteria determine how many work units go into a processing block? Options include: target total output size (e.g., 1–2 TB per block for efficient tape writes), fixed work unit count, or input-data-driven boundaries (e.g., one block per input DBS block). Too small → tape fragmentation; too large → data sits on disk unprotected by tape for too long. The right size depends on tape capacity (18 TB), expected file sizes (2–4 GB), and production timelines.
+20. **Block Completion Priority**: Should WMS2 actively prioritize completing in-progress blocks before starting new ones? This could mean biasing work unit scheduling within a DAG to finish partial blocks first, or limiting how many blocks can be open simultaneously. Tradeoff: strict block completion ordering may reduce site utilization if a block's remaining work units are waiting for specific sites.
+21. **Rucio Retry Max Duration**: What is the right default for `RUCIO_MAX_RETRY_DURATION`? Currently 3 days (covers a weekend outage). Should this be configurable per request? A campaign deadline might require shorter timeout with faster operator escalation.
 
 ---
 
@@ -2983,19 +2991,22 @@ This section captures significant design decisions and the reasoning behind them
 
 ### DD-4: Output processing starts immediately as work units complete
 
-**Decision**: The Lifecycle Manager calls `process_outputs_for_workflow()` every cycle for ACTIVE requests, not just after the DAG finishes. When a work unit completes, its output enters the pipeline immediately for DBS registration and Rucio source protection.
+**Decision**: The Lifecycle Manager calls `handle_work_unit_completion()` as soon as a work unit is detected as complete. DBS file registration and Rucio source protection happen immediately — they do not wait for the full processing block or DAG to complete.
 
-**Why**: Work unit outputs sit on the source site's scratch space. If we wait until the entire DAG completes (which could be hours or days later), the source site may clean up that scratch space. DBS registration and Rucio source protection are urgent — they must happen as soon as the merge output exists. This also ensures that partial production stops do not lose already-completed outputs.
+**Why**: Work unit outputs sit on the source site's local storage. If we wait until the entire processing block or DAG completes (which could be hours or days later), the source site may clean up that space. DBS registration and Rucio source protection are urgent — they must happen as soon as the merge output exists. This also ensures that partial production stops do not lose already-completed outputs.
 
-**Rejected alternative**: Process outputs only after DAG completion. Simpler but risks data loss for early-completing work units.
+**Rejected alternative**: Process outputs only after block or DAG completion. Simpler but risks data loss for early-completing work units.
 
-### DD-5: Priority-tiered output processing with transfer polling cooldown
+### DD-5: Processing blocks as the unit of DBS blocks and tape archival
 
-**Decision**: `process_outputs_for_workflow()` partitions outputs into three priority tiers: (1) DBS registration + source protection (urgent), (2) transfer rule creation, (3) transfer status polling (rate-limited to every 5 minutes per output).
+**Decision**: Work units are grouped into processing blocks at DAG planning time. Each processing block maps 1:1 to a DBS block and a tape archival unit. Individual work unit completions trigger DBS file registration and source protection (urgent). Block completion triggers DBS block closure and a single tape archival rule for the entire block.
 
-**Why**: With 300 workflows × dozens of outputs each, the Lifecycle Manager calls the Output Manager many times per cycle. Not all output work is equally urgent. DBS registration and source protection prevent data loss; transfer polling is informational and can tolerate minutes of staleness. Polling Rucio for every in-flight transfer every 60-second cycle would generate excessive API load for no benefit.
+**Why**: Writing thousands of 2–4 GB files individually to tape causes dramatic fragmentation — files scatter across many 18 TB tapes, making dataset recall extremely slow (requires mounting dozens of tapes). Production can stretch over weeks or months (partial production at high priority, remainder via rescue DAG at lower priority), so tape system buffers (1–2 days) cannot consolidate on their own. Grouping work units into blocks ensures contiguous tape writes and efficient recall. The block also serves as a natural DBS block boundary, giving downstream consumers a meaningful unit of data availability.
 
-**Rejected alternative**: Flat processing order (iterate all outputs, handle each based on status). Risks spending the cycle budget on transfer polling while newly-completed merge groups wait for protection.
+**Rejected alternatives**:
+- *Tape archival per work unit*: Causes tape fragmentation. Each 2–4 GB merged output would be written to tape independently, scattering across tapes.
+- *Tape archival per entire request*: Delays archival too long — a request with thousands of work units may take months. Data sits on disk unprotected by tape for the entire duration.
+- *Let Rucio/tape system consolidate*: Tape buffers only handle 1–2 day delays, not weeks/months. Rucio has no concept of "wait until related files accumulate."
 
 ### DD-6: Dataset versioning for catastrophic failure recovery
 
@@ -3017,11 +3028,13 @@ This section captures significant design decisions and the reasoning behind them
 
 **Why**: WMCore's per-job tracking database tables are the single largest source of scale problems: millions of rows, expensive status updates, complex state machines per job. HTCondor already tracks this. Duplicating it in WMS2 creates consistency problems and O(jobs) database load. WMS2 needs only DAG-level aggregates (nodes done, nodes failed) which DAGMan provides via the `.status` file.
 
-### DD-9: Rucio subscriptions drive data placement, not WMS2
+### DD-9: Fire-and-forget Rucio interaction
 
-**Decision**: `_determine_destinations()` queries Rucio for existing subscriptions matching the dataset pattern. WMS2 does not maintain its own placement policy.
+**Decision**: WMS2 creates Rucio rules (source protection per work unit, tape archival per block) and does not track their progress. Once a rule is created, Rucio owns the outcome — transfers, source cleanup, tape writes, and subscription-driven distribution are all Rucio's responsibility. WMS2's only follow-up is retry with backoff if a rule creation call fails.
 
-**Why**: CMS data placement policy is managed by Physics and Computing coordination through Rucio subscriptions. These policies change frequently (new tiers, quota adjustments, campaign-specific rules). If WMS2 duplicated this logic, it would need constant synchronization. Instead, WMS2 creates the source protection rule (preventing premature cleanup) and then lets Rucio's subscription mechanism handle the rest.
+**Why**: WMS2 is an orchestrator, not a data management system. Rucio already handles transfer scheduling, status tracking, subscription-driven placement, and cleanup. Duplicating any of this in WMS2 (polling transfer status, managing source protection lifecycle, determining placement destinations) would create a fragile shadow of Rucio's own state machine. The previous design had WMS2 polling Rucio transfer status every 5 minutes across hundreds of workflows, managing an 8-state output lifecycle, and querying subscriptions to determine destinations — all of which is Rucio's job. The simplified design reduces WMS2's Rucio interaction to two API calls: `create_rule()` for source protection (per work unit) and `create_rule()` for tape archival (per block).
+
+**Rejected alternative**: WMS2 tracks transfer completion, manages source protection lifecycle, queries Rucio subscriptions for placement. Over-engineered — WMS2 was doing Rucio's job.
 
 ### DD-10: Stuck request handling is status-aware, not one-size-fits-all
 
@@ -3062,7 +3075,7 @@ The design reuses the clean stop flow entirely — no new request states, no new
 | JobSubmitter | DAG Planner (DAG submission) | Uses `condor_submit_dag` |
 | BossAir | HTCondor/DAGMan Adapter | DAGMan owns job lifecycle |
 | StatusPoller | DAG Monitor | Monitors DAGMan status, not individual jobs |
-| JobAccountant | DAG Monitor + Output Manager | Split between monitoring and registration |
+| JobAccountant | DAG Monitor + Output Manager | Split between monitoring and DBS/Rucio registration |
 | ErrorHandler | POST script + Error Handler | Per-node in POST script, workflow-level in WMS2 |
 | RetryManager | DAGMan RETRY + POST script | Fully delegated with intelligent POST script |
 | ResourceControl | Site Manager + DAGMan MAXJOBS + Admission Controller | Multi-level throttling |

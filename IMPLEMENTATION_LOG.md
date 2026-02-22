@@ -2100,3 +2100,70 @@ Step 1 dominates wall time (81.5%) at only 30% CPU efficiency. The 30% is a weig
 ### Known Issues
 
 - The `events_per_job` in the report header counts generated (input) events, not filtered (output) events. For filtered workflows this is misleading — 301.0 reports "4000 events" but only 429 survive to output.
+
+## 2026-02-22 — Spec v2.6.0: Processing Blocks and Output Manager Redesign
+
+### Context
+
+The Output Manager design needed to address a fundamental tape archival problem: CMS workflows produce thousands of 2-4GB merged files over weeks or months of production. Tape drives write 18TB tapes — if files trickle in individually, they scatter across tape cartridges causing severe fragmentation and slow recall. Tape buffers compensate for 1-2 day transfer delays, not months-long production.
+
+### What Changed (spec v2.5.0 → v2.6.0)
+
+#### New Concept: Processing Block
+
+A **processing block** is a group of work units that forms the atomic unit of DBS block registration and tape archival. Requests are split into processing blocks at DAG planning time. Each block maps 1:1 to a DBS block and a tape archival rule.
+
+- Work unit completes → immediate DBS file registration + Rucio source protection rule (urgent, protects local storage)
+- Processing block completes (all work units done) → DBS block closure + single tape archival rule for the entire block
+- After creating rules, WMS2 is done — Rucio owns the outcome (fire-and-forget)
+
+#### Replaced OutputDataset with ProcessingBlock
+
+- **Old**: `OutputDataset` model with 10-state `OutputStatus` enum tracking registration, announcement, invalidation stages
+- **New**: `ProcessingBlock` model with 5-state `BlockStatus` enum (OPEN → COMPLETE → ARCHIVED, plus FAILED and INVALIDATED)
+- SQL table `output_datasets` → `processing_blocks` with fields for DBS state, Rucio rule tracking, and retry metadata
+
+#### Rewrote Output Manager (Section 4.7)
+
+Simplified from complex multi-stage pipeline to focused responsibilities:
+
+1. `handle_work_unit_completion()` — DBS file registration + source protection (per work unit)
+2. `_complete_block()` — DBS block closure + tape archival rule creation (per block)
+3. `process_blocks_for_workflow()` — retry loop for previously failed Rucio calls
+4. `invalidate_blocks()` — catastrophic recovery cleanup (delete rules, invalidate in DBS)
+
+#### Retry with Backoff
+
+Rucio call failures use exponential backoff: 1m → 5m → 30m → 2h → 4h → 8h, bounded by configurable `max_rucio_retry_duration` (default 3 days). On exhaustion, logs a full diagnostic dump and marks block as FAILED.
+
+#### Other Spec Changes
+
+- Section 2.3: Added processing block definition
+- Section 4.2: Updated Lifecycle Manager `_handle_active` to use new Output Manager methods
+- Section 4.6: Updated DAG Monitor merge manifest to include `block_id` and `output_files`
+- Section 6.2.1: Updated output continuity note for clean stop
+- Section 6.3: Simplified catastrophic recovery invalidation table (3 states instead of 8)
+- Section 7: Updated API example response to show blocks
+- Section 10.4: Updated Phase 4 deliverables
+- Section 14: Replaced Output Manager risks with processing block sizing risk
+- Section 15: Added OQ-19 (block sizing), OQ-20 (block completion priority), OQ-21 (retry max duration)
+- Section 16: Replaced DD-4 (immediate output processing), DD-5 (processing blocks), DD-9 (fire-and-forget Rucio)
+- Appendix A: Updated WMCore component mapping
+
+### Design Decisions
+
+1. **Fire-and-forget Rucio interaction**: WMS2 creates rules and does not track their progress. Rucio owns transfer execution, retry, and completion. WMS2's only follow-up is retrying rule creation on temporary failures.
+
+2. **Immediate source protection**: Source protection rules are created per work unit immediately on completion, not batched with block completion. Output files sit on the producing site's local storage which could be reclaimed.
+
+3. **Processing blocks as DBS/tape unit**: Grouping work units into blocks ensures contiguous tape writes. A single tape rule per block (containing all the block's files) lets Rucio write them together on tape, avoiding fragmentation.
+
+### Rucio Installation
+
+Also set up a local Rucio 39.3.0 instance for future integration testing:
+- Separate venv at `/mnt/shared/rucio/venv/`
+- PostgreSQL database `rucio` on existing pg16 instance
+- 3 POSIX RSEs: T2_LOCAL_A, T2_LOCAL_B, T2_LOCAL_C
+- Userpass auth (ddmlab/secret), no X.509 needed
+- Server management: `/mnt/shared/rucio/rucio-server.sh {start|stop|status}`
+- No automatic transfers (no FTS) — manual replica placement + `rucio-judge-evaluator --run-once` for rule evaluation
