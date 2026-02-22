@@ -1119,9 +1119,17 @@ for filename, finfo in file_map.items():
     tier = finfo['tier'] if isinstance(finfo, dict) else finfo
     unmerged_base = tier_to_unmerged.get(tier, '')
     if not unmerged_base:
-        # Try substring match
+        # Try EDM variant: NANOEDMAODSIM files match NANOAODSIM dataset
         for ds_tier, base in tier_to_unmerged.items():
-            if ds_tier.upper() in tier.upper() or tier.upper() in ds_tier.upper():
+            if tier.upper().replace(\"EDM\", \"\") == ds_tier.upper():
+                unmerged_base = base
+                break
+    if not unmerged_base:
+        # Fallback: longer tier must contain shorter, with small length diff
+        for ds_tier, base in tier_to_unmerged.items():
+            t_up, d_up = tier.upper(), ds_tier.upper()
+            longer, shorter = (t_up, d_up) if len(t_up) >= len(d_up) else (d_up, t_up)
+            if shorter in longer and len(longer) - len(shorter) <= 3:
                 unmerged_base = base
                 break
     if not unmerged_base:
@@ -1201,7 +1209,7 @@ with open(pset_path, 'a') as f:
 
 # ── Parallel step 0 execution ─────────────────────────────────
 run_step0_parallel() {
-    local n_par="$1" nthreads="$2" cmssw="$3" arch="$4" pset="$5" step_name="$6"
+    local n_par="$1" nthreads="$2" cmssw="$3" arch="$4" pset="$5" step_name="$6" use_tmpfs="$7"
     local events_per_inst=$((EVENTS_PER_JOB / n_par))
     local remainder=$((EVENTS_PER_JOB % n_par))
 
@@ -1255,14 +1263,20 @@ SETUPEOF
         apptainer exec --no-home "$CONTAINER" bash "$WORK_DIR/_setup_cmssw.sh"
     fi
 
-    # Use tmpfs for instance working directories to avoid virtiofs/FUSE
+    # Instance base directory: tmpfs (/dev/shm) avoids virtiofs/FUSE
     # file descriptor limits during gridpack extraction (29K+ files each).
     # ExternalLHEProducer extracts gridpacks into cmsRun's CWD, so placing
     # the CWD on tmpfs keeps extraction entirely in RAM.
-    local TMPFS_BASE="/dev/shm/wms2_step0_$$"
+    local TMPFS_BASE
+    if [[ "$use_tmpfs" == "true" ]]; then
+        TMPFS_BASE="/dev/shm/wms2_step0_$$"
+        echo "  Using tmpfs for parallel instances: $TMPFS_BASE"
+    else
+        TMPFS_BASE="$WORK_DIR/_step0_parallel"
+        echo "  Using disk for parallel instances: $TMPFS_BASE"
+    fi
     mkdir -p "$TMPFS_BASE"
     trap "rm -rf $TMPFS_BASE 2>/dev/null" EXIT
-    echo "  Using tmpfs for parallel instances: $TMPFS_BASE"
 
     # Create instance directories and fork
     local pids=()
@@ -1343,9 +1357,9 @@ INSTEOF
     done
     echo "  Collected outputs: $PREV_OUTPUT"
 
-    # Clean up tmpfs
+    # Clean up instance directories
     rm -rf "$TMPFS_BASE"
-    echo "  Cleaned up tmpfs"
+    echo "  Cleaned up parallel instance dirs"
 }
 
 # ── All-step pipeline split execution ─────────────────────────
@@ -1628,6 +1642,7 @@ run_cmssw_mode() {
 
     # Pipeline mode dispatch: n_pipelines > 1 runs all steps in parallel pipelines
     N_PIPELINES=$(python3 -c "import json; print(json.load(open('manifest.json')).get('n_pipelines', 1))")
+    SPLIT_TMPFS=$(python3 -c "import json; print(str(json.load(open('manifest.json')).get('split_tmpfs', False)).lower())")
     if [[ "$N_PIPELINES" -gt 1 ]]; then
         echo "Pipeline mode: $N_PIPELINES pipelines"
         run_all_steps_pipeline "$N_PIPELINES"
@@ -1673,7 +1688,7 @@ run_cmssw_mode() {
         if [[ $step_idx -eq 0 && "$N_PARALLEL" -gt 1 ]]; then
             echo "  n_parallel: $N_PARALLEL"
             STEP_START=$(date +%s)
-            run_step0_parallel "$N_PARALLEL" "$NTHREADS" "$CMSSW_VER" "$STEP_ARCH" "$PSET_PATH" "$STEP_NAME"
+            run_step0_parallel "$N_PARALLEL" "$NTHREADS" "$CMSSW_VER" "$STEP_ARCH" "$PSET_PATH" "$STEP_NAME" "$SPLIT_TMPFS"
             STEP_END=$(date +%s)
             STEP_WALL=$((STEP_END - STEP_START))
             echo "  Step $STEP_NAME completed in ${STEP_WALL}s (parallel, $N_PARALLEL instances)"
@@ -2749,9 +2764,19 @@ if root_files:
         tier_files = tier_to_files.get(ds_tier, [])
         step_idx = tier_to_step.get(ds_tier, -1)
         if not tier_files:
-            # Try case-insensitive substring match
+            # Try EDM variant: NANOEDMAODSIM files match NANOAODSIM dataset
             for tier, files in tier_to_files.items():
-                if ds_tier.upper() in tier.upper() or tier.upper() in ds_tier.upper():
+                if tier.upper().replace("EDM", "") == ds_tier.upper():
+                    tier_files = files
+                    step_idx = tier_to_step.get(tier, -1)
+                    break
+        if not tier_files:
+            # Fallback: longer tier name must contain shorter one
+            # (match MINIAODSIM->MINIAODSIM but not AODSIM->NANOAODSIM)
+            for tier, files in tier_to_files.items():
+                t_up, d_up = tier.upper(), ds_tier.upper()
+                longer, shorter = (t_up, d_up) if len(t_up) >= len(d_up) else (d_up, t_up)
+                if shorter in longer and len(longer) - len(shorter) <= 3:
                     tier_files = files
                     step_idx = tier_to_step.get(tier, -1)
                     break

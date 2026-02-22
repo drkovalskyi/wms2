@@ -439,7 +439,7 @@ def compute_all_step_split(
 
 def patch_wu_manifests(
     group_dir: Path, per_step: dict, n_pipelines: int = 1,
-    max_memory_mb: int = 0,
+    max_memory_mb: int = 0, split_tmpfs: bool = False,
 ) -> dict:
     """Create manifest_tuned.json with per-step nThreads and add to proc submit files.
 
@@ -462,6 +462,8 @@ def patch_wu_manifests(
 
     if n_pipelines > 1:
         manifest["n_pipelines"] = n_pipelines
+    if split_tmpfs:
+        manifest["split_tmpfs"] = True
 
     for si_str, tuning in per_step.items():
         si = int(si_str)
@@ -555,6 +557,8 @@ def _replan_cli(args: list[str]) -> None:
                         help="All-step pipeline split (supersedes --no-split)")
     parser.add_argument("--uniform-threads", action="store_true", default=False,
                         help="Use uniform nThreads across all steps (with --split-all-steps)")
+    parser.add_argument("--split-tmpfs", action="store_true", default=False,
+                        help="Use tmpfs for parallel split instance working directories")
     opts = parser.parse_args(args)
 
     wu0_dir = Path(opts.wu0_dir)
@@ -649,6 +653,7 @@ def _replan_cli(args: list[str]) -> None:
     patch_result = patch_wu_manifests(
         wu1_dir, tuning["per_step"], n_pipelines=n_pipelines,
         max_memory_mb=max_memory_mb,
+        split_tmpfs=opts.split_tmpfs,
     )
     print(f"Patched {patch_result['patched']} proc submit files")
 

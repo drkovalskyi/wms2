@@ -1012,6 +1012,7 @@ class MatrixRunner:
             + (f" --no-split" if not wf.adaptive_split else "")
             + (f" --split-all-steps" if wf.split_all_steps else "")
             + (f" --uniform-threads" if wf.split_uniform_threads else "")
+            + (f" --split-tmpfs" if wf.split_tmpfs else "")
         )
         replan_sub_path = wf_dir / "replan.sub"
         replan_sub_path.write_text("\n".join([
