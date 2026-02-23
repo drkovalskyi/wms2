@@ -417,6 +417,23 @@ def _print_adaptive_report(
             out.write(f"  Step 0 split: {actual_n_par} instances"
                       f" (ideal: {ideal_n_par}, memory-constrained)\n")
 
+    # Probe data (if probe split was used)
+    probe_data = adaptive.get("probe_data", {})
+    if probe_data:
+        cg = probe_data.get("per_instance_cgroup_mb", 0)
+        rss = probe_data.get("max_instance_rss_mb", 0)
+        n_inst = probe_data.get("num_instances", 0)
+        mem_src = step0_tuning.get("memory_source", "") if per_step_tuning else ""
+        inst_mem = step0_tuning.get("instance_mem_mb", 0) if per_step_tuning else 0
+        out.write(f"  Probe: {n_inst} instances,"
+                  f" {round(cg)} MB/instance cgroup,"
+                  f" {round(rss)} MB/instance RSS"
+                  f"  [{mem_src}]\n")
+        if inst_mem > 0 and ideal_mem > 0 and orig_nt > 0:
+            out.write(f"  To split {ideal_n_par}×: need"
+                      f" {ideal_mem // orig_nt} MB/core"
+                      f" (current max: {max_mem_per_core} MB/core)\n")
+
     # Round 1 table
     r1_cpu_pct = 0.0
     if round1_steps:

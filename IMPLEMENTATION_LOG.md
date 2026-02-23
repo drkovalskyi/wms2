@@ -2396,3 +2396,200 @@ Performance (300.0, single round, no adaptation):
 - 0.37 ev/s, 21 ev/core-hour
 - 1078s processing, 55s merge, 1270s total
 - Peak RSS: 7348 MB (step 2 DRPremix)
+
+---
+
+## Adaptive Job Split (391.0/391.1)
+
+**Date**: 2026-02-23
+
+### Motivation
+
+351.0/351.1 results showed step 0 (GEN) is the bottleneck: 86% of wall time, only 27% CPU efficiency at 8 threads (effective 2.2 cores). The previous adaptive model (350.x/351.x) splits step 0 into parallel instances *within* each job, but has two drawbacks:
+1. **Tail effect**: Slower instance dictates wall time, idle cores on fast instance
+2. **Resource lock-in**: All 8 cores stay reserved even when only 2 are needed
+
+### Design: Job-level splitting
+
+Instead of splitting step 0 inside the sandbox, split the jobs themselves — run N× more jobs with N× fewer cores each. Same total core allocation, but jobs finish independently and release resources faster.
+
+Example: 8 jobs × 8 cores → 32 jobs × 2 cores, each processing 12 events instead of 50.
+
+### Algorithm: `compute_job_split()`
+
+Based on Round 1 step 0 metrics:
+1. `eff_cores = cpu_eff_step0 × original_nthreads` (e.g., 0.27 × 8 = 2.18)
+2. `tuned_threads = nearest_power_of_2(eff_cores)` → 2, capped to [1, original]
+3. `job_multiplier = original_nthreads // tuned_threads` → 4
+4. All steps run with `tuned_threads` (request_cpus = tuned_threads)
+5. `new_events_per_job = original_events_per_job // job_multiplier`
+6. `new_num_jobs = original_num_jobs × job_multiplier`
+7. `new_request_memory = tuned_threads × max_memory_per_core_mb`
+
+### Key implementation: `rewrite_wu_for_job_split()`
+
+The replan node rewrites WU1's DAG files between work units:
+- Parses existing proc_*.sub as template
+- Generates new proc submit files with tuned resources
+- Rewrites group.dag with new proc node entries + dependencies
+- Writes manifest_tuned.json with all steps at tuned_threads
+
+This works because DAGMan reads SUBDAG EXTERNAL files when the node is ready to execute, not at outer DAG submission.
+
+### Tmpfs for non-parallel step 0
+
+Added tmpfs support to the regular step 0 path in dag_planner.py (not just the parallel split path). When `SPLIT_TMPFS=true` and `N_PARALLEL<=1`, step 0 runs from /dev/shm to avoid virtiofs overhead for gridpack extraction.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `tests/matrix/definitions.py` | Added `job_split: bool = False` field |
+| `tests/matrix/adaptive.py` | New `compute_job_split()`, `rewrite_wu_for_job_split()`, `--job-split` CLI flag |
+| `src/wms2/core/dag_planner.py` | Tmpfs support for non-parallel step 0 |
+| `tests/matrix/catalog.py` | Added 391.0 and 391.1 workflow definitions |
+| `tests/matrix/sets.py` | Added 391.0 to integration set |
+| `tests/matrix/runner.py` | Wired `--job-split`, `--events-per-job`, `--num-jobs` flags |
+| `tests/matrix/reporter.py` | Job split display in adaptive report (R2 job count, memory) |
+
+### Workflow Definitions
+
+| WF | Title | Events/job | Jobs | Timeout |
+|---|---|---|---|---|
+| 391.0 | DY2L adaptive job split (50 ev) | 50 | 8 | 7200s |
+| 391.1 | DY2L adaptive job split (500 ev) | 500 | 8 | 10800s |
+
+### Expected Behavior (391.0)
+
+- Round 1: 8 jobs × 8 cores × 50 events (same as 351.0)
+- Replan: step 0 eff=27% → ideal 2T → multiplier=4 → 32 jobs × 2 cores × 12 events
+- Round 2: 32 jobs at 2 cores each, all steps at 2 threads, tmpfs for step 0
+
+### Verification
+
+- `python -m tests.matrix -l 391.0` — lists workflow, shows runnable
+- `compute_job_split()` unit test: 27% eff × 8T → 2T, 4× multiplier, 32 jobs × 12 ev
+- Full run 391.0: **PASSED** (4436s)
+
+### Bugs Found and Fixed During 391.0 Testing
+
+**Bug 1: tmpfs CWD not propagated to apptainer step runner**
+- `run_step_apptainer()` creates `_step_runner.sh` with `cd $WORK_DIR`, but when running
+  from tmpfs, WORK_DIR still pointed to the original execute directory
+- cmsRun couldn't find `cfg.py` (copied to tmpfs but cmsRun ran from original dir)
+- Fix: temporarily override `WORK_DIR` to tmpfs path before calling `run_step_apptainer()`,
+  restore after. Also added `/dev/shm` to apptainer bind mounts.
+
+**Bug 2: `--input none` treated as real LFN**
+- `rewrite_wu_for_job_split()` wrote `--input none` in proc submit files
+- `lfn_to_xrootd("none")` converted to `root://cms-xrd-global.cern.ch/none`
+- This got injected as `fileNames` into GEN's `EmptySource` → CMSSW Configuration error
+- Fix: use `synthetic://gen/events_{fe}_{le}` instead of `none`
+
+**Bug 3: Memory formula underestimated at low nthreads**
+- Formula `tuned_nthreads × max_memory_per_core_mb` → 1 × 2500 = 2500 MB
+- But CMSSW base memory (~70%) doesn't scale with threads; step 1 (SIM) needs ~4000+ MB even at 1T
+- All 64 single-threaded jobs hit cgroup OOM (2560 MB limit)
+- Fix: floor `tuned_nthreads` at 2 (1T too aggressive for memory), and use
+  `max(formula, peak_observed_rss × 1.1)` as memory request
+
+### 391.0 Results (8 jobs × 8 cores baseline)
+
+| Metric | Round 1 (8T, 8 jobs) | Round 2 (2T, 32 jobs) | Change |
+|--------|---------------------|----------------------|--------|
+| Events | 400 | 384 | |
+| Processing wall | 1508s | 1764s | +17% |
+| CPU efficiency | 17% | 62% | **+45pp** |
+| Peak RSS/job | 6491 MB | 3655 MB | -44% |
+
+Round 2 wall time higher because 6 of 32 jobs queued for memory (128 GB VM limit).
+In a real cluster, all 32 would run concurrently.
+
+### Catalog Changes: Plumbing Test Optimization
+
+Reduced num_jobs for .0 plumbing tests to allow parallel test execution on the 64-core VM:
+- 300.0: 8 → 2 jobs (16 cores, was 64)
+- 350.0: 8 → 2 jobs
+- 351.0: 8 → 2 jobs
+- 391.0: 8 → 2 jobs
+- 351.1: 8 → 4 jobs (performance test, moderate reduction)
+
+---
+
+## Probe Split + Events Count Change
+
+**Date**: 2026-02-23
+
+### Problem
+
+351.1 (adaptive step 0 split, 4 jobs × 500 ev) OOM'd in R2 — jobs hit 18.9 GB against 20 GB cgroup limit. The replan node estimated R2 memory theoretically (SANDBOX_OVERHEAD + n_par × (R1_RSS + TMPFS)), but FJR RSS only measures process RSS (~1550 MB), not tmpfs (~3500 MB from gridpack extraction). The actual cgroup footprint was ~5000 MB/instance, not the estimated 3050 MB.
+
+### Solution: Probe Node
+
+Run one R1 job as a "probe" — split it into 2×(N/2)T instances within the same slot, with `max_memory_per_core × ncores` reservation. The probe's HTCondor cgroup peak (Image size) becomes ground truth for R2 memory estimation.
+
+### Key Design Decisions
+
+- **Probe is the last proc node**: Doesn't extend critical path — other jobs run in parallel
+- **request_cpus stays at 8**: Same slot size, no extra concurrent jobs
+- **Cgroup peak > RSS**: HTCondor's `ImageSize` captures RSS + tmpfs + page cache — what the cgroup actually enforces. FJR's `PeakValueRss` only measures process RSS.
+- **10% safety margin on cgroup data** (vs larger margins for theoretical estimates)
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `definitions.py` | Added `probe_split: bool` field |
+| `catalog.py` | Events 50→40, 500→400; `probe_split=True` on 351.0/351.1 |
+| `runner.py` | `_inject_probe_node()`, cgroup CPU monitoring, probe wiring |
+| `adaptive.py` | `analyze_probe_metrics()`, cgroup-aware memory model |
+| `reporter.py` | Probe data and operator guidance in report |
+
+### Events Change
+
+Changed event counts to avoid splitting edge cases (N must be divisible by n_parallel):
+- 50→40: all `.0` cached workflows
+- 500→400: all `.1` cached workflows
+- Unchanged: 350.1 (10 ev), 300.1 (1000 ev)
+
+### Memory Model (3-tier)
+
+```
+1. probe_cgroup (best):  instance_mem = cgroup_per_instance × 1.10
+2. probe_rss (fallback): instance_mem = rss + TMPFS_ESTIMATE
+3. theoretical:          instance_mem = R1_avg_rss + TMPFS_ESTIMATE
+total = SANDBOX_OVERHEAD + n_parallel × instance_mem
+```
+
+### Cgroup CPU Monitoring
+
+Replaced system-wide `/proc/stat` CPU tracking with HTCondor cgroup-based monitoring at `/sys/fs/cgroup/system.slice/htcondor/cpu.stat`. Enables meaningful CPU timeline plots even when running concurrent workflows.
+
+### Verification Results
+
+**351.0** (2 jobs × 40 ev): PASSED, 2708s
+- Probe cgroup: 9957 MB → 4978 MB/instance
+- R2 n_parallel=2 (correctly sized, not 4)
+- R2 peak memory: 5492 MB/job (within 20 GB)
+
+**351.1** (4 jobs × 400 ev): PASSED, 7783s
+- Probe cgroup: 10308 MB → 5154 MB/instance
+- R2 n_parallel=2 (ideal=4 needs 25677 MB, capped at 20000 MB)
+- R2 peak memory: 7606 MB/job (within 20 GB)
+
+| Metric | R1 (3 jobs, 1×8T) | R2 (4 jobs, 2×4T) | Change |
+|--------|-------------------|-------------------|--------|
+| Step 0 wall | 3405s | 2310s | -32% |
+| Total wall/job | 3951s | 2828s | -28% |
+| Ev/core-hour | 45.6 | 63.6 | **+40%** |
+| Peak memory/job | 6795 MB | 7606 MB | +12% |
+
+### Operator Guidance in Report
+
+Report now shows actionable memory info:
+```
+Memory needed: 25677 MB (3209 MB/core) — capped at 20000 MB
+Step 0 split: 2 instances (ideal: 4, memory-constrained)
+Probe: 2 instances, 5154 MB/instance cgroup, 1663 MB/instance RSS  [probe_cgroup]
+To split 4×: need 3209 MB/core (current max: 2500 MB/core)
+```

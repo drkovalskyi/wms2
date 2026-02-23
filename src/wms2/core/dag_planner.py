@@ -1062,7 +1062,7 @@ STEPEOF
     chmod +x _step_runner.sh
 
     # Bind paths: CVMFS, working dir, temp, and optional site config / credentials
-    local BIND="/cvmfs,/tmp,$(pwd)"
+    local BIND="/cvmfs,/tmp,/dev/shm,$(pwd)"
     [[ -d /mnt/creds ]]        && BIND="$BIND,/mnt/creds"
     [[ -d /mnt/shared ]]       && BIND="$BIND,/mnt/shared"
     [[ -d "$SITE_CFG" ]]       && BIND="$BIND,$SITE_CFG"
@@ -1769,22 +1769,65 @@ with open(pset, 'a') as f:
         echo "  cmsRun $CMSRUN_ARGS"
         STEP_START=$(date +%s)
 
-        # Execute: determine if we need apptainer
-        CONTAINER=$(resolve_container "$STEP_ARCH")
-        if [[ -z "$CONTAINER" ]]; then
-            echo "  execution: native (host OS matches $STEP_ARCH)"
-            run_step_native "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
-        else
-            echo "  execution: apptainer ($CONTAINER)"
-            run_step_apptainer "$CONTAINER" "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+        # Tmpfs for non-parallel step 0: use /dev/shm for gridpack extraction
+        # (same benefit as parallel split tmpfs, but for single-instance jobs)
+        STEP0_TMPFS=""
+        if [[ $step_idx -eq 0 && "$SPLIT_TMPFS" == "true" && "$N_PARALLEL" -le 1 ]]; then
+            STEP0_TMPFS="/dev/shm/wms2_step0_$$"
+            mkdir -p "$STEP0_TMPFS"
+            echo "  Using tmpfs for step 0: $STEP0_TMPFS"
+            # Copy PSet to tmpfs working directory
+            cp "$PSET_PATH" "$STEP0_TMPFS/"
+            # Update CMSRUN_ARGS to use tmpfs PSet path
+            CMSRUN_ARGS="-j report_step${step_num}.xml $STEP0_TMPFS/$(basename $PSET_PATH)"
         fi
 
-        STEP_RC=$?
+        # Execute: determine if we need apptainer
+        CONTAINER=$(resolve_container "$STEP_ARCH")
+        if [[ -n "$STEP0_TMPFS" ]]; then
+            # Run from tmpfs directory — gridpack extracts to CWD
+            ORIG_DIR="$PWD"
+            cd "$STEP0_TMPFS"
+            # Update FJR path to be absolute
+            CMSRUN_ARGS="-j ${ORIG_DIR}/report_step${step_num}.xml $(basename $PSET_PATH)"
+            # Override WORK_DIR so run_step_* functions cd back to tmpfs
+            # after CMSSW setup (they do `cd $WORK_DIR` internally)
+            SAVED_WORK_DIR="$WORK_DIR"
+            WORK_DIR="$STEP0_TMPFS"
+            if [[ -z "$CONTAINER" ]]; then
+                echo "  execution: native (tmpfs CWD)"
+                run_step_native "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+            else
+                echo "  execution: apptainer (tmpfs CWD, $CONTAINER)"
+                run_step_apptainer "$CONTAINER" "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+            fi
+            STEP_RC=$?
+            WORK_DIR="$SAVED_WORK_DIR"
+            # Copy ROOT outputs back to work dir
+            for rf in *.root; do
+                [[ -f "$rf" ]] && cp "$rf" "$ORIG_DIR/"
+            done
+            cd "$ORIG_DIR"
+            rm -rf "$STEP0_TMPFS"
+            echo "  Cleaned tmpfs: $STEP0_TMPFS"
+        else
+            if [[ -z "$CONTAINER" ]]; then
+                echo "  execution: native (host OS matches $STEP_ARCH)"
+                run_step_native "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+            else
+                echo "  execution: apptainer ($CONTAINER)"
+                run_step_apptainer "$CONTAINER" "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
+            fi
+            STEP_RC=$?
+        fi
+
         STEP_END=$(date +%s)
         STEP_WALL=$((STEP_END - STEP_START))
 
         if [[ $STEP_RC -ne 0 ]]; then
             echo "ERROR: Step $STEP_NAME (cmsRun) failed with exit code $STEP_RC" >&2
+            # Clean up tmpfs on failure too
+            [[ -n "$STEP0_TMPFS" && -d "$STEP0_TMPFS" ]] && rm -rf "$STEP0_TMPFS"
             exit $STEP_RC
         fi
 

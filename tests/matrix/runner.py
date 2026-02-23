@@ -89,9 +89,32 @@ def _check_disk_space(num_concurrent_jobs: int, output_dir: Path) -> None:
 
 # ── CPU monitoring ───────────────────────────────────────────
 
+# HTCondor cgroup v2 CPU accounting — tracks only HTCondor job CPU,
+# not system-wide utilization.  Safe to use with concurrent tests.
+_HTCONDOR_CGROUP_CPU = "/sys/fs/cgroup/system.slice/htcondor/cpu.stat"
+
+
+def _read_cgroup_cpu_usec() -> int:
+    """Read usage_usec from HTCondor parent cgroup.
+
+    Returns total CPU microseconds consumed by all HTCondor jobs.
+    Falls back to 0 if cgroup file is unavailable.
+    """
+    try:
+        with open(_HTCONDOR_CGROUP_CPU) as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
 
 def _read_cpu_jiffies() -> tuple[int, int]:
-    """Read total CPU jiffies from /proc/stat.  Returns (busy, total)."""
+    """Read total CPU jiffies from /proc/stat.  Returns (busy, total).
+
+    Legacy fallback — used only when cgroup accounting is unavailable.
+    """
     try:
         with open("/proc/stat") as f:
             for line in f:
@@ -115,6 +138,15 @@ def _cpu_percent(prev_busy: int, prev_total: int, cur_busy: int, cur_total: int)
         return 0.0
     ncpus = os.cpu_count() or 1
     return (db / dt) * ncpus * 100
+
+
+def _cgroup_cpu_cores(prev_usec: int, cur_usec: int, interval_sec: float) -> float:
+    """Convert cgroup CPU delta to cores (100% = 1 core, in % units)."""
+    if interval_sec <= 0:
+        return 0.0
+    delta_usec = cur_usec - prev_usec
+    # usec -> sec, then convert to % (1 core = 100%)
+    return (delta_usec / 1_000_000) / interval_sec * 100
 
 
 # ── Result tracking ──────────────────────────────────────────
@@ -796,6 +828,91 @@ def _parse_dagman_times_from_dir(gd: Path, perf: PerfData) -> None:
         perf.time_cleanup += (cleanup_end - cleanup_start).total_seconds()
 
 
+# ── Probe node injection ─────────────────────────────────────
+
+
+def _inject_probe_node(wf: WorkflowDef, wu0_dir: Path) -> str | None:
+    """Modify the last proc node in WU0 to run as a 2×(N/2)T probe.
+
+    The probe splits step 0 into 2 parallel instances, each with half the
+    cores, inside the same 8-core slot.  Its actual RSS becomes ground truth
+    for R2 memory estimation (replacing the theoretical extrapolation).
+
+    Steps:
+    1. Read manifest.json from WU0 merge group dir
+    2. Create manifest_tuned.json with steps[0].multicore = ncores//2,
+       steps[0].n_parallel = 2, and split_tmpfs if enabled
+    3. Patch ONLY the last proc submit file:
+       - Add manifest_tuned.json to transfer_input_files
+       - Set request_memory = max_memory_per_core × ncores
+    4. Guard: skip if < 2 proc nodes
+
+    Returns the probe node name (e.g. "proc_000001") or None if skipped.
+    """
+    # Find proc submit files
+    proc_subs = sorted(wu0_dir.glob("proc_*.sub"))
+    if len(proc_subs) < 2:
+        logger.info("Probe split skipped: need >= 2 proc nodes, have %d", len(proc_subs))
+        return None
+
+    # Read manifest.json
+    manifest_path = wu0_dir / "manifest.json"
+    if not manifest_path.exists():
+        logger.warning("Probe split skipped: no manifest.json in %s", wu0_dir)
+        return None
+
+    manifest = json.loads(manifest_path.read_text())
+    steps = manifest.get("steps", [])
+    if not steps:
+        logger.warning("Probe split skipped: manifest has no steps")
+        return None
+
+    ncores = wf.multicore
+    half_cores = max(ncores // 2, 2)
+
+    # Create manifest_tuned.json for probe
+    manifest["steps"][0]["multicore"] = half_cores
+    manifest["steps"][0]["n_parallel"] = 2
+    if wf.split_tmpfs:
+        manifest["split_tmpfs"] = True
+    tuned_path = wu0_dir / "manifest_tuned.json"
+    tuned_path.write_text(json.dumps(manifest, indent=2))
+
+    # Patch last proc submit file
+    last_sub = proc_subs[-1]
+    content = last_sub.read_text()
+
+    # Add manifest_tuned.json to transfer_input_files
+    tif_match = re.search(
+        r"^(transfer_input_files\s*=\s*)(.+)$", content, re.MULTILINE
+    )
+    if tif_match:
+        prefix = tif_match.group(1)
+        files = tif_match.group(2).rstrip()
+        new_line = f"{prefix}{files}, {tuned_path}"
+        content = content[:tif_match.start()] + new_line + content[tif_match.end():]
+
+    # Set request_memory = max_memory_per_core × ncores
+    max_memory_mb = wf.max_memory_per_core_mb * ncores
+    mem_match = re.search(
+        r"^(request_memory\s*=\s*)(\d+)", content, re.MULTILINE
+    )
+    if mem_match:
+        content = (content[:mem_match.start()]
+                   + f"{mem_match.group(1)}{max_memory_mb}"
+                   + content[mem_match.end():])
+
+    last_sub.write_text(content)
+
+    # Extract probe node name from filename (e.g. proc_000001.sub -> proc_000001)
+    probe_node = last_sub.stem
+    logger.info(
+        "Probe node %s: 2×%dT, request_memory=%d MB, manifest_tuned.json injected",
+        probe_node, half_cores, max_memory_mb,
+    )
+    return probe_node
+
+
 # ── Main runner ──────────────────────────────────────────────
 
 
@@ -998,6 +1115,11 @@ class MatrixRunner:
 
         logger.info("Planned %d merge groups for adaptive workflow", len(mg_dirs))
 
+        # Step 1b: Inject probe node if enabled
+        probe_node_name: str | None = None
+        if wf.probe_split:
+            probe_node_name = _inject_probe_node(wf, mg_dirs[0])
+
         # Step 2: Generate replan.sub (universe=local)
         wu1_dir = mg_dirs[1]
         venv_python = str(Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python")
@@ -1013,6 +1135,9 @@ class MatrixRunner:
             + (f" --split-all-steps" if wf.split_all_steps else "")
             + (f" --uniform-threads" if wf.split_uniform_threads else "")
             + (f" --split-tmpfs" if wf.split_tmpfs else "")
+            + (f" --job-split --events-per-job {wf.events_per_job}"
+               f" --num-jobs {wf.num_jobs}" if wf.job_split else "")
+            + (f" --probe-node {probe_node_name}" if probe_node_name else "")
         )
         replan_sub_path = wf_dir / "replan.sub"
         replan_sub_path.write_text("\n".join([
@@ -1073,10 +1198,19 @@ class MatrixRunner:
         """Poll DAGMan until done, removed, or timeout.
 
         Returns (status_string, cpu_samples_percent).
+        CPU samples use cgroup accounting (HTCondor jobs only) when available,
+        falling back to system-wide /proc/stat if cgroup is unavailable.
         """
         start = time.monotonic()
         cpu_samples: list[float] = []
-        prev_busy, prev_total = _read_cpu_jiffies()
+
+        # Prefer cgroup accounting — tracks only HTCondor job CPU
+        use_cgroup = _read_cgroup_cpu_usec() > 0
+        if use_cgroup:
+            prev_cg_usec = _read_cgroup_cpu_usec()
+            prev_time = time.monotonic()
+        else:
+            prev_busy, prev_total = _read_cpu_jiffies()
 
         while time.monotonic() - start < timeout_sec:
             try:
@@ -1087,9 +1221,16 @@ class MatrixRunner:
                 continue
 
             # Sample CPU
-            cur_busy, cur_total = _read_cpu_jiffies()
-            cpu_pct = _cpu_percent(prev_busy, prev_total, cur_busy, cur_total)
-            prev_busy, prev_total = cur_busy, cur_total
+            if use_cgroup:
+                cur_cg_usec = _read_cgroup_cpu_usec()
+                cur_time = time.monotonic()
+                cpu_pct = _cgroup_cpu_cores(prev_cg_usec, cur_cg_usec, cur_time - prev_time)
+                prev_cg_usec = cur_cg_usec
+                prev_time = cur_time
+            else:
+                cur_busy, cur_total = _read_cpu_jiffies()
+                cpu_pct = _cpu_percent(prev_busy, prev_total, cur_busy, cur_total)
+                prev_busy, prev_total = cur_busy, cur_total
             cpu_samples.append(cpu_pct)
 
             if info is None:

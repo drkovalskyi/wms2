@@ -9,7 +9,7 @@ ID scheme:
     9xx.x  — performance / scale
 
 Variant convention:
-    x00.0 = 1 job,  x00.1 = 8 jobs,  x00.2 = 64 jobs
+    x00.0 = plumbing (2 jobs),  x00.1 = performance (4–8 jobs)
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ _NPS_OUTPUT_DATASETS = [
 
 _WF_300_0 = WorkflowDef(
     wf_id=300.0,
-    title="NPS 5-step StepChain, 1 work unit (8 jobs x 50 ev)",
+    title="NPS 5-step StepChain, 1 work unit (2 jobs x 40 ev)",
     sandbox_mode="cached",
     cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox.tar.gz",
     request_spec={
@@ -124,8 +124,8 @@ _WF_300_0 = WorkflowDef(
         "TimePerEvent": 1.0,
         "SizePerEvent": 50.0,
     },
-    events_per_job=50,
-    num_jobs=8,
+    events_per_job=40,
+    num_jobs=2,
     output_datasets=_NPS_OUTPUT_DATASETS,
     memory_mb=16000,
     multicore=8,
@@ -156,7 +156,7 @@ _GEN_DY2L_OUTPUT_DATASETS = [
 
 _WF_301_0 = WorkflowDef(
     wf_id=301.0,
-    title="DY2L 5-step StepChain, 8 cores (8 jobs x 500 ev, ~10% filter)",
+    title="DY2L 5-step StepChain, 8 cores (8 jobs x 400 ev, ~10% filter)",
     sandbox_mode="cached",
     cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
     request_spec={
@@ -168,7 +168,7 @@ _WF_301_0 = WorkflowDef(
         "TimePerEvent": 11.35,
         "SizePerEvent": 1570.7,
     },
-    events_per_job=500,
+    events_per_job=400,
     num_jobs=8,
     output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
     memory_mb=16000,
@@ -185,7 +185,7 @@ _WF_301_0 = WorkflowDef(
 
 _WF_351_0 = WorkflowDef(
     wf_id=351.0,
-    title="DY2L adaptive step 1 split (8 jobs x 50 ev, ~10% filter)",
+    title="DY2L adaptive step 1 split (2 jobs x 40 ev, ~10% filter)",
     sandbox_mode="cached",
     cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
     request_spec={
@@ -197,14 +197,15 @@ _WF_351_0 = WorkflowDef(
         "TimePerEvent": 11.35,
         "SizePerEvent": 1570.7,
     },
-    events_per_job=50,
-    num_jobs=8,
+    events_per_job=40,
+    num_jobs=2,
     num_work_units=2,
     adaptive=True,
     output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
     memory_per_core_mb=2000,
-    max_memory_per_core_mb=2000,
+    max_memory_per_core_mb=2500,
     split_tmpfs=True,
+    probe_split=True,
     multicore=8,
     size="large",
     timeout_sec=7200,
@@ -218,7 +219,7 @@ _WF_351_0 = WorkflowDef(
 
 _WF_351_1 = WorkflowDef(
     wf_id=351.1,
-    title="DY2L adaptive step 1 split (8 jobs x 500 ev, ~10% filter)",
+    title="DY2L adaptive step 1 split (4 jobs x 400 ev, ~10% filter)",
     sandbox_mode="cached",
     cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
     request_spec={
@@ -230,14 +231,87 @@ _WF_351_1 = WorkflowDef(
         "TimePerEvent": 11.35,
         "SizePerEvent": 1570.7,
     },
-    events_per_job=500,
-    num_jobs=8,
+    events_per_job=400,
+    num_jobs=4,
     num_work_units=2,
     adaptive=True,
     output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
     memory_per_core_mb=2000,
-    max_memory_per_core_mb=2000,
+    max_memory_per_core_mb=2500,
     split_tmpfs=True,
+    probe_split=True,
+    multicore=8,
+    size="large",
+    timeout_sec=10800,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+# ── Adaptive job split ────────────────────────────────────────
+
+_WF_391_0 = WorkflowDef(
+    wf_id=391.0,
+    title="DY2L adaptive job split (2 jobs x 40 ev, ~10% filter)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=40,
+    num_jobs=2,
+    num_work_units=2,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    split_tmpfs=True,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=2500,
+    multicore=8,
+    size="large",
+    timeout_sec=7200,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_391_1 = WorkflowDef(
+    wf_id=391.1,
+    title="DY2L adaptive job split (4 jobs x 400 ev, ~10% filter)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=400,
+    num_jobs=4,
+    num_work_units=2,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    split_tmpfs=True,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=2500,
     multicore=8,
     size="large",
     timeout_sec=10800,
@@ -253,7 +327,7 @@ _WF_351_1 = WorkflowDef(
 
 _WF_350_0 = WorkflowDef(
     wf_id=350.0,
-    title="Adaptive nThreads tuning, 50 ev/job",
+    title="Adaptive nThreads tuning, 40 ev/job",
     sandbox_mode="cached",
     cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox.tar.gz",
     request_spec={
@@ -265,8 +339,8 @@ _WF_350_0 = WorkflowDef(
         "TimePerEvent": 1.0,
         "SizePerEvent": 50.0,
     },
-    events_per_job=50,
-    num_jobs=8,
+    events_per_job=40,
+    num_jobs=2,
     num_work_units=2,
     adaptive=True,
     output_datasets=_NPS_OUTPUT_DATASETS,
@@ -297,7 +371,7 @@ _WF_360_0 = WorkflowDef(
         "TimePerEvent": 1.0,
         "SizePerEvent": 50.0,
     },
-    events_per_job=50,
+    events_per_job=40,
     num_jobs=8,
     num_work_units=2,
     adaptive=True,
@@ -331,7 +405,7 @@ _WF_370_0 = WorkflowDef(
         "TimePerEvent": 1.0,
         "SizePerEvent": 50.0,
     },
-    events_per_job=50,
+    events_per_job=40,
     num_jobs=8,
     num_work_units=2,
     adaptive=True,
@@ -364,7 +438,7 @@ _WF_380_0 = WorkflowDef(
         "TimePerEvent": 1.0,
         "SizePerEvent": 50.0,
     },
-    events_per_job=50,
+    events_per_job=40,
     num_jobs=8,
     num_work_units=2,
     adaptive=True,
@@ -386,7 +460,7 @@ _WF_380_0 = WorkflowDef(
 
 _WF_380_1 = WorkflowDef(
     wf_id=380.1,
-    title="Pipeline split, uniform threads, 500 ev/job",
+    title="Pipeline split, uniform threads, 400 ev/job",
     sandbox_mode="cached",
     cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox.tar.gz",
     request_spec={
@@ -398,7 +472,7 @@ _WF_380_1 = WorkflowDef(
         "TimePerEvent": 1.0,
         "SizePerEvent": 50.0,
     },
-    events_per_job=500,
+    events_per_job=400,
     num_jobs=8,
     num_work_units=2,
     adaptive=True,
@@ -599,6 +673,8 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_301_0,
         _WF_351_0,
         _WF_351_1,
+        _WF_391_0,
+        _WF_391_1,
         _WF_350_0,
         _WF_360_0,
         _WF_370_0,
