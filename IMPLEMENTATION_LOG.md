@@ -2593,3 +2593,30 @@ Step 0 split: 2 instances (ideal: 4, memory-constrained)
 Probe: 2 instances, 5154 MB/instance cgroup, 1663 MB/instance RSS  [probe_cgroup]
 To split 4×: need 3209 MB/core (current max: 2500 MB/core)
 ```
+
+---
+
+## Spec v2.7.0: Memory-Per-Core Window and Adaptive Sizing
+
+**Date**: 2026-02-23
+
+### Problem
+
+The spec's adaptive memory model (Section 5.4) used a fixed 512 MB headroom buffer above measured peak RSS. This doesn't scale — 512 MB is 25% overhead on a 2 GB job but only 2.5% on a 20 GB job. The spec also had no concept of site-level memory constraints: CMS sites advertise memory per core with a practical minimum, and requesting more narrows the site pool. The adaptive algorithm needed explicit bounds.
+
+### Design Decisions
+
+- **Memory-per-core window**: Two operational parameters — `default_memory_per_core` (baseline, widest site pool) and `max_memory_per_core` (upper bound). Round 1 production jobs use default, probe jobs use max, Round 2+ sizes within the window based on measured data.
+- **20% safety margin**: Replaces fixed 512 MB buffer. Percentage-based margin scales naturally with job size. Accounts for memory leak accumulation (probes process fewer events), event-to-event RSS variation, and page cache pressure.
+- **Request validation**: Requests where `Memory / Multicore > max_memory_per_core` are rejected — they cannot be satisfied.
+- **Memory-constrained splits**: If measured data + 20% exceeds `max_memory_per_core × cores`, reduce parallel instances rather than exceed the ceiling.
+
+### Spec Changes (v2.6.0 → v2.7.0)
+
+| Section | Change |
+|---|---|
+| 5.2 (new) | Memory-Per-Core Window — defines default/max parameters, request validation |
+| 5.3 (was 5.2) | Execution Rounds — probe jobs use max mem/core, production uses default |
+| 5.5 (new, replaces 5.4) | Memory Sizing — 20% margin, data source hierarchy (cgroup > FJR RSS), sizing formula with clamp |
+| 5.4, 5.6, 5.7 | Renumbered from 5.3, 5.5, 5.6; cross-references updated |
+| DD-13 (new) | Rationale for memory-per-core window and percentage-based margin |
