@@ -274,18 +274,25 @@ def compute_per_step_nthreads(
     metrics: dict,
     original_nthreads: int,
     request_cpus: int = 0,
+    default_memory_mb: int = 0,
     max_memory_mb: int = 0,
     overcommit_max: float = 1.0,
     split: bool = True,
     probe_rss_mb: float = 0,
     probe_cgroup_per_instance_mb: float = 0,
+    safety_margin: float = 0.20,
 ) -> dict:
     """Derive optimal nThreads for step 0 parallel splitting and optional overcommit.
 
-    Three inputs control the algorithm:
-      request_cpus   — max cores per job (ncores)
-      max_memory_mb  — memory ceiling for Round 2 (max_mem_per_core * ncores)
-      overcommit_max — max CPU overcommit ratio (1.0 = disabled)
+    Key inputs:
+      request_cpus      — max cores per job (ncores)
+      default_memory_mb — floor for request_memory (default_mem_per_core * ncores)
+      max_memory_mb     — ceiling for request_memory (max_mem_per_core * ncores)
+      overcommit_max    — max CPU overcommit ratio (1.0 = disabled)
+      safety_margin     — fractional margin on measured memory (0.20 = 20%)
+
+    Memory sizing follows spec Section 5.5: measured data × (1 + safety_margin),
+    clamped to [default_memory_mb, max_memory_mb].
 
     The scheduler-visible resource footprint (request_cpus, num_jobs,
     events_per_job) stays unchanged.  Only step 0's nThreads is reduced —
@@ -298,6 +305,7 @@ def compute_per_step_nthreads(
 
     Returns dict with per-step tuning details.
     """
+    margin_mult = 1.0 + safety_margin
     # Conservative per-thread memory overhead for CMSSW (MB)
     PER_THREAD_OVERHEAD_MB = 250
 
@@ -340,21 +348,22 @@ def compute_per_step_nthreads(
             ideal_n_par = n_par
             ideal_tuned = tuned
 
-            # Per-instance memory for the memory model.
+            # Per-instance memory for the memory model (spec Section 5.5).
             # Three data sources, best to worst:
             # 1. probe cgroup: actual cgroup peak / n_instances (includes RSS+tmpfs)
             # 2. probe RSS: FJR peak_rss_mb from probe (RSS only, add TMPFS estimate)
             # 3. theoretical: R1 avg_rss at original nThreads (add TMPFS estimate)
+            # All sources apply safety_margin to account for memory leak
+            # accumulation, event-to-event variation, and page cache pressure.
             if probe_cgroup_per_instance_mb > 0:
                 # Cgroup peak already includes RSS + tmpfs + page cache.
-                # Use 10% margin, no separate TMPFS needed.
-                instance_mem = probe_cgroup_per_instance_mb * 1.10
+                instance_mem = probe_cgroup_per_instance_mb * margin_mult
                 memory_source = "probe_cgroup"
             elif probe_rss_mb > 0:
-                instance_mem = probe_rss_mb * 1.10 + TMPFS_PER_INSTANCE_MB
+                instance_mem = probe_rss_mb * margin_mult + TMPFS_PER_INSTANCE_MB
                 memory_source = "probe"
             else:
-                instance_mem = avg_rss + TMPFS_PER_INSTANCE_MB
+                instance_mem = avg_rss * margin_mult + TMPFS_PER_INSTANCE_MB
                 memory_source = "theoretical"
 
             # Memory-aware reduction: each instance needs instance_mem.
@@ -475,9 +484,11 @@ def compute_job_split(
     metrics: dict,
     original_nthreads: int,
     request_cpus: int,
+    memory_per_core_mb: int,
     max_memory_per_core_mb: int,
     events_per_job: int,
     num_jobs_wu: int,
+    safety_margin: float = 0.20,
 ) -> dict:
     """Compute adaptive job split: more jobs with fewer cores per job.
 
@@ -486,14 +497,18 @@ def compute_job_split(
     Same total core allocation, but each job finishes independently
     (no tail effect, resources released sooner).
 
+    Memory follows spec Section 5.5: clamp(measured × (1 + safety_margin),
+    default_per_core × tuned_cores, max_per_core × tuned_cores).
+
     Algorithm (based on Round 1 step 0 metrics):
     1. eff_cores = cpu_eff_step0 × original_nthreads
     2. tuned_threads = nearest_power_of_2(eff_cores), capped to [2, original]
     3. job_multiplier = original_nthreads // tuned_threads
     4. new_events_per_job = events_per_job // job_multiplier
     5. new_num_jobs = num_jobs_wu × job_multiplier
-    6. new_request_memory = max(tuned_threads × max_memory_per_core_mb,
-                                peak_observed_rss × 1.1)
+    6. new_request_memory = clamp(peak_rss × (1 + margin),
+                                  tuned × memory_per_core_mb,
+                                  tuned × max_memory_per_core_mb)
     """
     step0 = metrics["steps"].get(0)
     if not step0:
@@ -503,7 +518,7 @@ def compute_job_split(
             "new_num_jobs": num_jobs_wu,
             "new_events_per_job": events_per_job,
             "new_request_cpus": request_cpus,
-            "new_request_memory_mb": max_memory_per_core_mb * request_cpus,
+            "new_request_memory_mb": memory_per_core_mb * request_cpus,
             "per_step": {},
         }
 
@@ -530,7 +545,8 @@ def compute_job_split(
     new_num_jobs = num_jobs_wu * job_multiplier
     new_request_cpus = tuned
 
-    # Memory: use the max observed RSS from Round 1 as a floor.
+    # Memory sizing (spec Section 5.5):
+    # clamp(measured × (1 + margin), default × tuned_cores, max × tuned_cores)
     # CMSSW memory has a large base component (~70%) that doesn't scale
     # with nthreads, so the per-core formula underestimates at low nthreads.
     # The Round 1 RSS (at original_nthreads) is a safe upper bound since
@@ -542,10 +558,14 @@ def compute_job_split(
         if step_rss:
             avg = sum(step_rss) / len(step_rss)
             peak_rss_mb = max(peak_rss_mb, avg)
-    # Apply 10% safety margin over observed peak
-    memory_from_rss = int(peak_rss_mb * 1.1) if peak_rss_mb > 0 else 0
-    memory_from_formula = tuned * max_memory_per_core_mb
-    new_request_memory_mb = max(memory_from_formula, memory_from_rss)
+    margin_mult = 1.0 + safety_margin
+    memory_from_rss = int(peak_rss_mb * margin_mult) if peak_rss_mb > 0 else 0
+    memory_floor = tuned * memory_per_core_mb
+    memory_ceiling = tuned * max_memory_per_core_mb
+    new_request_memory_mb = max(memory_floor, min(memory_from_rss, memory_ceiling))
+    # If measured exceeds ceiling, cap at ceiling (algorithm reduces splits)
+    if memory_from_rss > memory_ceiling:
+        new_request_memory_mb = memory_ceiling
 
     # Build per-step info for reporting
     per_step = {}
@@ -856,6 +876,7 @@ def compute_all_step_split(
     request_cpus: int,
     request_memory_mb: int,
     uniform: bool = False,
+    safety_margin: float = 0.20,
 ) -> dict:
     """Derive N-pipeline split where each pipeline runs ALL steps with tuned nThreads.
 
@@ -868,7 +889,7 @@ def compute_all_step_split(
     2. Iterate n_pipelines from highest feasible down to 1:
        - threads_cap = request_cpus // n_pipelines
        - Per-step: tuned = min(ideal_threads, threads_cap)
-       - Per-step: proj_rss = measured_rss - (original - tuned) * 250, floor 500 MB
+       - Per-step: proj_rss = (measured_rss - (original - tuned) * 250) × (1 + margin)
        - Memory check: n_pipelines * max(proj_rss) <= request_memory_mb
        - Take first (highest) n_pipelines that fits
     3. Return dict with n_pipelines and per-step tuning details.
@@ -895,6 +916,7 @@ def compute_all_step_split(
         step_rss[si] = avg_rss
 
     # Step 2: iterate n_pipelines from highest feasible down
+    margin_mult = 1.0 + safety_margin
     max_pipelines = request_cpus  # theoretical max (1 thread each)
     best_n = 1
     best_per_step = {}
@@ -909,11 +931,12 @@ def compute_all_step_split(
         for si in sorted(step_ideals):
             tuned = threads_cap if uniform else min(step_ideals[si]["ideal"], threads_cap)
             tuned = max(tuned, 1)
-            # Project RSS: fewer threads => less memory
+            # Project RSS: fewer threads => less memory, then apply safety margin
             measured = step_rss[si]
             thread_reduction = original_nthreads - tuned
             proj_rss = measured - thread_reduction * PER_THREAD_OVERHEAD_MB
             proj_rss = max(proj_rss, 500)  # floor at 500 MB
+            proj_rss = proj_rss * margin_mult
             max_proj_rss = max(max_proj_rss, proj_rss)
             per_step[si] = {
                 "tuned_nthreads": tuned,
@@ -1071,6 +1094,8 @@ def _replan_cli(args: list[str]) -> None:
                         help="Number of jobs per work unit (for job split)")
     parser.add_argument("--probe-node", type=str, default="",
                         help="Probe node name (e.g. proc_000001) for R2 memory estimation")
+    parser.add_argument("--safety-margin", type=float, default=0.20,
+                        help="Safety margin on measured memory (0.20 = 20%%)")
     opts = parser.parse_args(args)
 
     wu0_dir = Path(opts.wu0_dir)
@@ -1080,7 +1105,8 @@ def _replan_cli(args: list[str]) -> None:
     ncores = opts.ncores
     mem_per_core = opts.mem_per_core
     max_mem_per_core = opts.max_mem_per_core
-    request_memory_mb = mem_per_core * ncores
+    safety_margin = opts.safety_margin
+    default_memory_mb = mem_per_core * ncores
     max_memory_mb = max_mem_per_core * ncores
 
     print(f"=== WMS2 Adaptive Replan ===")
@@ -1130,7 +1156,7 @@ def _replan_cli(args: list[str]) -> None:
 
     # 2. Compute per-step optimal nThreads
     print(f"\n--- Computing per-step nThreads ---")
-    print(f"ncores: {ncores}  mem/core: {mem_per_core} MB  max mem/core: {max_mem_per_core} MB")
+    print(f"ncores: {ncores}  mem/core: {mem_per_core} MB  max mem/core: {max_mem_per_core} MB  margin: {safety_margin:.0%}")
 
     n_pipelines = 1
     job_multiplier = 1
@@ -1141,9 +1167,11 @@ def _replan_cli(args: list[str]) -> None:
         split_result = compute_job_split(
             metrics, original_nthreads,
             request_cpus=ncores,
+            memory_per_core_mb=mem_per_core,
             max_memory_per_core_mb=max_mem_per_core,
             events_per_job=opts.events_per_job,
             num_jobs_wu=opts.num_jobs,
+            safety_margin=safety_margin,
         )
         job_multiplier = split_result["job_multiplier"]
         tuned_nt = split_result["tuned_nthreads"]
@@ -1168,6 +1196,7 @@ def _replan_cli(args: list[str]) -> None:
         decisions = {
             "original_nthreads": original_nthreads,
             "overcommit_max": opts.overcommit_max,
+            "safety_margin": safety_margin,
             "n_pipelines": 1,
             "job_multiplier": job_multiplier,
             "tuned_nthreads": tuned_nt,
@@ -1197,6 +1226,7 @@ def _replan_cli(args: list[str]) -> None:
             request_cpus=ncores,
             request_memory_mb=max_memory_mb,
             uniform=opts.uniform_threads,
+            safety_margin=safety_margin,
         )
         n_pipelines = tuning.get("n_pipelines", 1)
         print(f"n_pipelines: {n_pipelines}")
@@ -1216,11 +1246,13 @@ def _replan_cli(args: list[str]) -> None:
         tuning = compute_per_step_nthreads(
             metrics, original_nthreads,
             request_cpus=ncores,
+            default_memory_mb=default_memory_mb,
             max_memory_mb=max_memory_mb,
             overcommit_max=opts.overcommit_max,
             split=not opts.no_split,
             probe_rss_mb=probe_rss_mb,
             probe_cgroup_per_instance_mb=probe_cgroup_per_inst,
+            safety_margin=safety_margin,
         )
         for si in sorted(tuning["per_step"]):
             t = tuning["per_step"][si]
@@ -1252,6 +1284,7 @@ def _replan_cli(args: list[str]) -> None:
     decisions = {
         "original_nthreads": original_nthreads,
         "overcommit_max": opts.overcommit_max,
+        "safety_margin": safety_margin,
         "n_pipelines": n_pipelines,
         "memory_per_core_mb": mem_per_core,
         "max_memory_per_core_mb": max_mem_per_core,

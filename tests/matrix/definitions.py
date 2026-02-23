@@ -59,3 +59,4 @@ class WorkflowDef:
     job_split: bool = False  # adaptive job split: more jobs with fewer cores in Round 2
     memory_per_core_mb: int = 2000  # MB per core for Round 1 request_memory
     max_memory_per_core_mb: int = 2000  # max MB per core for Round 2 request_memory
+    safety_margin: float = 0.20  # safety margin on measured memory (0.20 = 20%)

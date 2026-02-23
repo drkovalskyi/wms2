@@ -1130,6 +1130,7 @@ class MatrixRunner:
             f" --ncores {wf.multicore}"
             f" --mem-per-core {wf.memory_per_core_mb}"
             f" --max-mem-per-core {wf.max_memory_per_core_mb}"
+            f" --safety-margin {wf.safety_margin}"
             f" --overcommit-max {wf.overcommit_max}"
             + (f" --no-split" if not wf.adaptive_split else "")
             + (f" --split-all-steps" if wf.split_all_steps else "")
