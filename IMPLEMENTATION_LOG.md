@@ -2620,3 +2620,21 @@ The spec's adaptive memory model (Section 5.4) used a fixed 512 MB headroom buff
 | 5.5 (new, replaces 5.4) | Memory Sizing — 20% margin, data source hierarchy (cgroup > FJR RSS), sizing formula with clamp |
 | 5.4, 5.6, 5.7 | Renumbered from 5.3, 5.5, 5.6; cross-references updated |
 | DD-13 (new) | Rationale for memory-per-core window and percentage-based margin |
+
+### Adaptive Algorithm Alignment
+
+Updated the three adaptive algorithms in `tests/matrix/adaptive.py` to match the spec v2.7.0 memory model.
+
+**Changes:**
+
+| Function | Before | After |
+|---|---|---|
+| `compute_per_step_nthreads` (probe cgroup) | `× 1.10` | `× (1 + safety_margin)` |
+| `compute_per_step_nthreads` (probe RSS) | `× 1.10 + TMPFS` | `× (1 + safety_margin) + TMPFS` |
+| `compute_per_step_nthreads` (theoretical) | `avg_rss + TMPFS` (no margin) | `avg_rss × (1 + safety_margin) + TMPFS` |
+| `compute_job_split` | `max(tuned × max_per_core, rss × 1.1)` | `clamp(rss × (1 + margin), default × tuned, max × tuned)` |
+| `compute_all_step_split` | No margin on projected RSS | `proj_rss × (1 + safety_margin)` |
+
+**New parameter:** `safety_margin` (default 0.20) added to `WorkflowDef`, all three compute functions, and the CLI (`--safety-margin`). Recorded in `replan_decisions.json` for traceability.
+
+**Key fix:** `compute_job_split` previously used `max_memory_per_core` as the per-core formula base. Now uses `memory_per_core` (default) as floor and `max_memory_per_core` as ceiling, matching the spec's clamp semantics.
