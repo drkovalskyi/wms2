@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.6.0 |
+| **Spec Version** | 2.7.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-22 |
+| **Date** | 2026-02-23 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -316,7 +316,7 @@ class Workflow(BaseModel):
 
     # Accumulated per-step FJR metrics from completed jobs (populated after
     # recovery rounds). Passed to sandbox via step_profile.json for adaptive
-    # per-step optimization. Structure defined in Section 5.5.
+    # per-step optimization. Structure defined in Section 5.6.
     step_metrics: Optional[Dict[str, Any]]
 
     # DAG Reference (set after DAG submission)
@@ -1345,7 +1345,7 @@ class DAGPlanner:
 
         # Write step_profile.json if step_metrics exist (recovery round).
         # The sandbox reads this file for per-step adaptive optimization
-        # (see Section 5.3). Absent on round 1 — sandbox uses defaults.
+        # (see Section 5.4). Absent on round 1 — sandbox uses defaults.
         if workflow.step_metrics:
             profile_path = os.path.join(submit_dir, "step_profile.json")
             with open(profile_path, "w") as f:
@@ -2230,9 +2230,33 @@ WMS2 does not run a separate pilot job. Instead, the first production DAG uses r
 
 This design eliminates the latency of a dedicated pilot phase (~8 hours) while converging to optimal resource estimates asymptotically through production data. The existing recovery/rescue DAG mechanism is the natural re-optimization point — no new states, no new components.
 
-### 5.2 Execution Rounds
+### 5.2 Memory-Per-Core Window
+
+CMS sites advertise resources as memory per core. There is a minimum that most sites offer, but no fixed maximum — requesting more memory per core narrows the pool of matching sites. WMS2 defines two operational parameters to bound the adaptive algorithm:
+
+- **`default_memory_per_core`** (MB): The baseline memory per core. Matches the widest set of sites. Round 1 production jobs use this value. Example: 2000 MB/core.
+- **`max_memory_per_core`** (MB): The upper bound the adaptive algorithm may request. Beyond this, too few sites match to be practical. Probe jobs and memory-constrained Round 2+ jobs may use up to this value. Example: 3000 MB/core.
+
+These are operational knobs — set by the WMS2 deployment, not per-request. They reflect the site landscape and can be tuned as site capabilities change.
+
+**Request validation**: A request arrives with `Multicore` (thread count) and `Memory` (total MB). The DAG Planner checks that the request's memory requirement fits within the window:
+
+```
+request_memory_per_core = request.Memory / request.Multicore
+
+if request_memory_per_core > max_memory_per_core:
+    reject — request cannot be satisfied
+if request_memory_per_core > default_memory_per_core:
+    Round 1 uses request_memory_per_core (accepted, but fewer sites)
+else:
+    Round 1 uses default_memory_per_core × Multicore
+```
+
+### 5.3 Execution Rounds
 
 **Round 1** (fresh submission, no `step_profile.json`):
+- **Production jobs**: Use `default_memory_per_core × Multicore` as `request_memory` (unless the request itself demands more — see Section 5.2). This maximizes the site pool.
+- **Probe jobs** (optional, 1–2 jobs): Use `max_memory_per_core × Multicore` as `request_memory`. Probes test splitting configurations (e.g., 2 parallel instances within one slot) that need headroom to avoid OOM. The wider memory envelope is acceptable because only 1–2 jobs are affected. Probe results (cgroup memory peaks, CPU utilization) feed the Round 2 adaptive sizing.
 - DAG Planner uses request resource hints: `Memory`, `TimePerEvent`, `SizePerEvent`
 - Sandbox runs each job with default resource allocation
 - FJR data is collected per work unit but not yet aggregated
@@ -2241,12 +2265,14 @@ This design eliminates the latency of a dedicated pilot phase (~8 hours) while c
 - Lifecycle Manager aggregates FJR data from completed work units into `workflow.step_metrics`
 - DAG Planner writes `step_profile.json` to submit directory
 - Sandbox reads `step_profile.json` and applies per-step optimization:
-  - Memory sizing based on measured peak RSS
-  - Per-step splitting for CPU-inefficient steps (Section 5.3)
+  - Memory sizing based on measured data + 20% safety margin (Section 5.5), within the `[default, max] × Multicore` window
+  - Per-step splitting for CPU-inefficient steps (Section 5.4)
 - Rescue DAG skips completed nodes — only remaining work uses updated parameters
 
 ```
 Round 1: Request hints → DAG → jobs run → FJR data collected
+              │         (production: default mem/core)
+              │         (probes: max mem/core)
               │
               ▼ (clean stop, partial failure, or production step)
          Lifecycle Manager: _prepare_recovery()
@@ -2254,6 +2280,7 @@ Round 1: Request hints → DAG → jobs run → FJR data collected
               ▼
 Round 2: step_metrics → DAG Planner writes step_profile.json
               │  Sandbox applies per-step optimization
+              │  Memory sized to measured data + 20%, within [default, max] window
               ▼
          Rescue DAG resumes with adaptive parameters
               │
@@ -2261,7 +2288,7 @@ Round 2: step_metrics → DAG Planner writes step_profile.json
 Round 3+: Refined step_metrics → further optimization (diminishing returns)
 ```
 
-### 5.3 Per-Step Splitting Optimization
+### 5.4 Per-Step Splitting Optimization
 
 Per-step splitting is a sandbox-owned optimization. When `step_profile.json` is present, the sandbox can split CPU-inefficient steps into N parallel `cmsRun` processes within a single slot, using `skipEvents`/`maxEvents` partitioning.
 
@@ -2273,9 +2300,29 @@ Per-step splitting is a sandbox-owned optimization. When `step_profile.json` is 
 
 **CPU overcommit** is a complementary optimization: instead of (or in addition to) splitting, give each cmsRun instance more threads than its proportional core share. The extra threads fill I/O bubbles — when some threads are waiting on disk or network, the overcommitted threads can use the idle CPU. For example, on 8 allocated cores with 2 parallel step 0 instances, each could get 5 threads (10 total, 25% overcommit) instead of 4. Steps 1+ running sequentially could get 10 threads instead of 8. Overcommit is optional (off by default, `overcommit_max=1.0`) and memory-safe: the projected RSS including per-thread overhead (conservatively 250 MB/thread for CMSSW) must fit within `request_memory`. Only steps with moderate CPU efficiency (50–90%) benefit from overcommit — low-efficiency steps need splitting, and high-efficiency steps are already saturating their threads. The scheduler-visible `request_cpus` is unchanged; overcommit operates entirely within the sandbox.
 
-### 5.4 Memory Calibration
+### 5.5 Memory Sizing
 
-Memory usage varies with thread count. Two data points enable a simple linear model:
+The adaptive algorithm sizes `request_memory` for Round 2+ based on measured data from Round 1 (or earlier rounds). All measured values include a **20% safety margin** (default, configurable) to account for:
+- Memory leak accumulation over longer production runs (probes/early jobs process fewer events)
+- Event-to-event variation in RSS across different input data
+- Page cache pressure under concurrent load
+
+**Data sources** (in order of preference):
+
+1. **Cgroup peak** (from probe jobs): HTCondor's cgroup accounting captures the full memory footprint — process RSS, tmpfs (e.g., gridpack extraction), and page cache. This is the most accurate measurement because it reflects what the cgroup OOM killer actually enforces. Available when probe jobs run in Round 1.
+2. **FJR peak RSS** (from completed work units): The Framework Job Report's `PeakValueRss` measures process RSS only — it misses tmpfs and page cache. Available from Round 2+ via `step_metrics` aggregation. Median of all sampled jobs, robust against outliers.
+
+**Sizing formula**:
+
+```
+measured_memory = best available measurement (cgroup or FJR RSS)
+request_memory  = measured_memory × 1.20
+request_memory  = clamp(request_memory, default_memory_per_core × cores, max_memory_per_core × cores)
+```
+
+If the clamped value at `max_memory_per_core × cores` is still below what the measured data requires, the adaptive algorithm must reduce the number of parallel instances (fewer splits) rather than exceed the memory ceiling.
+
+**Thread count extrapolation**: Memory usage varies with thread count. Two data points enable a linear model:
 
 ```
 RSS(threads) = base + per_thread × threads
@@ -2284,9 +2331,9 @@ RSS(threads) = base + per_thread × threads
 - **Point 1**: Round 1 measurement (e.g., 8 threads, 2400 MB)
 - **Point 2**: Round 2 measurement at a different thread count (if the sandbox adjusts threads)
 
-With only one data point (common case), the DAG Planner adds a conservative headroom buffer (512 MB above measured peak) rather than attempting extrapolation.
+With only one data point (common case), the 20% safety margin on the measured value absorbs the extrapolation uncertainty — a percentage scales naturally with job size (unlike a fixed MB buffer).
 
-### 5.5 Metric Aggregation
+### 5.6 Metric Aggregation
 
 The Lifecycle Manager aggregates per-step FJR data from completed work units during `_prepare_recovery()`. The aggregation uses medians to be robust against outliers (e.g., one job hitting a slow node).
 
@@ -2321,7 +2368,7 @@ The Lifecycle Manager aggregates per-step FJR data from completed work units dur
 
 The `round` counter increments with each recovery. On round 2+, previous round metrics are merged (weighted by `jobs_sampled`) so the model accumulates data across rounds.
 
-### 5.6 Convergence
+### 5.7 Convergence
 
 - **Round 1**: Request defaults. May be suboptimal but functional.
 - **Round 2**: Most gains realized — memory sized to actual RSS, per-step splitting applied to inefficient steps.
@@ -2428,7 +2475,7 @@ ACTIVE at priority 50000 (rescue DAG, refined step_metrics)
 COMPLETED
 ```
 
-**Adaptive optimization on rescue DAG**: When a request re-enters QUEUED after a clean stop, the Lifecycle Manager has aggregated per-step FJR metrics from completed work units into `workflow.step_metrics` (see Section 5.5). The rescue DAG carries these accumulated metrics, and the sandbox uses them for per-step optimization (memory sizing, CPU-efficiency-based splitting). Each successive rescue round refines the estimates further.
+**Adaptive optimization on rescue DAG**: When a request re-enters QUEUED after a clean stop, the Lifecycle Manager has aggregated per-step FJR metrics from completed work units into `workflow.step_metrics` (see Section 5.6). The rescue DAG carries these accumulated metrics, and the sandbox uses them for per-step optimization (memory sizing, CPU-efficiency-based splitting). Each successive rescue round refines the estimates further.
 
 **In-flight waste**: When the clean stop triggers, work units already in flight continue briefly until `condor_rm` takes effect. The waste is bounded by `MAXJOBS MergeGroup` (typically ~10 work units) — the actual fraction may slightly overshoot the requested threshold.
 
@@ -3062,6 +3109,14 @@ The design reuses the clean stop flow entirely — no new request states, no new
 **Why**: A dedicated pilot phase adds ~8 hours of latency before the first production job runs, and the pilot's measurements may not represent the full dataset (different input files, different sites). The adaptive model starts producing real results immediately and converges to optimal parameters asymptotically — most gains are realized by round 2. Partial production steps (Section 6.2.1) are natural re-optimization points, so the bulk of every workflow benefits from measured data even on first submission. This also simplifies the state machine (no `PILOT_RUNNING` status) and removes pilot-specific tracking fields.
 
 **Rejected alternative**: *Dedicated pilot job with iterative measurement*. Adds latency, complexity (extra request/workflow states, pilot tracking fields, pilot parsing logic), and may not be representative. The adaptive approach achieves the same goal (accurate resource estimates) without a separate phase, using production data that is inherently representative.
+
+### DD-13: Memory-per-core window with 20% safety margin
+
+**Decision**: The adaptive algorithm operates within a `[default_memory_per_core, max_memory_per_core]` window. Round 1 production jobs use `default_memory_per_core` (maximizing site pool), probe jobs use `max_memory_per_core` (headroom for split testing), and Round 2+ sizes memory to measured data + 20% safety margin, clamped within the window. This replaces the previous fixed 512 MB headroom buffer.
+
+**Why**: CMS sites advertise resources as memory per core with a practical minimum. Requesting more than the minimum narrows the pool of matching sites, creating a tradeoff between accurate memory sizing and scheduling breadth. The two-knob window makes this tradeoff explicit and tunable. The 20% percentage-based margin (rather than fixed MB) scales naturally with job size — it provides proportionally more headroom for memory-heavy jobs and avoids being either too generous for small jobs (512 MB on a 2 GB job is 25%) or too thin for large jobs (512 MB on a 20 GB job is 2.5%). The margin accounts for memory leak accumulation (probes process fewer events than production), event-to-event RSS variation, and page cache pressure under concurrent load.
+
+**Rejected alternative**: *Fixed MB headroom* (512 MB above measured peak). Doesn't scale — too large for small jobs, too small for large ones. Also conflated two sources of uncertainty (measurement noise vs. extrapolation error) into a single buffer.
 
 ---
 
