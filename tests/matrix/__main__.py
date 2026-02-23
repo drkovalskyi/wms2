@@ -29,6 +29,7 @@ from tests.matrix.definitions import WorkflowDef
 from tests.matrix.environment import detect_capabilities, detect_capabilities_detailed
 from tests.matrix.reporter import print_catalog_list, print_summary
 from tests.matrix.runner import (
+    RESULTS_DIR,
     MatrixRunner,
     list_saved_results,
     load_results,
@@ -162,9 +163,11 @@ def main() -> int:
     if args.report is not None:
         if args.report == "latest":
             results = load_results()
+            report_dir = list_saved_results()[-1].parent if list_saved_results() else None
         else:
             results = load_results(Path(args.report))
-        print_summary(results)
+            report_dir = Path(args.report).parent
+        print_summary(results, out_dir=report_dir)
         return 0
 
     # Resolve workflow list
@@ -198,7 +201,7 @@ def main() -> int:
     # Save results for later re-rendering
     save_results(results, tag=args.workflows)
 
-    print_summary(results)
+    print_summary(results, out_dir=RESULTS_DIR)
 
     # Exit code: 0 if all passed or skipped, 1 otherwise
     failed = any(r.status in ("failed", "error", "timeout") for r in results)

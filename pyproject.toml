@@ -30,6 +30,7 @@ dev = [
     "respx>=0.21.0",
     "ruff>=0.2.0",
     "mypy>=1.8.0",
+    "matplotlib>=3.8.0",
 ]
 
 [tool.hatch.build.targets.wheel]

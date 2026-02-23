@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import re
 import sys
+from pathlib import Path
 from typing import TextIO
 
-from tests.matrix.runner import PerfData, WorkflowResult
+from tests.matrix.runner import POLL_INTERVAL, PerfData, WorkflowResult
 
 # ANSI color codes (disabled if not a tty)
 _GREEN = "\033[32m"
@@ -36,6 +37,7 @@ def print_summary(
     results: list[WorkflowResult],
     out: TextIO = sys.stdout,
     use_color: bool | None = None,
+    out_dir: Path | None = None,
 ) -> None:
     """Print a pass/fail table with timing."""
     if use_color is None:
@@ -85,33 +87,42 @@ def print_summary(
     perf_results = [r for r in results if r.perf and r.perf.steps]
     if perf_results:
         for r in perf_results:
-            _print_perf_detail(r, out, use_color)
+            _print_perf_detail(r, out, use_color, out_dir=out_dir)
 
 
 # ── Throughput computation ───────────────────────────────────
 
 
-def _compute_round_metrics(steps, total_cores):
-    """Compute aggregate throughput metrics for a list of StepPerf objects.
+def _compute_round_metrics(steps, n_jobs, request_cpus):
+    """Compute throughput metrics based on actual core-time committed.
+
+    Core-seconds = sum of (per-job wall time × request_cpus) across all jobs.
+    Uses StepPerf.n_jobs × StepPerf.wall_sec_mean per step to get the sum
+    directly, which is more accurate than n_jobs × mean when job counts
+    vary per step (e.g. some jobs failed a later step).
 
     Args:
         steps: list of StepPerf objects for one round
-        total_cores: total allocated cores across all concurrent jobs
+        n_jobs: number of jobs (for output metadata)
+        request_cpus: cores allocated per job
 
-    Returns dict with events, proc_wall, ev_s, ev_ch.
+    Returns dict with events, n_jobs, request_cpus, core_hours, ev_ch.
     """
-    if not steps:
+    if not steps or request_cpus <= 0:
         return {}
     total_events = max(s.events_total for s in steps) if steps else 0
-    proc_wall = sum(s.wall_sec_max for s in steps)
-    if proc_wall <= 0 or total_events <= 0:
+    # Sum of all per-job wall seconds across all steps
+    total_job_wall_sec = sum(s.n_jobs * s.wall_sec_mean for s in steps)
+    if total_job_wall_sec <= 0 or total_events <= 0:
         return {}
-    ev_s = total_events / proc_wall
-    ev_ch = total_events / (total_cores * proc_wall / 3600)
+    total_core_sec = request_cpus * total_job_wall_sec
+    core_hours = total_core_sec / 3600
+    ev_ch = total_events / core_hours
     return {
         "events": total_events,
-        "proc_wall": proc_wall,
-        "ev_s": ev_s,
+        "n_jobs": n_jobs,
+        "request_cpus": request_cpus,
+        "core_hours": core_hours,
         "ev_ch": ev_ch,
     }
 
@@ -232,6 +243,7 @@ def _print_perf_detail(
     result: WorkflowResult,
     out: TextIO,
     use_color: bool,
+    out_dir: Path | None = None,
 ) -> None:
     """Print performance report for a single workflow."""
     perf = result.perf
@@ -259,6 +271,13 @@ def _print_perf_detail(
             out.write("  (unmerged cleaned)")
         out.write("\n")
 
+    # CPU timeline plot
+    if out_dir and perf.cpu_samples and len(perf.cpu_samples) > 10:
+        plot_path = out_dir / f"cpu_{result.wf_id:.1f}.png"
+        saved = _save_cpu_plot(result, perf, plot_path)
+        if saved:
+            out.write(f"\n  CPU plot: {saved}\n")
+
     out.write("\n")
 
 
@@ -274,12 +293,11 @@ def _print_standard_report(
 
     # Throughput headline
     n_jobs = perf.num_proc_jobs
-    total_cores = nthreads * n_jobs
-    m = _compute_round_metrics(perf.steps, total_cores)
+    m = _compute_round_metrics(perf.steps, n_jobs, nthreads)
     if m:
-        out.write(f"\n  Throughput: {m['ev_s']:.2f} ev/s  |  "
-                  f"{m['ev_ch']:.0f} ev/core-hour  |  "
-                  f"{m['events']} events in {m['proc_wall']:.0f}s\n")
+        out.write(f"\n  Throughput: {m['ev_ch']:.0f} ev/core-hour  |  "
+                  f"{m['events']} events, {m['core_hours']:.2f} core-hours "
+                  f"({n_jobs} jobs \u00d7 {nthreads}T)\n")
 
     # Per-step table
     if perf.steps:
@@ -301,19 +319,36 @@ def _print_adaptive_report(
     """Print report for adaptive workflows with throughput comparison."""
     orig_nt = adaptive.get("original_nthreads", 8)
     n_pipelines = adaptive.get("n_pipelines", 1)
+    job_multiplier = adaptive.get("job_multiplier", 1)
     per_step_tuning = adaptive.get("per_step", {})
 
     # Split steps by round
     round1_steps = [s for s in perf.steps if s.step_name.startswith("Round 1:")]
     round2_steps = [s for s in perf.steps if s.step_name.startswith("Round 2:")]
 
-    # Jobs per round (adaptive always has 2 work units)
-    jobs_per_round = perf.num_proc_jobs // 2 if perf.num_proc_jobs else 0
-    total_cores = orig_nt * jobs_per_round
+    # Jobs per round — with job split, R2 has more jobs than R1
+    if job_multiplier > 1:
+        # R1 jobs from total proc jobs accounting for multiplier
+        r1_jobs = perf.num_proc_jobs // (1 + job_multiplier)
+        r2_jobs = r1_jobs * job_multiplier
+        # Also infer from actual step data if available
+        if round1_steps and round1_steps[0].n_jobs > 0:
+            r1_jobs = round1_steps[0].n_jobs
+        if round2_steps and round2_steps[0].n_jobs > 0:
+            r2_jobs = round2_steps[0].n_jobs
+    else:
+        r1_jobs = perf.num_proc_jobs // 2 if perf.num_proc_jobs else 0
+        r2_jobs = r1_jobs
 
-    # Compute per-round throughput using total allocated cores
-    r1 = _compute_round_metrics(round1_steps, total_cores)
-    r2 = _compute_round_metrics(round2_steps, total_cores)
+    # Total cores (same for both rounds — same cluster allocation)
+    total_cores = orig_nt * r1_jobs
+
+    # For job split, R2 uses tuned_threads per job but more jobs
+    r2_request_cpus = adaptive.get("new_request_cpus", orig_nt) if job_multiplier > 1 else orig_nt
+
+    # Compute per-round throughput using per-job core-time committed
+    r1 = _compute_round_metrics(round1_steps, r1_jobs, orig_nt)
+    r2 = _compute_round_metrics(round2_steps, r2_jobs, r2_request_cpus)
 
     # Throughput comparison headline
     if r1 and r2:
@@ -324,29 +359,33 @@ def _print_adaptive_report(
         else:
             out.write(f"{hdr}\n")
 
-        delta_ev_s = (r2['ev_s'] - r1['ev_s']) / r1['ev_s'] * 100 if r1['ev_s'] > 0 else 0
         delta_ev_ch = (r2['ev_ch'] - r1['ev_ch']) / r1['ev_ch'] * 100 if r1['ev_ch'] > 0 else 0
+
+        r1_jc = f"{r1['n_jobs']}\u00d7{r1['request_cpus']}T"
+        r2_jc = f"{r2['n_jobs']}\u00d7{r2['request_cpus']}T"
 
         out.write(f"\n    {'':22s}  {'Round 1':>10s}  {'Round 2':>10s}  {'Change':>8s}\n")
         out.write(f"    {'Events':22s}  {r1['events']:>10d}  {r2['events']:>10d}\n")
-        out.write(f"    {'Processing wall':22s}  {r1['proc_wall']:>9.0f}s  {r2['proc_wall']:>9.0f}s\n")
-        out.write(f"    {'Throughput (ev/s)':22s}  {r1['ev_s']:>10.2f}  {r2['ev_s']:>10.2f}  {delta_ev_s:>+7.1f}%\n")
+        out.write(f"    {'Jobs \u00d7 Cores':22s}  {r1_jc:>10s}  {r2_jc:>10s}\n")
+        out.write(f"    {'Core-hours':22s}  {r1['core_hours']:>10.2f}  {r2['core_hours']:>10.2f}\n")
         out.write(f"    {'Ev/core-hour':22s}  {r1['ev_ch']:>10.0f}  {r2['ev_ch']:>10.0f}  {delta_ev_ch:>+7.1f}%\n")
     elif r1:
-        out.write(f"\n  Throughput (Round 1): {r1['ev_s']:.2f} ev/s  |  "
-                  f"{r1['ev_ch']:.0f} ev/core-hour  |  "
-                  f"{r1['events']} events in {r1['proc_wall']:.0f}s\n")
+        out.write(f"\n  Throughput (Round 1): {r1['ev_ch']:.0f} ev/core-hour  |  "
+                  f"{r1['events']} events, {r1['core_hours']:.2f} core-hours\n")
 
     # Tuning summary
-    out.write(f"\n  Tuning: {orig_nt}T baseline")
-    if n_pipelines > 1:
-        out.write(f" \u2192 {n_pipelines} pipelines")
-    tuned_vals = [t.get("tuned_nthreads", orig_nt) for t in per_step_tuning.values()]
-    if tuned_vals and len(set(tuned_vals)) == 1:
-        out.write(f" \u00d7 {tuned_vals[0]}T (uniform)")
-    elif tuned_vals:
-        out.write(f", per-step: [{', '.join(str(v) for v in tuned_vals)}]")
-    out.write("\n")
+    if job_multiplier > 1:
+        out.write(f"\n  Job split: {r1_jobs} \u2192 {r2_jobs} jobs (\u00d7{job_multiplier}), {r2_request_cpus}T\n")
+    else:
+        out.write(f"\n  Tuning: {orig_nt}T baseline")
+        if n_pipelines > 1:
+            out.write(f" \u2192 {n_pipelines} pipelines")
+        tuned_vals = [t.get("tuned_nthreads", orig_nt) for t in per_step_tuning.values()]
+        if tuned_vals and len(set(tuned_vals)) == 1:
+            out.write(f" \u00d7 {tuned_vals[0]}T (uniform)")
+        elif tuned_vals:
+            out.write(f", per-step: [{', '.join(str(v) for v in tuned_vals)}]")
+        out.write("\n")
 
     # Memory limits
     mem_per_core = adaptive.get("memory_per_core_mb", 0)
@@ -357,7 +396,11 @@ def _print_adaptive_report(
         out.write(f"  Memory: {mem_per_core} MB/core (R1)")
         if max_mem_per_core > 0:
             out.write(f", max {max_mem_per_core} MB/core (R2)")
-        if ideal_mem > 0 and actual_mem > 0 and ideal_mem > actual_mem:
+        if job_multiplier > 1:
+            r2_mem = adaptive.get("new_request_memory_mb", 0)
+            if r2_mem > 0:
+                out.write(f"\n  R2 request_memory: {r2_mem} MB ({r2_request_cpus} cores)")
+        elif ideal_mem > 0 and actual_mem > 0 and ideal_mem > actual_mem:
             out.write(f"\n  Memory needed: {ideal_mem} MB"
                       f" ({ideal_mem // orig_nt if orig_nt else 0} MB/core)"
                       f" — capped at {actual_mem} MB")
@@ -365,21 +408,22 @@ def _print_adaptive_report(
             out.write(f"\n  R2 request_memory: {actual_mem} MB")
         out.write("\n")
 
-    # Ideal n_parallel (if memory-constrained)
-    step0_tuning = per_step_tuning.get("0", {})
-    ideal_n_par = step0_tuning.get("ideal_n_parallel", 0)
-    actual_n_par = step0_tuning.get("n_parallel", 1)
-    if ideal_n_par > actual_n_par:
-        out.write(f"  Step 0 split: {actual_n_par} instances"
-                  f" (ideal: {ideal_n_par}, memory-constrained)\n")
+    # Ideal n_parallel (if memory-constrained, not for job split)
+    if job_multiplier <= 1:
+        step0_tuning = per_step_tuning.get("0", {})
+        ideal_n_par = step0_tuning.get("ideal_n_parallel", 0)
+        actual_n_par = step0_tuning.get("n_parallel", 1)
+        if ideal_n_par > actual_n_par:
+            out.write(f"  Step 0 split: {actual_n_par} instances"
+                      f" (ideal: {ideal_n_par}, memory-constrained)\n")
 
     # Round 1 table
     r1_cpu_pct = 0.0
     if round1_steps:
-        out.write(f"\n  Round 1 (baseline, {orig_nt}T):\n")
+        out.write(f"\n  Round 1 (baseline, {orig_nt}T, {r1_jobs} jobs):\n")
         _, _, r1_cpu_pct, _ = _print_step_table(
             round1_steps, orig_nt, out, show_nthreads=False,
-            n_concurrent=1, n_jobs=jobs_per_round, request_cpus=orig_nt)
+            n_concurrent=1, n_jobs=r1_jobs, request_cpus=orig_nt)
 
     # Round 2 table
     r2_cpu_pct = 0.0
@@ -394,18 +438,22 @@ def _print_adaptive_report(
                 r2_nt_map[i] = orig_nt
 
         desc_parts = []
-        if n_pipelines > 1:
-            desc_parts.append(f"{n_pipelines} pipelines")
-        tuned_unique = sorted(set(r2_nt_map.values()))
-        if len(tuned_unique) == 1:
-            desc_parts.append(f"{tuned_unique[0]}T")
+        if job_multiplier > 1:
+            desc_parts.append(f"{r2_jobs} jobs")
+            desc_parts.append(f"{r2_request_cpus}T")
         else:
-            desc_parts.append("per-step tuned")
+            if n_pipelines > 1:
+                desc_parts.append(f"{n_pipelines} pipelines")
+            tuned_unique = sorted(set(r2_nt_map.values()))
+            if len(tuned_unique) == 1:
+                desc_parts.append(f"{tuned_unique[0]}T")
+            else:
+                desc_parts.append("per-step tuned")
 
         out.write(f"\n  Round 2 ({', '.join(desc_parts)}):\n")
         _, _, r2_cpu_pct, _ = _print_step_table(
             round2_steps, r2_nt_map, out, show_nthreads=True,
-            n_concurrent=n_pipelines, n_jobs=jobs_per_round, request_cpus=orig_nt)
+            n_concurrent=n_pipelines, n_jobs=r2_jobs, request_cpus=r2_request_cpus)
 
     # Overall CPU efficiency summary
     if r1_cpu_pct > 0:
@@ -434,6 +482,137 @@ def _print_time_breakdown(
         if perf.time_overhead > 0:
             out.write(f"  overhead {perf.time_overhead:.0f}s")
         out.write(f"  total {result.elapsed_sec:.0f}s\n")
+
+
+# ── CPU timeline plot ────────────────────────────────────────
+
+
+def _rolling_mean(data: list[float], window: int) -> list[float]:
+    """Simple moving average, same length as input (edges use smaller windows)."""
+    n = len(data)
+    result = []
+    for i in range(n):
+        lo = max(0, i - window // 2)
+        hi = min(n, i + window // 2 + 1)
+        result.append(sum(data[lo:hi]) / (hi - lo))
+    return result
+
+
+def _annotate_phases(ax, perf: PerfData) -> None:
+    """Shade workflow phase regions on the plot."""
+    colors = {
+        "Processing": ("#2196F3", 0.08),
+        "Merge": ("#FF9800", 0.12),
+        "Cleanup": ("#4CAF50", 0.12),
+    }
+
+    t_cursor = 0.0
+    if perf.time_processing > 0:
+        c, a = colors["Processing"]
+        ax.axvspan(t_cursor, t_cursor + perf.time_processing,
+                   color=c, alpha=a, label="Processing")
+        t_cursor += perf.time_processing
+    if perf.time_overhead > 0:
+        t_cursor += perf.time_overhead
+    if perf.time_merge > 0:
+        c, a = colors["Merge"]
+        ax.axvspan(t_cursor, t_cursor + perf.time_merge,
+                   color=c, alpha=a, label="Merge")
+        t_cursor += perf.time_merge
+    if perf.time_cleanup > 0:
+        c, a = colors["Cleanup"]
+        ax.axvspan(t_cursor, t_cursor + perf.time_cleanup,
+                   color=c, alpha=a, label="Cleanup")
+
+
+def _find_r1r2_boundary(cores: list[float], perf: PerfData) -> int | None:
+    """Estimate R1/R2 boundary sample index for adaptive workflows.
+
+    Looks for the deepest sustained dip in CPU usage (the replan gap)
+    between the two processing bursts.  Only searches the middle 80%
+    of the timeline.
+    """
+    n = len(cores)
+    if n < 40:
+        return None
+    # Search in the middle 60% of the timeline
+    lo = n // 5
+    hi = 4 * n // 5
+    # Smooth heavily to find the valley
+    window = max(12, n // 20)
+    smoothed = _rolling_mean(cores, window)
+    # Find the minimum in the search window
+    min_val = float("inf")
+    min_idx = lo
+    for i in range(lo, hi):
+        if smoothed[i] < min_val:
+            min_val = smoothed[i]
+            min_idx = i
+    # Only report if the dip is significant (below 50% of expected)
+    expected = perf.cpu_expected_pct / 100.0
+    if expected > 0 and min_val < expected * 0.5:
+        return min_idx
+    return None
+
+
+def _save_cpu_plot(
+    result: WorkflowResult, perf: PerfData, out_path: Path,
+) -> Path | None:
+    """Generate CPU timeline PNG for a workflow run."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    samples = perf.cpu_samples
+    if len(samples) < 10:
+        return None
+
+    # Time axis
+    t = [i * POLL_INTERVAL for i in range(len(samples))]
+    # Convert CPU% to cores (100% = 1 core)
+    cores = [s / 100.0 for s in samples]
+
+    # Smoothing: rolling average (window = ~30s = 6 samples)
+    window = min(6, len(cores) // 4)
+    if window > 1:
+        smoothed = _rolling_mean(cores, window)
+    else:
+        smoothed = cores
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.fill_between(t, smoothed, alpha=0.3, color="#1976D2")
+    ax.plot(t, smoothed, linewidth=0.8, color="#1976D2")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("CPU cores")
+    ax.set_title(f"{result.wf_id:.1f} \u2014 {result.title}")
+
+    # Expected cores line
+    expected = perf.cpu_expected_pct / 100.0
+    if expected > 0:
+        ax.axhline(y=expected, color="red", linestyle="--", alpha=0.5,
+                    label=f"Allocated ({expected:.0f} cores)")
+
+    # Phase annotations
+    _annotate_phases(ax, perf)
+
+    # Adaptive R1/R2 boundary
+    adaptive = perf.raw_job_step_data.get("_adaptive")
+    if adaptive:
+        boundary = _find_r1r2_boundary(cores, perf)
+        if boundary is not None:
+            ax.axvline(x=t[boundary], color="#9C27B0", linestyle=":",
+                       alpha=0.7, label="R1\u2192R2 replan")
+
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_xlim(0, t[-1])
+    ax.set_ylim(0, None)
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=100)
+    plt.close(fig)
+    return out_path
 
 
 # ── Catalog listing ──────────────────────────────────────────
