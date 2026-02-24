@@ -2814,3 +2814,48 @@ Peak memory per job: R1 4200 MB (8.2 GB × 2 jobs)  R2 4200 MB (8.2 GB × 2 jobs
 - R2→R3: Job split triggered (averaged metrics → 5.2 eff cores < 5.66 → 4T → 4 jobs × 4T)
 - Per-job memory correctly reduced from 4200→3000 MB after split
 - Machine total increased from 8.2→11.7 GB (more jobs, less per job)
+
+---
+
+## Adaptive Execution Algorithm Specification
+
+**Date**: 2026-02-24
+**Spec Version**: 2.7.0
+**Commit**: ebdf7af
+
+### What Was Built
+
+Created `docs/adaptive.md` (1139 lines) — a standalone algorithm specification documenting the concrete algorithms behind main spec Section 5. This is a companion document to `docs/spec.md`, following the same OpenSpec v1.0 format as `docs/testing.md`.
+
+### Document Structure
+
+| Section | Lines | Content |
+|---|---|---|
+| 1. Overview | ~25 | Purpose, relationship to main spec, scope |
+| 2. Core Concepts | ~70 | Effective cores, geometric mean thread rounding, work unit rounds, three optimization modes |
+| 3. Metric Collection | ~90 | `analyze_wu_metrics()`, `load_cgroup_metrics()`, `merge_round_metrics()` with normalization formula |
+| 4. Probe Node Design | ~80 | Configuration (2×(N/2)T on last WU0 proc), metrics extraction, marginal memory model |
+| 5. Memory Sizing Model | ~90 | 4-level source hierarchies for each mode, constants table |
+| 6. Cgroup and Tmpfs | ~35 | Why cgroup matters, tmpfs optimization, tmpfs-aware binding selection |
+| 7. Per-Step nThreads Tuning | ~140 | Step 0 splitting, memory-aware instance reduction, CPU overcommit, output format |
+| 8. Adaptive Job Split | ~100 | Core algorithm, DAG rewriting, event range redistribution |
+| 9. Pipeline Split | ~55 | Algorithm, uniform vs per-step threads |
+| 10. Manifest Patching | ~35 | Behavior, sandbox contract |
+| 11. Multi-Round Convergence | ~60 | Round progression, orchestration, convergence properties |
+| 12. Worked Examples | ~90 | Geometric mean table, 3-round job split trace, memory source fallback scenarios |
+| 13. CLI Reference | ~85 | Arguments table, decision JSON schema, DAGMan integration |
+| Appendix A | ~15 | Constants reference (consolidated) |
+| Appendix B | ~50 | Decision JSON schema (full field listing) |
+
+### Design Decisions
+
+- **Separate document rather than inline in spec.md**: The main spec Section 5 (~155 lines) covers the adaptive model at an architectural level. The algorithm details (1139 lines) would overwhelm the main spec. A companion document keeps the main spec readable while providing the algorithm-level detail needed for reimplementation.
+- **Memory source hierarchy tables**: The priority order for per-step tuning differs from job split mode (probe_peak > cgroup_measured > probe_rss > theoretical vs probe_peak > cgroup_measured > probe_rss > prior_rss). Documenting these as explicit tables makes the non-obvious priority differences visible.
+- **Worked examples**: The 3-round job split trace (§12.2) demonstrates the critical geometric mean boundary at 5.657 and how multi-round merging can shift the efficiency estimate across that boundary.
+
+### Verification
+
+- All 10 constants verified against `tests/matrix/adaptive.py` values (SANDBOX_OVERHEAD=3000, TMPFS_PER_INSTANCE=1500/2000, CGROUP_HEADROOM=1000, PER_THREAD_OVERHEAD=250, MAX_PARALLEL=4, safety_margin=0.20, marginal floor=500, pipeline RSS floor=500, power-of-2 max=64)
+- Memory source hierarchy priority order matches code: `compute_per_step_nthreads()` lines 585–601, `compute_job_split()` lines 818–857
+- Spec.md §5.1–§5.5 cross-references verified against actual section locations
+- Cross-reference sentence added to `docs/spec.md` Section 5.1
