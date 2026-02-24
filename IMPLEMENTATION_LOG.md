@@ -2740,3 +2740,77 @@ With 392.1 R2 data and 10% margin: `max(5126, 2990) × 1.10 = 5638 MB` — corre
 - `proc_1_cgroup.json` (R2, tmpfs): `peak_anon=3755, shmem=1494, tmpfs_peak_nr=5126, no_tmpfs_peak=2990`
 - Adaptive algorithm correctly selects `cgroup_measured` source and computes 5638 MB
 - Backward compatible: jobs without `proc_*_cgroup.json` fall through to existing FJR+estimate logic
+
+---
+
+## N-Round Adaptive Execution and Simulator Job-Split Workflow
+
+**Date**: 2026-02-24
+
+### What was built
+
+Generalized the adaptive execution framework from a fixed 2 work units to N work units, with replan nodes between each consecutive pair. Added workflow 155.2 as the simulator equivalent of 392.0 (3-round adaptive job split).
+
+### Runner changes (`tests/matrix/runner.py`)
+
+**N-round adaptive support**:
+- `_execute_adaptive()` now generates `replan_0..replan_{N-2}` submit files and DAG nodes dynamically based on `num_work_units`
+- Each replan node receives `--prior-wu-dirs` (comma-separated list of all completed WU dirs) and `--replan-index` for multi-round metric averaging
+- Probe node injection remains WU0-only; probe exclusion from R1 performance data uses the `probe_node` field from replan decisions
+
+**Per-WU configuration**:
+- `split_tmpfs` injection via `manifest_tuned.json` in each merge group, respecting `split_tmpfs_from_wu` threshold
+- `memory_mb_per_wu` overrides: per-WU `request_memory` patching in proc submit files
+- Multi-WU job distribution: `jobs_per_work_unit = num_jobs // num_work_units` ensures each WU gets its own merge group
+
+**Performance collection**:
+- `_collect_adaptive_perf()` reads `replan_*_decisions.json` files (one per replan node) and stores them as `_all_decisions` list
+- Probe node excluded from R1 step data to avoid corrupting baseline metrics
+
+### Reporter changes (`tests/matrix/reporter.py`)
+
+**N-round dynamic reporting**:
+- `_print_adaptive_report()` discovers rounds dynamically from step name prefixes (`Round 1:`, `Round 2:`, etc.)
+- Builds per-round metadata from `_all_decisions` list: job count, request_cpus, job_multiplier, n_pipelines, per-step tuning
+- Throughput comparison table shows all rounds side-by-side with pairwise deltas (Δ1→2, Δ2→3, etc.)
+- CPU efficiency summary shows all rounds (e.g., `R1 81%  R2 83%  R3 85%  (+4pp)`)
+
+**Per-round peak memory**:
+- New summary line: `Peak memory per job: R1 4200 MB (8.2 GB × 2 jobs)  R2 4200 MB (8.2 GB × 2 jobs)  R3 3000 MB (11.7 GB × 4 jobs)`
+- Shows per-job RSS and total machine memory footprint per round
+
+### Data model changes (`tests/matrix/definitions.py`)
+
+| Field | Type | Purpose |
+|---|---|---|
+| `split_tmpfs_from_wu` | `int` | Only inject tmpfs for WU >= this index (default 0) |
+| `memory_mb_per_wu` | `dict[int, int]` | Per-WU request_memory overrides |
+
+### New workflows (`tests/matrix/catalog.py`)
+
+| ID | Title | Mode | Key parameters |
+|---|---|---|---|
+| 155.2 | Simulator adaptive job split 3-round, 3 GB/core | simulator | 2 jobs × 8T, num_work_units=3, job_split, probe_split |
+| 392.1 | DY2L fixed 2T memory test (3-round tmpfs) | cached | 3 jobs × 2T, split_tmpfs_from_wu=1, memory_mb_per_wu |
+
+**155.2 design**: Simulator equivalent of 392.0. GEN-SIM serial_fraction=0.30 at 8T gives ~5.9 effective cores, which is above the geometric-mean midpoint (√(4×8)=5.66), so replan_0 does NOT split (stays at 8T). Only replan_1 triggers the job split after averaging R1+R2 metrics (cpu_eff converges → 5.2 eff cores → below 5.66 → rounds to 4T → job_multiplier=2).
+
+### Verification
+
+155.2 run result (312s):
+
+```
+Throughput Comparison
+                         Round 1     Round 2     Round 3      Δ1→2      Δ2→3
+  Events                      20          20          20
+  Jobs × Cores              2×8T        2×8T        4×4T
+  Ev/core-hour             22500       28125       28125    +25.0%     +0.0%
+
+CPU efficiency per job:  R1 81%  R2 83%  R3 85%  (+4pp)
+Peak memory per job: R1 4200 MB (8.2 GB × 2 jobs)  R2 4200 MB (8.2 GB × 2 jobs)  R3 3000 MB (11.7 GB × 4 jobs)
+```
+
+- R1→R2: No split (5.9 eff cores > 5.66 midpoint), stays at 2×8T
+- R2→R3: Job split triggered (averaged metrics → 5.2 eff cores < 5.66 → 4T → 4 jobs × 4T)
+- Per-job memory correctly reduced from 4200→3000 MB after split
+- Machine total increased from 8.2→11.7 GB (more jobs, less per job)
