@@ -2637,4 +2637,46 @@ Updated the three adaptive algorithms in `tests/matrix/adaptive.py` to match the
 
 **New parameter:** `safety_margin` (default 0.20) added to `WorkflowDef`, all three compute functions, and the CLI (`--safety-margin`). Recorded in `replan_decisions.json` for traceability.
 
+---
+
+## Testing Specification
+
+**Date**: 2026-02-24
+
+### What Was Built
+
+Created `docs/testing.md` (597 lines) — a formal testing specification document following the same OpenSpec v1.0 format as the main spec.
+
+### Motivation
+
+The testing infrastructure had grown to ~13K lines across unit tests, integration tests, the matrix runner, cmsRun simulator, adaptive analysis, fault injection, and environment verification — all undocumented. The main spec mentions testing only in passing. Following the project principle that "the spec is the source of truth — always rebuildable," the testing infrastructure needed its own specification.
+
+### Document Structure
+
+| Section | Content |
+|---|---|
+| §1 Overview | Purpose, relationship to main spec, production code reuse principle |
+| §2 Test Levels | Unit (18 files, ~5.3K lines), integration (6 files, ~1.6K lines), matrix (~5.3K lines), environment (7 files, ~400 lines) |
+| §3 Test Matrix System | Architecture, execution flow, full 26-workflow catalog table, 7 named sets, CLI reference |
+| §4 Execution Modes | Synthetic, simulator (Amdahl's law resource models), real CMSSW |
+| §5 Adaptive Execution Testing | Two-round model, 6 adaptive modes, probe split, multi-round convergence, simulator integration |
+| §6 Fault Injection | Post-DAG injection mechanism, FaultSpec/VerifySpec data structures, 3 fault workflows |
+| §7 Verification Model | DAG status, rescue DAG, output checks, performance metrics, adaptive convergence |
+| §8 Unit Test Coverage | Mock strategy (5 fixture types), test file → component map with spec cross-references |
+| §9 Integration Test Coverage | 6 integration test files with infrastructure requirements |
+| §10 Environment Verification | 4 capability levels (L0–L3), matrix capability mapping |
+| §11 Performance Baselines | Main spec §13.1 success criteria mapped to test mechanisms |
+| §12 Future Work | CI/CD, load testing, regression detection, simulator profile library |
+
+### Spec Changes
+
+- `docs/spec.md` §10.4: Added one-line reference to `docs/testing.md` after Phase 4 deliverables
+
+### Verification
+
+- All 37 referenced source files confirmed to exist
+- All 26 catalog entries match actual `CATALOG` dictionary in `catalog.py`
+- Section numbering is sequential (§1–§12 with subsections)
+- Formatting follows main spec conventions (tables, inline code, `##`/`###` hierarchy)
+
 **Key fix:** `compute_job_split` previously used `max_memory_per_core` as the per-core formula base. Now uses `memory_per_core` (default) as floor and `max_memory_per_core` as ceiling, matching the spec's clamp semantics.
