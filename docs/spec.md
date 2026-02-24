@@ -2228,7 +2228,7 @@ class MetricsCollector:
 
 WMS2 does not run a separate pilot job. Instead, the first production DAG uses resource hints from the request (TimePerEvent, Memory, SizePerEvent) as defaults. As work units complete, their Framework Job Report (FJR) data — per-step CPU efficiency, peak RSS, wall time — is collected by the sandbox and written to merge manifests. When a recovery round occurs (rescue DAG after clean stop, partial failure, or partial production step), the Lifecycle Manager aggregates this FJR data into `step_metrics` on the workflow, and the DAG Planner writes it to `step_profile.json` in the submit directory. The sandbox reads this file and applies per-step adaptive optimization.
 
-This design eliminates the latency of a dedicated pilot phase (~8 hours) while converging to optimal resource estimates asymptotically through production data. The existing recovery/rescue DAG mechanism is the natural re-optimization point — no new states, no new components.
+This design eliminates the latency of a dedicated pilot phase (~8 hours) while converging to optimal resource estimates asymptotically through production data. The existing recovery/rescue DAG mechanism is the natural re-optimization point — no new states, no new components. See `docs/adaptive.md` for the complete algorithm specification covering thread count rounding, memory source hierarchy, probe node design, job split, pipeline split, and multi-round convergence.
 
 ### 5.2 Memory-Per-Core Window
 
