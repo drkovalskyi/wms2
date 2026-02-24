@@ -1163,6 +1163,12 @@ if os.path.isfile(manifest_file):
                 mdest = os.path.join(pfn_dir, metrics_file)
                 shutil.copy2(metrics_file, mdest)
                 print(f'Staged metrics: {metrics_file} -> {mdest}')
+            # Stage cgroup metrics file
+            cgroup_file = 'proc_${NODE_INDEX}_cgroup.json'
+            if os.path.isfile(cgroup_file):
+                cdest = os.path.join(pfn_dir, cgroup_file)
+                shutil.copy2(cgroup_file, cdest)
+                print(f'Staged cgroup: {cgroup_file} -> {cdest}')
             break
 "
 }
@@ -1670,6 +1676,68 @@ run_cmssw_mode() {
 
     PREV_OUTPUT=""
 
+    # ── Background memory monitor ──────────────────────────────
+    # Samples cgroup memory every 2 seconds to capture transient peaks
+    # that condor's 5-minute updates and FJR event-boundary sampling miss.
+    # Output: memory_monitor.log columns:
+    #   ts_sec cgroup_mb anon_mb file_mb shmem_mb tmpfs_present
+    # - cgroup_mb: total from memory.current (what cgroup limit enforces)
+    # - anon_mb:   anonymous pages from memory.stat (process RSS)
+    # - file_mb:   file-backed pages from memory.stat (page cache, reclaimable)
+    # - shmem_mb:  shared/tmpfs pages from memory.stat (non-reclaimable)
+    # - tmpfs_present: 1 if /dev/shm/wms2_step0_$$ exists, else 0
+    MEMMON_LOG="$WORK_DIR/memory_monitor.log"
+    # Locate cgroup v2 memory file for this job's cgroup
+    _memmon_cgroup_file=""
+    _memmon_stat_file=""
+    _cg_path=$(cat /proc/self/cgroup 2>/dev/null | sed 's/^0:://')
+    if [[ -n "$_cg_path" ]]; then
+        _candidate="/sys/fs/cgroup${_cg_path}/memory.current"
+        if [[ -r "$_candidate" ]]; then
+            _memmon_cgroup_file="$_candidate"
+            _stat_candidate="/sys/fs/cgroup${_cg_path}/memory.stat"
+            [[ -r "$_stat_candidate" ]] && _memmon_stat_file="$_stat_candidate"
+        fi
+    fi
+    # Fallback: cgroup v2 root or v1
+    if [[ -z "$_memmon_cgroup_file" ]]; then
+        if [[ -r /sys/fs/cgroup/memory.current ]]; then
+            _memmon_cgroup_file="/sys/fs/cgroup/memory.current"
+            [[ -r /sys/fs/cgroup/memory.stat ]] && _memmon_stat_file="/sys/fs/cgroup/memory.stat"
+        elif [[ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]]; then
+            _memmon_cgroup_file="/sys/fs/cgroup/memory/memory.usage_in_bytes"
+        fi
+    fi
+    echo "Memory monitor cgroup file: ${_memmon_cgroup_file:-none}"
+    echo "Memory monitor stat file:   ${_memmon_stat_file:-none}"
+    # Save wrapper PID for tmpfs detection inside the subshell
+    # ($$ doesn't change in subshells, but be explicit)
+    _wrapper_pid=$$
+    (
+        echo "# ts_sec cgroup_mb anon_mb file_mb shmem_mb tmpfs_present" > "$MEMMON_LOG"
+        while true; do
+            ts=$(date +%s)
+            # Cgroup total memory (RSS + page cache + tmpfs + kernel)
+            cg=0
+            if [[ -n "$_memmon_cgroup_file" && -r "$_memmon_cgroup_file" ]]; then
+                cg_bytes=$(cat "$_memmon_cgroup_file" 2>/dev/null || echo 0)
+                cg=$((cg_bytes / 1048576))
+            fi
+            # Breakdown from memory.stat (cgroup v2)
+            anon=0; file_mb=0; shmem=0
+            if [[ -n "$_memmon_stat_file" && -r "$_memmon_stat_file" ]]; then
+                eval "$(awk '/^anon / {printf "anon=%d;",int($2/1048576)} /^file / {printf "file_mb=%d;",int($2/1048576)} /^shmem / {printf "shmem=%d;",int($2/1048576)}' "$_memmon_stat_file" 2>/dev/null)"
+            fi
+            # Check if tmpfs step0 dir exists
+            tmpfs_flag=0
+            [[ -d /dev/shm/wms2_step0_${_wrapper_pid} ]] && tmpfs_flag=1
+            echo "$ts $cg $anon $file_mb $shmem $tmpfs_flag" >> "$MEMMON_LOG"
+            sleep 2
+        done
+    ) &
+    MEMMON_PID=$!
+    echo "Memory monitor started (pid $MEMMON_PID, log: memory_monitor.log)"
+
     for step_idx in $(seq 0 $((NUM_STEPS - 1))); do
         step_num=$((step_idx + 1))
 
@@ -1808,6 +1876,9 @@ with open(pset, 'a') as f:
             fi
             STEP_RC=$?
             WORK_DIR="$SAVED_WORK_DIR"
+            # Measure tmpfs usage before cleanup
+            TMPFS_MB=$(du -sm "$STEP0_TMPFS" 2>/dev/null | awk '{print $1}')
+            echo "  tmpfs_usage_mb: ${TMPFS_MB:-0}"
             # Copy ROOT outputs back to work dir
             for rf in *.root; do
                 [[ -f "$rf" ]] && cp "$rf" "$ORIG_DIR/"
@@ -1868,6 +1939,42 @@ except Exception:
     done
 
     fi  # end of sequential (non-pipeline) mode
+
+    # Stop memory monitor
+    if [[ -n "${MEMMON_PID:-}" ]]; then
+        kill "$MEMMON_PID" 2>/dev/null || true
+        wait "$MEMMON_PID" 2>/dev/null || true
+        if [[ -f "$MEMMON_LOG" ]]; then
+            SAMPLES=$(awk 'NR>1' "$MEMMON_LOG" | wc -l)
+            PEAK_CG=$(awk 'NR>1 && $2+0 > mx {mx=$2+0} END {print mx+0}' "$MEMMON_LOG")
+            PEAK_ANON=$(awk 'NR>1 && $3+0 > mx {mx=$3+0} END {print mx+0}' "$MEMMON_LOG")
+            PEAK_FILE=$(awk 'NR>1 && $4+0 > mx {mx=$4+0} END {print mx+0}' "$MEMMON_LOG")
+            PEAK_SHMEM=$(awk 'NR>1 && $5+0 > mx {mx=$5+0} END {print mx+0}' "$MEMMON_LOG")
+            # Peak non-reclaimable (anon+shmem) split by tmpfs phase
+            TMPFS_PEAK_NR=$(awk 'NR>1 && $6==1 {v=$3+$5; if(v>mx) mx=v} END {print mx+0}' "$MEMMON_LOG")
+            NO_TMPFS_PEAK_ANON=$(awk 'NR>1 && $6==0 {v=$3+0; if(v>mx) mx=v} END {print mx+0}' "$MEMMON_LOG")
+            PEAK_NR=$(awk 'NR>1 {v=$3+$5; if(v>mx) mx=v} END {print mx+0}' "$MEMMON_LOG")
+            echo "Memory monitor: ${SAMPLES} samples"
+            echo "  peak cgroup=${PEAK_CG} MB  (anon=${PEAK_ANON} file=${PEAK_FILE} shmem=${PEAK_SHMEM})"
+            echo "  peak non-reclaimable=${PEAK_NR} MB  (tmpfs_phase=${TMPFS_PEAK_NR} no_tmpfs=${NO_TMPFS_PEAK_ANON})"
+            # Write cgroup metrics JSON for adaptive algorithm
+            python3 -c "
+import json
+data = {
+    'peak_anon_mb': int('${PEAK_ANON}'),
+    'peak_shmem_mb': int('${PEAK_SHMEM}'),
+    'peak_nonreclaim_mb': int('${PEAK_NR}'),
+    'tmpfs_peak_nonreclaim_mb': int('${TMPFS_PEAK_NR}'),
+    'no_tmpfs_peak_anon_mb': int('${NO_TMPFS_PEAK_ANON}'),
+    'num_samples': int('${SAMPLES}'),
+}
+out = 'proc_${NODE_INDEX}_cgroup.json'
+with open(out, 'w') as f:
+    json.dump(data, f, indent=2)
+print(f'Wrote {out}')
+" 2>/dev/null || true
+        fi
+    fi
 
     process_outputs
 

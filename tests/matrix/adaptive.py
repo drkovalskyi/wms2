@@ -104,6 +104,7 @@ def analyze_wu_metrics(group_dir: Path, exclude_nodes: set[str] | None = None) -
                 s = steps.setdefault(si, {
                     "wall_sec": [], "cpu_eff": [], "peak_rss_mb": [],
                     "events": [], "throughput": [], "cpu_time_sec": [],
+                    "nthreads": [],
                 })
                 if step_data.get("wall_time_sec"):
                     s["wall_sec"].append(step_data["wall_time_sec"])
@@ -118,8 +119,10 @@ def analyze_wu_metrics(group_dir: Path, exclude_nodes: set[str] | None = None) -
                 if step_data.get("cpu_time_sec"):
                     s["cpu_time_sec"].append(step_data["cpu_time_sec"])
                 nt = step_data.get("num_threads")
-                if nt and nt > nthreads:
-                    nthreads = nt
+                if nt:
+                    s["nthreads"].append(nt)
+                    if nt > nthreads:
+                        nthreads = nt
 
         if num_jobs > 0:
             break  # found metrics in this dir, don't look further
@@ -148,7 +151,7 @@ def analyze_wu_metrics(group_dir: Path, exclude_nodes: set[str] | None = None) -
     weighted_cpu_eff = weighted_eff_num / weighted_eff_den if weighted_eff_den > 0 else 0.5
     effective_cores = weighted_cpu_eff * nthreads
 
-    return {
+    result = {
         "steps": steps,
         "peak_rss_mb": peak_rss_all,
         "weighted_cpu_eff": weighted_cpu_eff,
@@ -156,6 +159,207 @@ def analyze_wu_metrics(group_dir: Path, exclude_nodes: set[str] | None = None) -
         "num_jobs": num_jobs,
         "nthreads": nthreads,
     }
+    # Attach cgroup monitor data if available (captures subprocess memory
+    # that FJR PeakValueRss misses)
+    cgroup = load_cgroup_metrics(group_dir, exclude_nodes=exclude_nodes)
+    if cgroup:
+        result["cgroup"] = cgroup
+    return result
+
+
+def merge_round_metrics(round_metrics: list[dict], original_nthreads: int) -> dict:
+    """Merge metrics from multiple rounds, normalizing cpu_eff to original_nthreads.
+
+    When a round ran at reduced thread count (e.g. 2T instead of 8T),
+    its raw cpu_eff overstates effective cores:
+        eff_cores = raw_eff × original_nt   (WRONG if run at 2T)
+    Normalization: normalized_eff = raw_eff × actual_nt / original_nt
+    so that:  eff_cores = normalized_eff × original_nt = raw_eff × actual_nt  (CORRECT)
+
+    Strategy:
+    - cpu_eff: Normalize each round's values using per-step nthreads,
+      then concatenate from ALL rounds (more data = better estimate).
+    - RSS, wall, events, throughput, cpu_time: Most recent round only
+      (best predictor at the current thread count).
+    - nthreads: Set to original_nthreads (matches normalized reference frame).
+    - Recompute weighted_cpu_eff and effective_cores from normalized values.
+    """
+    if not round_metrics:
+        raise ValueError("No round metrics to merge")
+
+    # Single round: normalize in place and return
+    if len(round_metrics) == 1:
+        m = round_metrics[0]
+        round_nt = m["nthreads"]
+        for si, s in m["steps"].items():
+            step_nts = s.get("nthreads", [])
+            step_nt = (sum(step_nts) / len(step_nts)) if step_nts else round_nt
+            if step_nt != original_nthreads and original_nthreads > 0:
+                ratio = step_nt / original_nthreads
+                s["cpu_eff"] = [e * ratio for e in s["cpu_eff"]]
+        # Recompute aggregates
+        m["nthreads"] = original_nthreads
+        weighted_num = 0.0
+        weighted_den = 0.0
+        for si in sorted(m["steps"]):
+            s = m["steps"][si]
+            wall_vals = s["wall_sec"]
+            eff_vals = s["cpu_eff"]
+            if wall_vals and eff_vals:
+                mean_wall = sum(wall_vals) / len(wall_vals)
+                mean_eff = sum(eff_vals) / len(eff_vals)
+                weighted_num += mean_eff * mean_wall
+                weighted_den += mean_wall
+        m["weighted_cpu_eff"] = weighted_num / weighted_den if weighted_den > 0 else 0.5
+        m["effective_cores"] = m["weighted_cpu_eff"] * original_nthreads
+        # job_peak_mb already present if collected
+        return m
+
+    # Multiple rounds: merge cpu_eff from all, other fields from latest
+    latest = round_metrics[-1]
+    merged_steps: dict[int, dict[str, list]] = {}
+
+    # Initialize from latest round (RSS, wall, events, throughput, cpu_time)
+    for si, s in latest["steps"].items():
+        merged_steps[si] = {
+            "wall_sec": list(s["wall_sec"]),
+            "cpu_eff": [],  # will be filled from all rounds
+            "peak_rss_mb": list(s["peak_rss_mb"]),
+            "events": list(s["events"]),
+            "throughput": list(s["throughput"]),
+            "cpu_time_sec": list(s["cpu_time_sec"]),
+            "nthreads": [],
+        }
+
+    # Collect normalized cpu_eff from ALL rounds
+    for rm in round_metrics:
+        round_nt = rm["nthreads"]
+        for si, s in rm["steps"].items():
+            if si not in merged_steps:
+                merged_steps[si] = {
+                    "wall_sec": list(s["wall_sec"]),
+                    "cpu_eff": [],
+                    "peak_rss_mb": list(s["peak_rss_mb"]),
+                    "events": list(s["events"]),
+                    "throughput": list(s["throughput"]),
+                    "cpu_time_sec": list(s["cpu_time_sec"]),
+                    "nthreads": [],
+                }
+            step_nts = s.get("nthreads", [])
+            step_nt = (sum(step_nts) / len(step_nts)) if step_nts else round_nt
+            ratio = step_nt / original_nthreads if original_nthreads > 0 else 1.0
+            merged_steps[si]["cpu_eff"].extend(e * ratio for e in s["cpu_eff"])
+
+    # Recompute aggregates
+    peak_rss_all = 0.0
+    weighted_num = 0.0
+    weighted_den = 0.0
+    for si in sorted(merged_steps):
+        s = merged_steps[si]
+        rss_vals = s["peak_rss_mb"]
+        if rss_vals:
+            peak_rss_all = max(peak_rss_all, max(rss_vals))
+        wall_vals = s["wall_sec"]
+        eff_vals = s["cpu_eff"]
+        if wall_vals and eff_vals:
+            mean_wall = sum(wall_vals) / len(wall_vals)
+            mean_eff = sum(eff_vals) / len(eff_vals)
+            weighted_num += mean_eff * mean_wall
+            weighted_den += mean_wall
+
+    weighted_cpu_eff = weighted_num / weighted_den if weighted_den > 0 else 0.5
+
+    result = {
+        "steps": merged_steps,
+        "peak_rss_mb": peak_rss_all,
+        "weighted_cpu_eff": weighted_cpu_eff,
+        "effective_cores": weighted_cpu_eff * original_nthreads,
+        "num_jobs": latest["num_jobs"],
+        "nthreads": original_nthreads,
+    }
+    # Propagate cgroup data from latest round (most recent measurement)
+    if "cgroup" in latest:
+        result["cgroup"] = latest["cgroup"]
+    return result
+
+
+# ── Cgroup memory metrics ────────────────────────────────────
+
+
+def load_cgroup_metrics(
+    group_dir: Path, exclude_nodes: set[str] | None = None,
+) -> dict | None:
+    """Load cgroup monitor data from proc_*_cgroup.json files.
+
+    These files are generated by the wrapper's memory monitor and contain
+    peak non-reclaimable memory (anon + shmem) measured from cgroup
+    memory.stat.  Unlike FJR PeakValueRss, this captures ALL processes
+    in the cgroup (including ExternalLHEProducer subprocesses).
+
+    Returns aggregated peaks across all proc jobs, or None if no files found.
+    """
+    cgroup_pattern = re.compile(r"proc_(\d+)_cgroup\.json$")
+
+    # Search same dirs as analyze_wu_metrics
+    search_dirs = [group_dir]
+    output_info_path = group_dir / "output_info.json"
+    if output_info_path.exists():
+        try:
+            oi = json.loads(output_info_path.read_text())
+            pfx = oi.get("local_pfn_prefix", "")
+            gi = oi.get("group_index", 0)
+            for ds in oi.get("output_datasets", []):
+                ub = ds.get("unmerged_lfn_base", "")
+                if ub and pfx:
+                    udir = Path(pfx) / ub.lstrip("/") / f"{gi:06d}"
+                    if udir.is_dir():
+                        search_dirs.append(udir)
+        except Exception:
+            pass
+
+    num_jobs = 0
+    agg = {
+        "peak_anon_mb": 0,
+        "peak_shmem_mb": 0,
+        "peak_nonreclaim_mb": 0,
+        "tmpfs_peak_nonreclaim_mb": 0,
+        "no_tmpfs_peak_anon_mb": 0,
+    }
+
+    for search_dir in search_dirs:
+        for cf in sorted(search_dir.glob("proc_*_cgroup.json")):
+            if not cgroup_pattern.search(cf.name):
+                continue
+            # Apply same node exclusion as analyze_wu_metrics
+            if exclude_nodes:
+                file_idx_match = re.search(r"proc_(\d+)_cgroup", cf.name)
+                if file_idx_match:
+                    file_idx = int(file_idx_match.group(1))
+                    excluded_indices = set()
+                    for en in exclude_nodes:
+                        en_idx_match = re.search(r"proc_0*(\d+)$", en)
+                        if en_idx_match:
+                            excluded_indices.add(int(en_idx_match.group(1)))
+                    if file_idx in excluded_indices:
+                        continue
+            try:
+                data = json.loads(cf.read_text())
+            except Exception as exc:
+                logger.warning("Failed to read %s: %s", cf, exc)
+                continue
+
+            num_jobs += 1
+            for key in agg:
+                agg[key] = max(agg[key], data.get(key, 0))
+
+        if num_jobs > 0:
+            break  # found files in this dir, don't look further
+
+    if num_jobs == 0:
+        return None
+
+    agg["num_jobs"] = num_jobs
+    return agg
 
 
 # ── Probe metrics analysis ───────────────────────────────────
@@ -223,18 +427,25 @@ def analyze_probe_metrics(
         logger.warning("No step 0 RSS data in probe metrics %s", probe_file)
         return None
 
-    # Read peak cgroup memory from HTCondor job log (Image size).
-    # This is the real memory ceiling: RSS + tmpfs + page cache — what
-    # the cgroup enforces.  Much more accurate than FJR RSS + estimated tmpfs.
-    cgroup_peak_mb = 0.0
+    # Read peak MemoryUsage from HTCondor job log.
+    # The event 006 format is:
+    #   006 (...) Image size of job updated: <ImageSizeKb>
+    #       <MemoryUsage_MB>  -  MemoryUsage of job (MB)
+    #       <ResidentSetSize_KB>  -  ResidentSetSize of job (KB)
+    # ImageSize is virtual memory (irrelevant).  MemoryUsage is
+    # ceil(RSS/1024) at each sample — the best per-sample metric we
+    # have from the log.  Note: condor_history MemoryUsage (cgroup
+    # watermark) can be higher due to transient peaks between samples.
+    job_peak_mb = 0.0
     log_file = group_dir / f"{probe_node_name}.log"
     if log_file.exists():
         try:
             content = log_file.read_text()
-            # "Image size of job updated: NNNNNN" (in KB)
-            for m in re.finditer(r"Image size of job updated:\s+(\d+)", content):
-                kb = int(m.group(1))
-                cgroup_peak_mb = max(cgroup_peak_mb, kb / 1024.0)
+            for m in re.finditer(
+                r"(\d+)\s+-\s+MemoryUsage of job \(MB\)", content
+            ):
+                mb = int(m.group(1))
+                job_peak_mb = max(job_peak_mb, mb)
         except Exception:
             pass
 
@@ -243,10 +454,10 @@ def analyze_probe_metrics(
         "max_instance_rss_mb": max(step0_rss),
         "num_instances": len(step0_rss),
     }
-    if cgroup_peak_mb > 0:
-        result["cgroup_peak_mb"] = cgroup_peak_mb
-        # Per-instance cgroup memory = total / num_instances
-        result["per_instance_cgroup_mb"] = cgroup_peak_mb / len(step0_rss)
+    if job_peak_mb > 0:
+        result["job_peak_mb"] = job_peak_mb
+        # Per-instance peak memory = total / num_instances
+        result["per_instance_peak_mb"] = job_peak_mb / len(step0_rss)
     return result
 
 
@@ -279,17 +490,21 @@ def compute_per_step_nthreads(
     overcommit_max: float = 1.0,
     split: bool = True,
     probe_rss_mb: float = 0,
-    probe_cgroup_per_instance_mb: float = 0,
+    probe_job_peak_total_mb: float = 0,
+    probe_num_instances: int = 0,
     safety_margin: float = 0.20,
+    cgroup: dict | None = None,
 ) -> dict:
     """Derive optimal nThreads for step 0 parallel splitting and optional overcommit.
 
     Key inputs:
-      request_cpus      — max cores per job (ncores)
-      default_memory_mb — floor for request_memory (default_mem_per_core * ncores)
-      max_memory_mb     — ceiling for request_memory (max_mem_per_core * ncores)
-      overcommit_max    — max CPU overcommit ratio (1.0 = disabled)
-      safety_margin     — fractional margin on measured memory (0.20 = 20%)
+      request_cpus        — max cores per job (ncores)
+      default_memory_mb   — floor for request_memory (default_mem_per_core * ncores)
+      max_memory_mb       — ceiling for request_memory (max_mem_per_core * ncores)
+      overcommit_max      — max CPU overcommit ratio (1.0 = disabled)
+      safety_margin       — fractional margin on measured memory (0.20 = 20%)
+      probe_job_peak_total_mb — total job peak from probe (not per-instance)
+      probe_num_instances — number of instances in the probe job
 
     Memory sizing follows spec Section 5.5: measured data × (1 + safety_margin),
     clamped to [default_memory_mb, max_memory_mb].
@@ -340,7 +555,7 @@ def compute_per_step_nthreads(
             tuned = max(tuned, 2)
             n_par = request_cpus // tuned
             # Cap parallel instances to limit tmpfs usage for gridpack
-            # extraction (each uses ~1.4 GB counted against cgroup memory).
+            # extraction (each uses ~1.4 GB counted against job memory).
             MAX_PARALLEL = 4
             n_par = min(n_par, MAX_PARALLEL)
             n_par = max(n_par, 1)
@@ -349,16 +564,35 @@ def compute_per_step_nthreads(
             ideal_tuned = tuned
 
             # Per-instance memory for the memory model (spec Section 5.5).
+            #
+            # Memory model: SANDBOX_OVERHEAD + n_par × marginal_instance_mem
+            # - SANDBOX_OVERHEAD: CMSSW project area, shared libs, ROOT
+            #   (~3 GB constant, loaded once regardless of instances)
+            # - marginal_instance_mem: memory cost of adding one more instance
+            #
             # Three data sources, best to worst:
-            # 1. probe cgroup: actual cgroup peak / n_instances (includes RSS+tmpfs)
+            # 1. probe job peak: HTCondor-reported peak memory from probe,
+            #    subtract shared overhead to get marginal per-instance cost.
+            #    This avoids double-counting — dividing total by n_instances
+            #    would amortize the shared overhead into each instance, then
+            #    adding it back inflates the estimate.
             # 2. probe RSS: FJR peak_rss_mb from probe (RSS only, add TMPFS estimate)
             # 3. theoretical: R1 avg_rss at original nThreads (add TMPFS estimate)
+            #
             # All sources apply safety_margin to account for memory leak
             # accumulation, event-to-event variation, and page cache pressure.
-            if probe_cgroup_per_instance_mb > 0:
-                # Cgroup peak already includes RSS + tmpfs + page cache.
-                instance_mem = probe_cgroup_per_instance_mb * margin_mult
-                memory_source = "probe_cgroup"
+            SANDBOX_OVERHEAD_MB = 3000
+            if probe_job_peak_total_mb > 0 and probe_num_instances > 0:
+                # Marginal cost = (total - shared overhead) / n_probe_instances
+                marginal = (probe_job_peak_total_mb - SANDBOX_OVERHEAD_MB) / probe_num_instances
+                marginal = max(marginal, 500)  # floor: at least 500 MB/instance
+                instance_mem = marginal * margin_mult
+                memory_source = "probe_peak"
+            elif cgroup is not None and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) > 0:
+                # Measured cgroup data: peak non-reclaimable per instance
+                instance_mem = cgroup["tmpfs_peak_nonreclaim_mb"] * margin_mult
+                instance_mem = max(instance_mem, 500)
+                memory_source = "cgroup_measured"
             elif probe_rss_mb > 0:
                 instance_mem = probe_rss_mb * margin_mult + TMPFS_PER_INSTANCE_MB
                 memory_source = "probe"
@@ -368,12 +602,6 @@ def compute_per_step_nthreads(
 
             # Memory-aware reduction: each instance needs instance_mem.
             # Reduce n_parallel until total fits within max_memory_mb.
-            #
-            # Memory model: SANDBOX_OVERHEAD + n_par × instance_mem
-            # - SANDBOX_OVERHEAD: CMSSW project area, shared libs, ROOT
-            #   (~3 GB constant, loaded once regardless of instances)
-            # - instance_mem: per-instance cgroup memory (or RSS + TMPFS estimate)
-            SANDBOX_OVERHEAD_MB = 3000
             effective_max = max_memory_mb if max_memory_mb > 0 else 0
             if effective_max > 0 and n_par > 1 and instance_mem > 0:
                 # Prefer n_par that evenly divides cpus (no wasted cores).
@@ -489,6 +717,11 @@ def compute_job_split(
     events_per_job: int,
     num_jobs_wu: int,
     safety_margin: float = 0.20,
+    probe_job_peak_total_mb: float = 0,
+    probe_num_instances: int = 0,
+    probe_rss_mb: float = 0,
+    split_tmpfs: bool = False,
+    cgroup: dict | None = None,
 ) -> dict:
     """Compute adaptive job split: more jobs with fewer cores per job.
 
@@ -500,13 +733,21 @@ def compute_job_split(
     Memory follows spec Section 5.5: clamp(measured × (1 + safety_margin),
     default_per_core × tuned_cores, max_per_core × tuned_cores).
 
+    The cgroup enforces against total memory (RSS + page cache + tmpfs +
+    kernel overhead), not just process RSS.  When step 0 uses tmpfs for
+    gridpack extraction, TMPFS_PER_INSTANCE_MB of non-reclaimable content
+    is charged to the cgroup, making step 0's total cgroup usage potentially
+    comparable to the highest-RSS step.  Under tight limits, memory pressure
+    amplifies overhead further.  CGROUP_HEADROOM_MB provides minimum
+    absolute headroom to prevent this feedback loop.
+
     Algorithm (based on Round 1 step 0 metrics):
     1. eff_cores = cpu_eff_step0 × original_nthreads
     2. tuned_threads = nearest_power_of_2(eff_cores), capped to [2, original]
     3. job_multiplier = original_nthreads // tuned_threads
     4. new_events_per_job = events_per_job // job_multiplier
     5. new_num_jobs = num_jobs_wu × job_multiplier
-    6. new_request_memory = clamp(peak_rss × (1 + margin),
+    6. new_request_memory = clamp(peak_cgroup_est × (1 + margin),
                                   tuned × memory_per_core_mb,
                                   tuned × max_memory_per_core_mb)
     """
@@ -546,11 +787,26 @@ def compute_job_split(
     new_request_cpus = tuned
 
     # Memory sizing (spec Section 5.5):
-    # clamp(measured × (1 + margin), default × tuned_cores, max × tuned_cores)
-    # CMSSW memory has a large base component (~70%) that doesn't scale
-    # with nthreads, so the per-core formula underestimates at low nthreads.
-    # The Round 1 RSS (at original_nthreads) is a safe upper bound since
-    # fewer threads means equal or less memory.
+    # R2 jobs run 1 instance at tuned threads.  Three data sources, best
+    # to worst:
+    # 1. Probe job peak: HTCondor-reported peak from probe (ran n_instances
+    #    at fewer threads).  Marginal model: memory = SANDBOX_OVERHEAD +
+    #    1 × marginal, where marginal = (total_peak - overhead) / n_instances.
+    # 2. Probe RSS: FJR peak_rss_mb from probe × margin + tmpfs estimate.
+    # 3. Prior RSS: peak RSS from prior rounds × margin (fallback).
+    # All clamped to [tuned × memory_per_core, tuned × max_memory_per_core].
+    #
+    # IMPORTANT: FJR PeakValueRss only measures the main cmsRun process
+    # (/proc/PID/stat).  For GEN workflows with ExternalLHEProducer, the
+    # gridpack subprocess memory is invisible to FJR.  When cgroup monitor
+    # data is available (proc_*_cgroup.json), use peak non-reclaimable
+    # memory (anon + shmem from memory.stat) which captures ALL processes.
+    # Fall back to FJR + hardcoded estimates when cgroup data is absent.
+    SANDBOX_OVERHEAD_MB = 3000
+    TMPFS_PER_INSTANCE_MB = 2000   # fallback when no cgroup data
+    CGROUP_HEADROOM_MB = 1000      # fallback when no cgroup data
+    margin_mult = 1.0 + safety_margin
+
     peak_rss_mb = 0
     for si in metrics["steps"]:
         step = metrics["steps"][si]
@@ -558,13 +814,52 @@ def compute_job_split(
         if step_rss:
             avg = sum(step_rss) / len(step_rss)
             peak_rss_mb = max(peak_rss_mb, avg)
-    margin_mult = 1.0 + safety_margin
-    memory_from_rss = int(peak_rss_mb * margin_mult) if peak_rss_mb > 0 else 0
+
+    if probe_job_peak_total_mb > 0 and probe_num_instances > 0:
+        # Marginal cost per instance from probe, then project for 1 instance
+        marginal = (probe_job_peak_total_mb - SANDBOX_OVERHEAD_MB) / probe_num_instances
+        marginal = max(marginal, 500)
+        memory_from_measured = int((SANDBOX_OVERHEAD_MB + marginal) * margin_mult)
+        memory_source = "probe_peak"
+    elif cgroup is not None and cgroup.get("peak_nonreclaim_mb", 0) > 0:
+        # Measured cgroup data: peak non-reclaimable (anon + shmem).
+        # This captures subprocess memory that FJR PeakValueRss misses.
+        if split_tmpfs and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) > 0:
+            # Use max of tmpfs-phase peak (step 0: anon+shmem) vs
+            # non-tmpfs peak (other steps: anon only, shmem reclaimed)
+            binding = max(
+                cgroup["tmpfs_peak_nonreclaim_mb"],
+                cgroup.get("no_tmpfs_peak_anon_mb", 0),
+            )
+        else:
+            binding = cgroup["peak_nonreclaim_mb"]
+        memory_from_measured = int(binding * margin_mult)
+        memory_source = "cgroup_measured"
+    elif probe_rss_mb > 0:
+        memory_from_measured = int(probe_rss_mb * margin_mult + TMPFS_PER_INSTANCE_MB)
+        memory_source = "probe_rss"
+    elif peak_rss_mb > 0:
+        # Fallback: FJR RSS + hardcoded estimates (no cgroup data available).
+        effective_peak = peak_rss_mb
+        if split_tmpfs:
+            step0 = metrics["steps"].get(0)
+            if step0 and step0["peak_rss_mb"]:
+                s0_avg = sum(step0["peak_rss_mb"]) / len(step0["peak_rss_mb"])
+                s0_cgroup_est = s0_avg + TMPFS_PER_INSTANCE_MB
+                effective_peak = max(effective_peak, s0_cgroup_est)
+        memory_from_measured = max(
+            int(effective_peak * margin_mult),
+            int(effective_peak) + CGROUP_HEADROOM_MB,
+        )
+        memory_source = "prior_rss"
+    else:
+        memory_from_measured = 0
+        memory_source = "default"
+
     memory_floor = tuned * memory_per_core_mb
     memory_ceiling = tuned * max_memory_per_core_mb
-    new_request_memory_mb = max(memory_floor, min(memory_from_rss, memory_ceiling))
-    # If measured exceeds ceiling, cap at ceiling (algorithm reduces splits)
-    if memory_from_rss > memory_ceiling:
+    new_request_memory_mb = max(memory_floor, min(memory_from_measured, memory_ceiling))
+    if memory_from_measured > memory_ceiling:
         new_request_memory_mb = memory_ceiling
 
     # Build per-step info for reporting
@@ -593,6 +888,7 @@ def compute_job_split(
         "new_events_per_job": new_events_per_job,
         "new_request_cpus": new_request_cpus,
         "new_request_memory_mb": new_request_memory_mb,
+        "memory_source": memory_source,
         "per_step": per_step,
     }
 
@@ -1068,7 +1364,10 @@ def _replan_cli(args: list[str]) -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="WMS2 adaptive replan")
-    parser.add_argument("--wu0-dir", required=True, help="Completed WU0 group dir")
+    parser.add_argument("--wu0-dir", required=False, default="",
+                        help="Completed WU0 group dir (legacy, use --prior-wu-dirs)")
+    parser.add_argument("--prior-wu-dirs", default="",
+                        help="Comma-separated prior WU dirs (all rounds)")
     parser.add_argument("--wu1-dir", required=True, help="WU1 group dir to patch")
     parser.add_argument("--ncores", type=int, required=True,
                         help="Cores per job")
@@ -1096,9 +1395,18 @@ def _replan_cli(args: list[str]) -> None:
                         help="Probe node name (e.g. proc_000001) for R2 memory estimation")
     parser.add_argument("--safety-margin", type=float, default=0.20,
                         help="Safety margin on measured memory (0.20 = 20%%)")
+    parser.add_argument("--replan-index", type=int, default=0,
+                        help="Replan index (0-based) for decision file naming")
     opts = parser.parse_args(args)
 
-    wu0_dir = Path(opts.wu0_dir)
+    # Resolve prior dirs: --prior-wu-dirs takes precedence, --wu0-dir as fallback
+    if opts.prior_wu_dirs:
+        prior_dirs = [Path(p.strip()) for p in opts.prior_wu_dirs.split(",") if p.strip()]
+    elif opts.wu0_dir:
+        prior_dirs = [Path(opts.wu0_dir)]
+    else:
+        parser.error("Either --prior-wu-dirs or --wu0-dir is required")
+    wu0_dir = prior_dirs[0]  # first dir for probe analysis
     wu1_dir = Path(opts.wu1_dir)
 
     # Derive total memory from per-core inputs
@@ -1110,7 +1418,7 @@ def _replan_cli(args: list[str]) -> None:
     max_memory_mb = max_mem_per_core * ncores
 
     print(f"=== WMS2 Adaptive Replan ===")
-    print(f"WU0 dir: {wu0_dir}")
+    print(f"Prior dirs: {[str(d) for d in prior_dirs]}")
     print(f"WU1 dir: {wu1_dir}")
 
     # Read original nthreads from WU1's manifest
@@ -1125,34 +1433,53 @@ def _replan_cli(args: list[str]) -> None:
         original_nthreads = 1
     print(f"Original nThreads: {original_nthreads}")
 
-    # 1a. Analyze probe metrics (if probe node was used)
+    # 1a. Analyze probe metrics (if probe node was used — always in first dir)
     probe_data = None
     probe_rss_mb = 0.0
-    probe_cgroup_per_inst = 0.0
+    probe_job_peak_total = 0.0
+    probe_num_instances = 0
     exclude_nodes: set[str] | None = None
     if opts.probe_node:
         print(f"\n--- Analyzing probe metrics ({opts.probe_node}) ---")
         probe_data = analyze_probe_metrics(wu0_dir, opts.probe_node)
         if probe_data:
             probe_rss_mb = probe_data["max_instance_rss_mb"]
-            print(f"Probe instances: {probe_data['num_instances']}")
+            probe_num_instances = probe_data["num_instances"]
+            print(f"Probe instances: {probe_num_instances}")
             print(f"Per-instance RSS: {probe_data['per_instance_rss_mb']}")
             print(f"Max instance RSS: {probe_rss_mb:.0f} MB")
-            if "cgroup_peak_mb" in probe_data:
-                print(f"Cgroup peak: {probe_data['cgroup_peak_mb']:.0f} MB"
-                      f" ({probe_data['per_instance_cgroup_mb']:.0f} MB/instance)")
-                probe_cgroup_per_inst = probe_data["per_instance_cgroup_mb"]
+            if "job_peak_mb" in probe_data:
+                probe_job_peak_total = probe_data["job_peak_mb"]
+                marginal = (probe_job_peak_total - 3000) / probe_num_instances
+                print(f"Job peak: {probe_job_peak_total:.0f} MB total"
+                      f" (marginal: {marginal:.0f} MB/instance after 3 GB shared overhead)")
             exclude_nodes = {opts.probe_node}
         else:
             print(f"WARNING: Probe metrics not found, falling back to theoretical")
 
-    # 1b. Analyze WU0 metrics (excluding probe node)
-    print(f"\n--- Analyzing WU0 metrics ---")
-    metrics = analyze_wu_metrics(wu0_dir, exclude_nodes=exclude_nodes)
-    print(f"Peak RSS: {metrics['peak_rss_mb']:.0f} MB")
-    print(f"Weighted CPU efficiency: {metrics['weighted_cpu_eff']:.1%}")
-    print(f"Effective cores: {metrics['effective_cores']:.1f} / {metrics['nthreads']}")
-    print(f"Jobs analyzed: {metrics['num_jobs']}")
+    # 1b. Analyze metrics from all prior rounds, merge with normalization
+    print(f"\n--- Analyzing prior round metrics ({len(prior_dirs)} round(s)) ---")
+    round_metrics = []
+    for rd_idx, rd_dir in enumerate(prior_dirs):
+        # Exclude probe node only from first round (WU0)
+        excl = exclude_nodes if rd_idx == 0 else None
+        rm = analyze_wu_metrics(rd_dir, exclude_nodes=excl)
+        round_metrics.append(rm)
+        print(f"  Round {rd_idx + 1}: {rm['num_jobs']} jobs, "
+              f"cpu_eff={rm['weighted_cpu_eff']:.1%}, "
+              f"nthreads={rm['nthreads']}")
+
+    metrics = merge_round_metrics(round_metrics, original_nthreads)
+    print(f"Merged: Peak RSS: {metrics['peak_rss_mb']:.0f} MB")
+    print(f"Merged: Weighted CPU efficiency: {metrics['weighted_cpu_eff']:.1%} (normalized)")
+    print(f"Merged: Effective cores: {metrics['effective_cores']:.1f} / {original_nthreads}")
+    print(f"Rounds analyzed: {len(round_metrics)}")
+    cgroup = metrics.get("cgroup")
+    if cgroup:
+        print(f"Cgroup: peak_nonreclaim={cgroup['peak_nonreclaim_mb']} MB"
+              f"  (anon={cgroup['peak_anon_mb']} shmem={cgroup['peak_shmem_mb']})"
+              f"  tmpfs_phase={cgroup.get('tmpfs_peak_nonreclaim_mb', 0)}"
+              f"  no_tmpfs={cgroup.get('no_tmpfs_peak_anon_mb', 0)}")
 
     # 2. Compute per-step optimal nThreads
     print(f"\n--- Computing per-step nThreads ---")
@@ -1172,6 +1499,11 @@ def _replan_cli(args: list[str]) -> None:
             events_per_job=opts.events_per_job,
             num_jobs_wu=opts.num_jobs,
             safety_margin=safety_margin,
+            probe_job_peak_total_mb=probe_job_peak_total,
+            probe_num_instances=probe_num_instances,
+            probe_rss_mb=probe_rss_mb,
+            split_tmpfs=opts.split_tmpfs,
+            cgroup=cgroup,
         )
         job_multiplier = split_result["job_multiplier"]
         tuned_nt = split_result["tuned_nthreads"]
@@ -1182,7 +1514,8 @@ def _replan_cli(args: list[str]) -> None:
         print(f"  {opts.num_jobs} jobs x {opts.events_per_job} ev"
               f" -> {split_result['new_num_jobs']} jobs x {split_result['new_events_per_job']} ev")
         print(f"  request_cpus: {ncores} -> {split_result['new_request_cpus']}")
-        print(f"  request_memory: {split_result['new_request_memory_mb']} MB")
+        print(f"  request_memory: {split_result['new_request_memory_mb']} MB"
+              f"  [{split_result.get('memory_source', 'unknown')}]")
 
         # Rewrite WU1's DAG
         print(f"\n--- Rewriting WU1 DAG ---")
@@ -1204,13 +1537,16 @@ def _replan_cli(args: list[str]) -> None:
             "new_events_per_job": split_result["new_events_per_job"],
             "new_request_cpus": split_result["new_request_cpus"],
             "new_request_memory_mb": split_result["new_request_memory_mb"],
+            "memory_source": split_result.get("memory_source", "unknown"),
             "memory_per_core_mb": mem_per_core,
             "max_memory_per_core_mb": max_mem_per_core,
+            "rounds_analyzed": len(round_metrics),
+            "per_round_nthreads": [rm["nthreads"] for rm in round_metrics],
             "per_step": {
                 str(si): t for si, t in split_result["per_step"].items()
             },
         }
-        decisions_path = wu1_dir.parent / "replan_decisions.json"
+        decisions_path = wu1_dir.parent / f"replan_{opts.replan_index}_decisions.json"
         decisions_path.write_text(json.dumps(decisions, indent=2))
         print(f"\nWrote {decisions_path}")
         print(f"=== Replan complete ===")
@@ -1251,8 +1587,10 @@ def _replan_cli(args: list[str]) -> None:
             overcommit_max=opts.overcommit_max,
             split=not opts.no_split,
             probe_rss_mb=probe_rss_mb,
-            probe_cgroup_per_instance_mb=probe_cgroup_per_inst,
+            probe_job_peak_total_mb=probe_job_peak_total,
+            probe_num_instances=probe_num_instances,
             safety_margin=safety_margin,
+            cgroup=cgroup,
         )
         for si in sorted(tuning["per_step"]):
             t = tuning["per_step"][si]
@@ -1290,13 +1628,17 @@ def _replan_cli(args: list[str]) -> None:
         "max_memory_per_core_mb": max_mem_per_core,
         "ideal_memory_mb": patch_result.get("ideal_memory_mb", 0),
         "actual_memory_mb": patch_result.get("actual_memory_mb", 0),
+        "rounds_analyzed": len(round_metrics),
+        "per_round_nthreads": [rm["nthreads"] for rm in round_metrics],
         "per_step": {
             str(si): t for si, t in tuning["per_step"].items()
         },
     }
     if probe_data:
         decisions["probe_data"] = probe_data
-    decisions_path = wu1_dir.parent / "replan_decisions.json"
+    if opts.probe_node:
+        decisions["probe_node"] = opts.probe_node
+    decisions_path = wu1_dir.parent / f"replan_{opts.replan_index}_decisions.json"
     decisions_path.write_text(json.dumps(decisions, indent=2))
     print(f"\nWrote {decisions_path}")
     print(f"=== Replan complete ===")
