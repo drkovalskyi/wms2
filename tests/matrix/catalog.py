@@ -2,6 +2,7 @@
 
 ID scheme:
     1xx.x  — synthetic mode (fast, no CMSSW)
+    15x.x  — simulator mode (fast, no CMSSW, real ROOT/FJR artifacts)
     2xx.x  — single-step CMSSW (GEN)
     3xx.x  — multi-step StepChain
     4xx.x  — pilot workflow
@@ -274,6 +275,7 @@ _WF_391_0 = WorkflowDef(
     adaptive_split=False,
     job_split=True,
     split_tmpfs=True,
+    probe_split=True,
     output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
     memory_per_core_mb=2000,
     max_memory_per_core_mb=2500,
@@ -309,9 +311,82 @@ _WF_391_1 = WorkflowDef(
     adaptive_split=False,
     job_split=True,
     split_tmpfs=True,
+    probe_split=True,
     output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
     memory_per_core_mb=2000,
     max_memory_per_core_mb=2500,
+    multicore=8,
+    size="large",
+    timeout_sec=10800,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_392_0 = WorkflowDef(
+    wf_id=392.0,
+    title="DY2L adaptive job split 3-round (2 jobs x 40 ev, 3 GB/core)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=40,
+    num_jobs=2,
+    num_work_units=3,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    split_tmpfs=True,
+    probe_split=True,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=3000,
+    multicore=8,
+    size="large",
+    timeout_sec=10800,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_391_2 = WorkflowDef(
+    wf_id=391.2,
+    title="DY2L adaptive job split (4 jobs x 400 ev, 3 GB/core)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=400,
+    num_jobs=4,
+    num_work_units=2,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    split_tmpfs=True,
+    probe_split=True,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=3000,
     multicore=8,
     size="large",
     timeout_sec=10800,
@@ -661,6 +736,228 @@ _WF_510_0 = WorkflowDef(
     ),
 )
 
+# ── Simulator mode ────────────────────────────────────────────
+
+_SIM_OUTPUT_1TIER = [
+    {
+        "dataset_name": "/TestPrimary/Test-v1/GEN-SIM",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/GEN-SIM/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/GEN-SIM/v1",
+        "data_tier": "GEN-SIM",
+    }
+]
+
+_SIM_OUTPUT_3TIER = [
+    {
+        "dataset_name": "/TestPrimary/Test-v1/GEN-SIM",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/GEN-SIM/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/GEN-SIM/v1",
+        "data_tier": "GEN-SIM",
+    },
+    {
+        "dataset_name": "/TestPrimary/Test-v1/DIGI",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/DIGI/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/DIGI/v1",
+        "data_tier": "DIGI",
+    },
+    {
+        "dataset_name": "/TestPrimary/Test-v1/RECO",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/RECO/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/RECO/v1",
+        "data_tier": "RECO",
+    },
+]
+
+_WF_150_0 = WorkflowDef(
+    wf_id=150.0,
+    title="Simulator single-step, 1 job",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_sim_150_0",
+        "RequestType": "StepChain",
+        "StepChain": 1,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Multicore": 4,
+        "Memory": 4096,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=1,
+    output_datasets=_SIM_OUTPUT_1TIER,
+    memory_mb=4096,
+    multicore=4,
+    size="small",
+    timeout_sec=120,
+    requires=("condor",),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_150_1 = WorkflowDef(
+    wf_id=150.1,
+    title="Simulator single-step, 4 jobs",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_sim_150_1",
+        "RequestType": "StepChain",
+        "StepChain": 1,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Multicore": 4,
+        "Memory": 4096,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=4,
+    output_datasets=_SIM_OUTPUT_1TIER,
+    memory_mb=4096,
+    multicore=4,
+    size="small",
+    timeout_sec=180,
+    requires=("condor",),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_151_0 = WorkflowDef(
+    wf_id=151.0,
+    title="Simulator 3-step StepChain, 2 jobs",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_sim_151_0",
+        "RequestType": "StepChain",
+        "StepChain": 3,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Step2": {"StepName": "DIGI"},
+        "Step3": {"StepName": "RECO"},
+        "Multicore": 8,
+        "Memory": 8192,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=2,
+    output_datasets=_SIM_OUTPUT_3TIER,
+    memory_mb=8192,
+    multicore=8,
+    size="small",
+    timeout_sec=180,
+    requires=("condor",),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_152_0 = WorkflowDef(
+    wf_id=152.0,
+    title="Simulator high-memory profile",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_sim_152_0",
+        "RequestType": "StepChain",
+        "StepChain": 1,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=2,
+    output_datasets=_SIM_OUTPUT_1TIER,
+    memory_mb=16000,
+    multicore=8,
+    size="small",
+    timeout_sec=180,
+    requires=("condor",),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_155_0 = WorkflowDef(
+    wf_id=155.0,
+    title="Simulator adaptive 2-WU probe split",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_sim_155_0",
+        "RequestType": "StepChain",
+        "StepChain": 3,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Step2": {"StepName": "DIGI"},
+        "Step3": {"StepName": "RECO"},
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=2,
+    num_work_units=2,
+    adaptive=True,
+    output_datasets=_SIM_OUTPUT_3TIER,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=2500,
+    probe_split=True,
+    multicore=8,
+    size="medium",
+    timeout_sec=300,
+    requires=("condor",),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
+_WF_155_1 = WorkflowDef(
+    wf_id=155.1,
+    title="Simulator adaptive job split",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_sim_155_1",
+        "RequestType": "StepChain",
+        "StepChain": 3,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Step2": {"StepName": "DIGI"},
+        "Step3": {"StepName": "RECO"},
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+    },
+    events_per_job=10,
+    num_jobs=2,
+    num_work_units=2,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    probe_split=True,
+    output_datasets=_SIM_OUTPUT_3TIER,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=2500,
+    multicore=8,
+    size="medium",
+    timeout_sec=300,
+    requires=("condor",),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 # ── Master catalog ────────────────────────────────────────────
 
 CATALOG: dict[float, WorkflowDef] = {
@@ -668,6 +965,12 @@ CATALOG: dict[float, WorkflowDef] = {
     for wf in [
         _WF_100_0,
         _WF_100_1,
+        _WF_150_0,
+        _WF_150_1,
+        _WF_151_0,
+        _WF_152_0,
+        _WF_155_0,
+        _WF_155_1,
         _WF_300_0,
         _WF_300_1,
         _WF_301_0,
@@ -675,6 +978,8 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_351_1,
         _WF_391_0,
         _WF_391_1,
+        _WF_391_2,
+        _WF_392_0,
         _WF_350_0,
         _WF_360_0,
         _WF_370_0,

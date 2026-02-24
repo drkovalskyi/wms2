@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -866,7 +867,11 @@ def _write_proc_script(path: str) -> None:
     CMSSW mode handles per-step CMSSW/ScramArch with apptainer container support
     for cross-OS execution (e.g. el8 CMSSW on el9 host).
     """
-    _write_file(path, r'''#!/bin/bash
+    # Embed the venv Python path for simulator mode (needs numpy/uproot).
+    # At planning time sys.executable is the venv Python; at execution time
+    # the HTCondor job may only have system Python (no numpy/uproot).
+    _venv_python = sys.executable
+    _script = r'''#!/bin/bash
 # wms2_proc.sh — WMS2 processing job wrapper
 # Supports CMSSW mode (per-step cmsRun with apptainer), synthetic mode
 # (sized output), and pilot mode (iterative measurement).
@@ -1864,6 +1869,18 @@ except Exception:
 
     fi  # end of sequential (non-pipeline) mode
 
+    process_outputs
+
+    END_TIME=$(date +%s)
+    WALL_TIME=$((END_TIME - START_TIME))
+    echo ""
+    echo "=== CMSSW mode complete ==="
+    echo "wall_time_sec: $WALL_TIME"
+    echo "output_bytes:  $OUTPUT_SIZES"
+}
+
+# ── Shared output processing (FJR parse, manifest, metrics, stage-out) ──
+process_outputs() {
     # Rename output ROOT files to include node index — prevents collisions
     # when HTCondor transfers outputs from multiple proc jobs to the same dir
     echo ""
@@ -2076,11 +2093,33 @@ else:
 
     # Stage out to unmerged site storage
     stage_out_to_unmerged
+}
+
+# ── Simulator mode ────────────────────────────────────────────
+run_simulator_mode() {
+    echo "--- Simulator mode ---"
+
+    # Run the simulator script (included in sandbox)
+    # Uses venv Python (embedded at DAG planning time) for numpy/uproot deps
+    __VENV_PYTHON__ simulator.py \
+        --manifest manifest.json \
+        --node-index "$NODE_INDEX" \
+        --events-per-job "$EVENTS_PER_JOB" \
+        --first-event "$FIRST_EVENT"
+
+    SIM_RC=$?
+    if [[ $SIM_RC -ne 0 ]]; then
+        echo "ERROR: Simulator failed with exit code $SIM_RC" >&2
+        exit $SIM_RC
+    fi
+
+    # Shared output processing: rename, build manifest, extract metrics, stage-out
+    process_outputs
 
     END_TIME=$(date +%s)
     WALL_TIME=$((END_TIME - START_TIME))
     echo ""
-    echo "=== CMSSW mode complete ==="
+    echo "=== Simulator mode complete ==="
     echo "wall_time_sec: $WALL_TIME"
     echo "output_bytes:  $OUTPUT_SIZES"
 }
@@ -2273,13 +2312,16 @@ elif [[ "$MODE" == "cmssw" ]]; then
         exit 1
     fi
     run_cmssw_mode
+elif [[ "$MODE" == "simulator" ]]; then
+    run_simulator_mode
 elif [[ "$MODE" == "synthetic" ]]; then
     run_synthetic_mode
 else
     echo "ERROR: Unknown mode: $MODE" >&2
     exit 1
 fi
-''')
+'''
+    _write_file(path, _script.replace("__VENV_PYTHON__", _venv_python))
     os.chmod(path, 0o755)
 
 
@@ -2297,7 +2339,9 @@ def _write_merge_script(path: str) -> None:
     Falls back to hadd if CMSSW setup fails.
     For text files: concatenates proc_*.out into merged text output.
     """
-    _write_file(path, '''#!/usr/bin/env python3
+    # Use venv Python in shebang for numpy/uproot availability (simulator merge)
+    _venv_python = sys.executable
+    _script = '''#!__VENV_PYTHON__
 """wms2_merge.py — WMS2 merge job.
 
 Reads proc outputs from unmerged site storage, merges them, writes to merged
@@ -2567,11 +2611,53 @@ def merge_root_with_hadd(root_files, out_file, cmssw_version, scram_arch):
     return True
 
 
+def merge_root_with_uproot(root_files, out_file):
+    """Merge ROOT files using uproot — for simulator mode when CVMFS unavailable."""
+    try:
+        import uproot
+        import numpy as np
+    except ImportError:
+        print("  ERROR: uproot/numpy not available for merge", file=sys.stderr)
+        return False
+
+    all_data = {}
+    for rf in root_files:
+        try:
+            with uproot.open(rf) as f:
+                tree = f["Events"]
+                # Read all fields as awkward arrays, then convert each to numpy
+                # (tree-level arrays(library="np") fails on 2D fields in RNTuple)
+                ak_arrays = tree.arrays()
+                for key in tree.keys():
+                    all_data.setdefault(key, []).append(
+                        np.asarray(ak_arrays[key])
+                    )
+        except Exception as e:
+            print(f"  WARNING: Failed to read {rf}: {e}", file=sys.stderr)
+            return False
+
+    if not all_data:
+        print("  WARNING: No data read from ROOT files", file=sys.stderr)
+        return False
+
+    merged = {}
+    for k, v in all_data.items():
+        try:
+            merged[k] = np.concatenate(v)
+        except ValueError:
+            # Skip fields with incompatible shapes (e.g. padding with
+            # different column counts across files)
+            pass
+    with uproot.recreate(out_file) as f:
+        f["Events"] = merged
+    return True
+
+
 def merge_root_tier(tier, tier_files, tier_step_index, out_dir, manifest, work_dir):
     """Merge ROOT files for a single tier using cmsRun + mergeProcess().
 
     Batches files by max_merge_size and produces multiple outputs if needed.
-    Falls back to hadd if cmsRun fails.
+    Falls back to hadd if cmsRun fails, then to uproot merge for simulator mode.
     """
     # Determine CMSSW version/arch for this tier's step
     steps = manifest.get("steps", [])
@@ -2643,6 +2729,15 @@ def merge_root_tier(tier, tier_files, tier_step_index, out_dir, manifest, work_d
             if success and os.path.isfile(out_file):
                 size = os.path.getsize(out_file)
                 print(f"  Batch {batch_idx}: hadd fallback -> {out_file} ({size} bytes)")
+                merged_files.append(out_file)
+                continue
+
+        # Uproot merge fallback for simulator mode
+        if manifest.get("mode") == "simulator":
+            success = merge_root_with_uproot(batch, out_file)
+            if success and os.path.isfile(out_file):
+                size = os.path.getsize(out_file)
+                print(f"  Batch {batch_idx}: uproot merge -> {out_file} ({size} bytes)")
                 merged_files.append(out_file)
                 continue
 
@@ -2836,10 +2931,10 @@ if root_files:
         print(f"  Output: {out_dir}")
         os.makedirs(out_dir, exist_ok=True)
 
-        if manifest.get("mode") == "cmssw":
+        if manifest.get("mode") in ("cmssw", "simulator"):
             merge_root_tier(ds_tier, tier_files, step_idx, out_dir, manifest, work_dir)
         else:
-            # Non-CMSSW mode: just copy files
+            # Synthetic mode: just copy files
             print(f"  Non-CMSSW mode: copying {len(tier_files)} ROOT files to {out_dir}")
             for rf in tier_files:
                 dest = os.path.join(out_dir, os.path.basename(rf))
@@ -2918,7 +3013,8 @@ if root_files:
 else:
     print(f"Detected {len(text_files)} text file(s) — using text merge mode")
     merge_text_files(datasets, text_files, local_pfn_prefix, group_index)
-''')
+'''
+    _write_file(path, _script.replace("__VENV_PYTHON__", _venv_python))
     os.chmod(path, 0o755)
 
 

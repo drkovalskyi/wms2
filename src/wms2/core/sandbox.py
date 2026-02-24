@@ -34,6 +34,15 @@ def create_sandbox(output_path: str, request_data: dict[str, Any], mode: str = "
         # Write manifest
         (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
+        # For simulator mode, include simulator.py in sandbox
+        if mode == "simulator":
+            sim_src = Path(__file__).parent / "simulator.py"
+            if sim_src.is_file():
+                import shutil
+                shutil.copy2(str(sim_src), str(tmp / "simulator.py"))
+            else:
+                logger.warning("simulator.py not found at %s", sim_src)
+
         # For CMSSW mode, generate test PSets per step
         if mode == "cmssw":
             # For StepChain manifests (new format), get global_tag from first step
@@ -120,6 +129,12 @@ def _build_manifest(request_data: dict[str, Any], mode: str) -> dict[str, Any]:
             "output_tiers": _extract_output_tiers(request_data),
         }
 
+    if mode == "simulator":
+        return {
+            "mode": "simulator",
+            "steps": _build_simulator_steps(request_data),
+        }
+
     # CMSSW mode — use StepChain parser for StepChain requests
     if request_data.get("RequestType") == "StepChain" and request_data.get("StepChain"):
         from wms2.core.stepchain import parse_stepchain, to_manifest
@@ -174,6 +189,94 @@ def _extract_output_tiers(request_data: dict[str, Any]) -> list[str]:
     if not tiers:
         tiers = ["AODSIM"]
     return tiers
+
+
+# Default physics-based resource profiles per step type
+_SIMULATOR_PROFILES: dict[str, dict[str, float]] = {
+    "GEN": {
+        "serial_fraction": 0.30,
+        "base_memory_mb": 1500,
+        "marginal_per_thread_mb": 250,
+        "wall_sec_per_event": 0.05,
+        "output_size_per_event_kb": 50,
+    },
+    "DIGI": {
+        "serial_fraction": 0.10,
+        "base_memory_mb": 1800,
+        "marginal_per_thread_mb": 300,
+        "wall_sec_per_event": 0.03,
+        "output_size_per_event_kb": 30,
+    },
+    "RECO": {
+        "serial_fraction": 0.10,
+        "base_memory_mb": 1800,
+        "marginal_per_thread_mb": 300,
+        "wall_sec_per_event": 0.03,
+        "output_size_per_event_kb": 20,
+    },
+    "NANO": {
+        "serial_fraction": 0.05,
+        "base_memory_mb": 1200,
+        "marginal_per_thread_mb": 150,
+        "wall_sec_per_event": 0.01,
+        "output_size_per_event_kb": 5,
+    },
+}
+
+
+def _get_simulator_profile(step_name: str) -> dict[str, float]:
+    """Get resource profile defaults for a step type.
+
+    Matches by prefix: GEN-SIM → GEN, DIGI-RAW → DIGI, etc.
+    Falls back to DIGI profile for unknown step types.
+    """
+    name_upper = step_name.upper()
+    for prefix in ("GEN", "NANO", "RECO", "DIGI"):
+        if name_upper.startswith(prefix):
+            return dict(_SIMULATOR_PROFILES[prefix])
+    return dict(_SIMULATOR_PROFILES["DIGI"])
+
+
+def _build_simulator_steps(request_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build per-step simulator config with physics-based resource parameters.
+
+    Extracts step names from StepChain request data, assigns default profiles
+    based on step type, and sets output_module to data_tier + "output".
+    """
+    multicore = int(request_data.get("Multicore", 1))
+    n_steps = int(request_data.get("StepChain", 1))
+
+    steps: list[dict[str, Any]] = []
+    for i in range(1, n_steps + 1):
+        step_key = f"Step{i}"
+        step_data = request_data.get(step_key, {})
+        step_name = step_data.get("StepName", f"STEP{i}")
+
+        profile = _get_simulator_profile(step_name)
+
+        # Use step name as data tier (e.g. "GEN-SIM", "DIGI", "RECO")
+        data_tier = step_name
+
+        # output_module: data_tier + "output" for direct tier matching
+        output_module = data_tier + "output"
+
+        # Last step keeps output by default; intermediate steps don't
+        keep_output = i == n_steps
+
+        steps.append({
+            "name": step_name,
+            "serial_fraction": profile["serial_fraction"],
+            "base_memory_mb": profile["base_memory_mb"],
+            "marginal_per_thread_mb": profile["marginal_per_thread_mb"],
+            "wall_sec_per_event": profile["wall_sec_per_event"],
+            "output_size_per_event_kb": profile["output_size_per_event_kb"],
+            "multicore": multicore,
+            "output_module": output_module,
+            "data_tier": data_tier,
+            "keep_output": keep_output,
+        })
+
+    return steps
 
 
 def _create_test_pset(step_name: str, global_tag: str) -> str:

@@ -5,12 +5,16 @@ from __future__ import annotations
 from tests.matrix.catalog import CATALOG
 
 # Explicitly listed sets
-_SMOKE_IDS = [100.0, 500.0, 501.0, 510.0]
-_INTEGRATION_IDS = [100.0, 100.1, 300.0, 300.1, 301.0, 350.0, 351.0, 351.1, 391.0, 360.0, 370.0, 380.0, 380.1, 350.1, 500.0, 501.0, 510.0]
+_SMOKE_IDS = [100.0, 150.0, 500.0, 501.0, 510.0]
+_INTEGRATION_IDS = [100.0, 100.1, 150.0, 150.1, 151.0, 152.0, 155.0, 155.1, 300.0, 300.1, 301.0, 350.0, 351.0, 351.1, 391.0, 360.0, 370.0, 380.0, 380.1, 350.1, 500.0, 501.0, 510.0]
 
 
 def _synthetic_ids() -> list[float]:
     return sorted(wf.wf_id for wf in CATALOG.values() if wf.sandbox_mode == "synthetic")
+
+
+def _simulator_ids() -> list[float]:
+    return sorted(wf.wf_id for wf in CATALOG.values() if wf.sandbox_mode == "simulator")
 
 
 def _fault_ids() -> list[float]:
@@ -31,6 +35,7 @@ _SET_DEFS: dict[str, list[float] | callable] = {
     "smoke": _SMOKE_IDS,
     "integration": _INTEGRATION_IDS,
     "synthetic": _synthetic_ids,
+    "simulator": _simulator_ids,
     "faults": _fault_ids,
     "adaptive": _adaptive_ids,
     "full": _all_ids,
