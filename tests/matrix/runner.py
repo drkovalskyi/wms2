@@ -683,6 +683,37 @@ def _collect_adaptive_perf(
     job_step_data: dict[str, list[dict]] = {}
     metrics_pattern = re.compile(r"proc_(\d+)_metrics\.json$")
 
+    # Read replan decisions — one per replan node (replan_0_decisions.json, etc.)
+    # Also try legacy name (replan_decisions.json) for backward compatibility.
+    all_decisions: list[dict] = []
+    for dp in sorted(wf_dir.glob("replan_*_decisions.json")):
+        try:
+            all_decisions.append(json.loads(dp.read_text()))
+        except Exception:
+            pass
+    if not all_decisions:
+        legacy = wf_dir / "replan_decisions.json"
+        if legacy.exists():
+            try:
+                all_decisions.append(json.loads(legacy.read_text()))
+            except Exception:
+                pass
+
+    # Use first replan decisions as primary adaptive_info (for reporter compat)
+    # and store full list for N-round reporting.  Copy to avoid circular ref
+    # when we add _all_decisions below.
+    adaptive_info: dict = dict(all_decisions[0]) if all_decisions else {}
+
+    # Probe node index to exclude from R1 (WU0) performance data.
+    # The probe runs a different config (2×(N/2)T) and would corrupt
+    # the R1 baseline metrics used for throughput comparison.
+    probe_node = adaptive_info.get("probe_node", "")
+    probe_idx: int | None = None
+    if probe_node:
+        idx_match = re.search(r"proc_0*(\d+)$", probe_node)
+        if idx_match:
+            probe_idx = int(idx_match.group(1))
+
     mg_dirs = sorted(wf_dir.glob("mg_*"))
     for round_idx, gd in enumerate(mg_dirs):
         round_label = f"Round {round_idx + 1}"
@@ -711,6 +742,13 @@ def _collect_adaptive_perf(
                     continue
                 if mf.name in seen_metrics:
                     continue
+                # Exclude probe node from R1 — it ran a different config
+                if round_idx == 0 and probe_idx is not None:
+                    file_idx_match = metrics_pattern.search(mf.name)
+                    if file_idx_match and int(file_idx_match.group(1)) == probe_idx:
+                        logger.info("Excluding %s from R1 perf (probe node)", mf.name)
+                        seen_metrics.add(mf.name)
+                        continue
                 try:
                     data = json.loads(mf.read_text())
                     seen_metrics.add(mf.name)
@@ -729,16 +767,11 @@ def _collect_adaptive_perf(
                 except Exception as exc:
                     logger.warning("Failed to read %s: %s", mf, exc)
 
-    # Read replan decisions
-    decisions_path = wf_dir / "replan_decisions.json"
-    adaptive_info: dict = {}
-    if decisions_path.exists():
-        try:
-            adaptive_info = json.loads(decisions_path.read_text())
-        except Exception:
-            pass
+    # adaptive_info already read above (needed probe_node for exclusion)
 
     perf.raw_job_step_data = job_step_data
+    # Store primary decisions for backward compat, plus full list for N-round
+    adaptive_info["_all_decisions"] = all_decisions
     perf.raw_job_step_data["_adaptive"] = adaptive_info
     perf.cpu_samples = cpu_samples
 
@@ -995,10 +1028,16 @@ class MatrixRunner:
         mock_wf = _make_workflow_mock(wf, sandbox_path)
         repo = _make_mock_repo()
 
+        # For multi-WU workflows, split into 1 job per WU so each gets its
+        # own merge group (and its own manifest/tmpfs config).
+        if wf.num_work_units > 1:
+            jpwu = max(wf.num_jobs // wf.num_work_units, 1)
+        else:
+            jpwu = max(wf.num_jobs, 1)
         settings = self._settings.model_copy(
             update={
                 "submit_base_dir": submit_dir,
-                "jobs_per_work_unit": max(wf.num_jobs, 1),
+                "jobs_per_work_unit": jpwu,
             }
         )
 
@@ -1023,6 +1062,55 @@ class MatrixRunner:
         result.cluster_id = cluster_id
         wf_dir = Path(submit_dir) / str(mock_wf.id)
         result.submit_dir = str(wf_dir)
+
+        # 5b. Inject split_tmpfs via manifest_tuned.json if requested.
+        # Can't modify manifest.json directly — sandbox extraction overwrites it.
+        # manifest_tuned.json takes precedence (the wrapper applies it after extraction).
+        if wf.split_tmpfs:
+            import json as _json
+            import re as _re
+            skip_below = getattr(wf, "split_tmpfs_from_wu", 0)
+            for mg_dir in sorted(wf_dir.glob("mg_*")):
+                # Extract WU index from dir name (mg_000000 → 0)
+                wu_idx = int(mg_dir.name.split("_")[1])
+                if wu_idx < skip_below:
+                    continue
+                mf = mg_dir / "manifest.json"
+                if not mf.is_file():
+                    continue
+                try:
+                    data = _json.loads(mf.read_text())
+                    data["split_tmpfs"] = True
+                    tuned = mg_dir / "manifest_tuned.json"
+                    tuned.write_text(_json.dumps(data, indent=2))
+                    # Add to transfer_input_files in each proc submit file
+                    for sub in sorted(mg_dir.glob("proc_*.sub")):
+                        content = sub.read_text()
+                        tif = _re.search(r"^(transfer_input_files\s*=\s*)(.+)$",
+                                         content, _re.MULTILINE)
+                        if tif:
+                            new = f"{tif.group(1)}{tif.group(2).rstrip()}, {tuned}"
+                            content = content[:tif.start()] + new + content[tif.end():]
+                            sub.write_text(content)
+                except Exception:
+                    pass
+
+        # 5c. Per-WU memory overrides.
+        if wf.memory_mb_per_wu:
+            import re as _re2
+            for mg_dir in sorted(wf_dir.glob("mg_*")):
+                wu_idx = int(mg_dir.name.split("_")[1])
+                if wu_idx not in wf.memory_mb_per_wu:
+                    continue
+                mem = wf.memory_mb_per_wu[wu_idx]
+                for sub in sorted(mg_dir.glob("proc_*.sub")):
+                    content = sub.read_text()
+                    content = _re2.sub(
+                        r"^(request_memory\s*=\s*)\d+",
+                        f"\\g<1>{mem}",
+                        content, flags=_re2.MULTILINE,
+                    )
+                    sub.write_text(content)
 
         # 6. Fault injection
         if wf.fault:
@@ -1052,16 +1140,15 @@ class MatrixRunner:
         work_dir: Path,
         sandbox_path: str,
     ) -> WorkflowResult:
-        """Adaptive execution: 2 work units with a replan node between them.
+        """Adaptive execution: N work units with replan nodes between them.
 
-        The replan node analyzes WU0's metrics and patches WU1's manifest
-        with per-step nThreads tuning.  The scheduler-visible job shape
-        (request_cpus, request_memory, num_jobs, events_per_job) stays
-        identical between rounds.
+        Each replan node analyzes the previous WU's metrics and patches the
+        next WU's manifest with per-step nThreads tuning.  Supports arbitrary
+        num_work_units (2 = one replan, 3 = two replans, etc.).
 
         1. Plan with mock condor adapter (generates files, no submission)
-        2. Generate replan.sub (universe=local)
-        3. Modify workflow.dag: add replan node between WU0 and WU1
+        2. Generate replan_0..replan_{N-2}.sub (universe=local)
+        3. Modify workflow.dag: add replan nodes between consecutive WUs
         4. Submit with real condor adapter
         5. Poll, collect per-round perf, verify, sweep
         """
@@ -1073,7 +1160,7 @@ class MatrixRunner:
         round1_memory_mb = wf.memory_per_core_mb * wf.multicore
         max_memory_mb = wf.max_memory_per_core_mb * wf.multicore
 
-        # Total events across both work units
+        # Total events across all work units
         total_events = wf.events_per_job * wf.num_jobs * wf.num_work_units
         mock_wf = _make_workflow_mock(wf, sandbox_path)
         mock_wf.config_data["memory_mb"] = round1_memory_mb
@@ -1115,57 +1202,66 @@ class MatrixRunner:
 
         logger.info("Planned %d merge groups for adaptive workflow", len(mg_dirs))
 
-        # Step 1b: Inject probe node if enabled
+        # Step 1b: Inject probe node if enabled (only in first WU)
         probe_node_name: str | None = None
         if wf.probe_split:
             probe_node_name = _inject_probe_node(wf, mg_dirs[0])
 
-        # Step 2: Generate replan.sub (universe=local)
-        wu1_dir = mg_dirs[1]
+        # Step 2: Generate replan nodes — one between each consecutive pair
         venv_python = str(Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python")
-        replan_args = (
-            f"-m tests.matrix.adaptive replan"
-            f" --wu0-dir {mg_dirs[0]}"
-            f" --wu1-dir {wu1_dir}"
-            f" --ncores {wf.multicore}"
-            f" --mem-per-core {wf.memory_per_core_mb}"
-            f" --max-mem-per-core {wf.max_memory_per_core_mb}"
-            f" --safety-margin {wf.safety_margin}"
-            f" --overcommit-max {wf.overcommit_max}"
-            + (f" --no-split" if not wf.adaptive_split else "")
-            + (f" --split-all-steps" if wf.split_all_steps else "")
-            + (f" --uniform-threads" if wf.split_uniform_threads else "")
-            + (f" --split-tmpfs" if wf.split_tmpfs else "")
-            + (f" --job-split --events-per-job {wf.events_per_job}"
-               f" --num-jobs {wf.num_jobs}" if wf.job_split else "")
-            + (f" --probe-node {probe_node_name}" if probe_node_name else "")
-        )
-        replan_sub_path = wf_dir / "replan.sub"
-        replan_sub_path.write_text("\n".join([
-            "# Adaptive replan job (runs between work units)",
-            "universe = local",
-            f"executable = {venv_python}",
-            f"arguments = {replan_args}",
-            f"output = {wf_dir}/replan.out",
-            f"error = {wf_dir}/replan.err",
-            f"log = {wf_dir}/replan.log",
-            "queue 1",
-        ]) + "\n")
-
-        # Step 3: Modify workflow.dag — add replan node between WU0 and WU1
         dag_path = wf_dir / "workflow.dag"
         dag_content = dag_path.read_text()
-        wu0_name = mg_dirs[0].name
-        wu1_name = mg_dirs[1].name
-        dag_content += "\n".join([
-            "",
-            "# Adaptive replan between work units",
-            f"JOB replan {replan_sub_path}",
-            f"PARENT {wu0_name} CHILD replan",
-            f"PARENT replan CHILD {wu1_name}",
-        ]) + "\n"
+        dag_content += "\n# Adaptive replan nodes between work units\n"
+
+        for replan_idx in range(len(mg_dirs) - 1):
+            next_dir = mg_dirs[replan_idx + 1]
+            node_name = f"replan_{replan_idx}"
+
+            # Pass ALL prior dirs (rounds 0..replan_idx) for multi-round analysis
+            prior_dirs = mg_dirs[:replan_idx + 1]
+            prior_dirs_str = ",".join(str(d) for d in prior_dirs)
+
+            replan_args = (
+                f"-m tests.matrix.adaptive replan"
+                f" --prior-wu-dirs {prior_dirs_str}"
+                f" --wu1-dir {next_dir}"
+                f" --ncores {wf.multicore}"
+                f" --mem-per-core {wf.memory_per_core_mb}"
+                f" --max-mem-per-core {wf.max_memory_per_core_mb}"
+                f" --safety-margin {wf.safety_margin}"
+                f" --overcommit-max {wf.overcommit_max}"
+                f" --replan-index {replan_idx}"
+                + (f" --no-split" if not wf.adaptive_split else "")
+                + (f" --split-all-steps" if wf.split_all_steps else "")
+                + (f" --uniform-threads" if wf.split_uniform_threads else "")
+                + (f" --split-tmpfs" if wf.split_tmpfs else "")
+                + (f" --job-split --events-per-job {wf.events_per_job}"
+                   f" --num-jobs {wf.num_jobs}" if wf.job_split else "")
+                # Probe node only for first replan (it's in WU0)
+                + (f" --probe-node {probe_node_name}"
+                   if probe_node_name and replan_idx == 0 else "")
+            )
+
+            prev_dir = mg_dirs[replan_idx]
+            sub_path = wf_dir / f"{node_name}.sub"
+            sub_path.write_text("\n".join([
+                f"# Adaptive replan {replan_idx} (between {prev_dir.name} and {next_dir.name})",
+                "universe = local",
+                f"executable = {venv_python}",
+                f"arguments = {replan_args}",
+                f"output = {wf_dir}/{node_name}.out",
+                f"error = {wf_dir}/{node_name}.err",
+                f"log = {wf_dir}/{node_name}.log",
+                "queue 1",
+            ]) + "\n")
+
+            dag_content += f"JOB {node_name} {sub_path}\n"
+            dag_content += f"PARENT {prev_dir.name} CHILD {node_name}\n"
+            dag_content += f"PARENT {node_name} CHILD {next_dir.name}\n"
+
+        # Step 3: Write modified workflow.dag
         dag_path.write_text(dag_content)
-        logger.info("Modified workflow.dag with replan node")
+        logger.info("Modified workflow.dag with %d replan node(s)", len(mg_dirs) - 1)
 
         # Step 4: Submit with REAL condor adapter
         cluster_id, schedd_name = await self._condor.submit_dag(str(dag_path))

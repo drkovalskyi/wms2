@@ -93,7 +93,7 @@ def print_summary(
 # ── Throughput computation ───────────────────────────────────
 
 
-def _compute_round_metrics(steps, n_jobs, request_cpus):
+def _compute_round_metrics(steps, n_jobs, request_cpus, n_parallel=1):
     """Compute throughput metrics based on actual core-time committed.
 
     Core-seconds = sum of (per-job wall time × request_cpus) across all jobs.
@@ -101,18 +101,34 @@ def _compute_round_metrics(steps, n_jobs, request_cpus):
     directly, which is more accurate than n_jobs × mean when job counts
     vary per step (e.g. some jobs failed a later step).
 
+    When n_parallel > 1 (step 0 parallel split), StepPerf.n_jobs for step 0
+    counts individual instances (e.g. 16 = 4 jobs × 4 instances).  But the
+    actual core commitment is only 4 HTCondor slots × 8 cores.  We divide
+    step 0's instance count by n_parallel to get real job count.
+
     Args:
         steps: list of StepPerf objects for one round
-        n_jobs: number of jobs (for output metadata)
+        n_jobs: number of HTCondor jobs (for output metadata)
         request_cpus: cores allocated per job
+        n_parallel: parallel instances per job in step 0 (default 1)
 
     Returns dict with events, n_jobs, request_cpus, core_hours, ev_ch.
     """
     if not steps or request_cpus <= 0:
         return {}
     total_events = max(s.events_total for s in steps) if steps else 0
-    # Sum of all per-job wall seconds across all steps
-    total_job_wall_sec = sum(s.n_jobs * s.wall_sec_mean for s in steps)
+    # Sum of all per-job wall seconds across all steps.
+    # For steps with parallel instances, divide n_jobs by n_parallel
+    # to count actual HTCondor slots, not individual instances.
+    total_job_wall_sec = 0
+    for s in steps:
+        if n_parallel > 1 and s.n_jobs > n_jobs:
+            # This step has parallel instances — use max wall time per job
+            # (instances run concurrently, so wall = max, not sum)
+            actual_jobs = s.n_jobs // n_parallel
+            total_job_wall_sec += actual_jobs * s.wall_sec_max
+        else:
+            total_job_wall_sec += s.n_jobs * s.wall_sec_mean
     if total_job_wall_sec <= 0 or total_events <= 0:
         return {}
     total_core_sec = request_cpus * total_job_wall_sec
@@ -316,42 +332,79 @@ def _print_adaptive_report(
     out: TextIO,
     use_color: bool,
 ) -> None:
-    """Print report for adaptive workflows with throughput comparison."""
+    """Print report for adaptive workflows with throughput comparison.
+
+    Supports N rounds: discovers rounds dynamically from step name prefixes,
+    reads per-replan decisions from _all_decisions list, and shows pairwise
+    throughput comparison for consecutive rounds.
+    """
     orig_nt = adaptive.get("original_nthreads", 8)
-    n_pipelines = adaptive.get("n_pipelines", 1)
-    job_multiplier = adaptive.get("job_multiplier", 1)
-    per_step_tuning = adaptive.get("per_step", {})
+    all_decisions = adaptive.get("_all_decisions", [adaptive])
 
-    # Split steps by round
-    round1_steps = [s for s in perf.steps if s.step_name.startswith("Round 1:")]
-    round2_steps = [s for s in perf.steps if s.step_name.startswith("Round 2:")]
+    # Discover rounds dynamically from step name prefixes
+    round_nums: set[int] = set()
+    for s in perf.steps:
+        m = re.match(r"Round (\d+):", s.step_name)
+        if m:
+            round_nums.add(int(m.group(1)))
+    n_rounds = max(round_nums) if round_nums else 0
 
-    # Jobs per round — with job split, R2 has more jobs than R1
-    if job_multiplier > 1:
-        # R1 jobs from total proc jobs accounting for multiplier
-        r1_jobs = perf.num_proc_jobs // (1 + job_multiplier)
-        r2_jobs = r1_jobs * job_multiplier
-        # Also infer from actual step data if available
-        if round1_steps and round1_steps[0].n_jobs > 0:
-            r1_jobs = round1_steps[0].n_jobs
-        if round2_steps and round2_steps[0].n_jobs > 0:
-            r2_jobs = round2_steps[0].n_jobs
-    else:
-        r1_jobs = perf.num_proc_jobs // 2 if perf.num_proc_jobs else 0
-        r2_jobs = r1_jobs
+    # Build per-round step lists and metadata
+    rounds: list[dict] = []  # index 0 = Round 1, etc.
+    for ri in range(1, n_rounds + 1):
+        prefix = f"Round {ri}:"
+        steps = [s for s in perf.steps if s.step_name.startswith(prefix)]
 
-    # Total cores (same for both rounds — same cluster allocation)
-    total_cores = orig_nt * r1_jobs
+        # Decisions for the replan *producing* this round (replan_0 -> Round 2)
+        dec_idx = ri - 2  # Round 2 -> decisions[0], Round 3 -> decisions[1]
+        dec = all_decisions[dec_idx] if 0 <= dec_idx < len(all_decisions) else {}
 
-    # For job split, R2 uses tuned_threads per job but more jobs
-    r2_request_cpus = adaptive.get("new_request_cpus", orig_nt) if job_multiplier > 1 else orig_nt
+        job_multiplier = dec.get("job_multiplier", 1)
+        n_pipelines = dec.get("n_pipelines", 1)
+        per_step_tuning = dec.get("per_step", {})
 
-    # Compute per-round throughput using per-job core-time committed
-    r1 = _compute_round_metrics(round1_steps, r1_jobs, orig_nt)
-    r2 = _compute_round_metrics(round2_steps, r2_jobs, r2_request_cpus)
+        # Determine job count for this round
+        if steps and steps[0].n_jobs > 0:
+            n_jobs = steps[0].n_jobs
+        elif ri == 1:
+            # Round 1: baseline
+            n_jobs = perf.num_proc_jobs // n_rounds if n_rounds else 0
+            # When probe is excluded, infer from step data
+            if adaptive.get("probe_node") and steps:
+                non_step0 = [s for s in steps if not s.step_name.endswith("Step 1")]
+                if non_step0:
+                    n_jobs = non_step0[0].n_jobs
+                elif steps:
+                    n_jobs = steps[0].n_jobs
+        else:
+            n_jobs = perf.num_proc_jobs // n_rounds if n_rounds else 0
 
-    # Throughput comparison headline
-    if r1 and r2:
+        request_cpus = dec.get("new_request_cpus", orig_nt) if job_multiplier > 1 else orig_nt
+        step0_n_par = per_step_tuning.get("0", {}).get("n_parallel", 1)
+
+        rounds.append({
+            "num": ri,
+            "steps": steps,
+            "decisions": dec,
+            "n_jobs": n_jobs,
+            "request_cpus": request_cpus,
+            "job_multiplier": job_multiplier,
+            "n_pipelines": n_pipelines,
+            "per_step_tuning": per_step_tuning,
+            "step0_n_par": step0_n_par,
+        })
+
+    # Compute per-round throughput
+    round_metrics = []
+    for rd in rounds:
+        n_par = rd["step0_n_par"] if rd["num"] > 1 else 1
+        m = _compute_round_metrics(rd["steps"], rd["n_jobs"], rd["request_cpus"],
+                                   n_parallel=n_par)
+        round_metrics.append(m)
+
+    # Throughput comparison table (all rounds side by side)
+    valid_metrics = [m for m in round_metrics if m]
+    if len(valid_metrics) >= 2:
         out.write("\n")
         hdr = "  Throughput Comparison"
         if use_color:
@@ -359,24 +412,68 @@ def _print_adaptive_report(
         else:
             out.write(f"{hdr}\n")
 
-        delta_ev_ch = (r2['ev_ch'] - r1['ev_ch']) / r1['ev_ch'] * 100 if r1['ev_ch'] > 0 else 0
+        # Header row
+        out.write(f"\n    {'':22s}")
+        for i, m in enumerate(round_metrics):
+            if m:
+                out.write(f"  {'Round ' + str(i + 1):>10s}")
+        # Change columns for consecutive pairs
+        for i in range(1, len(round_metrics)):
+            if round_metrics[i] and round_metrics[i - 1]:
+                out.write(f"  {'\u0394' + str(i) + '\u2192' + str(i + 1):>8s}")
+        out.write("\n")
 
-        r1_jc = f"{r1['n_jobs']}\u00d7{r1['request_cpus']}T"
-        r2_jc = f"{r2['n_jobs']}\u00d7{r2['request_cpus']}T"
+        # Events row
+        out.write(f"    {'Events':22s}")
+        for m in round_metrics:
+            if m:
+                out.write(f"  {m['events']:>10d}")
+        out.write("\n")
 
-        out.write(f"\n    {'':22s}  {'Round 1':>10s}  {'Round 2':>10s}  {'Change':>8s}\n")
-        out.write(f"    {'Events':22s}  {r1['events']:>10d}  {r2['events']:>10d}\n")
-        out.write(f"    {'Jobs \u00d7 Cores':22s}  {r1_jc:>10s}  {r2_jc:>10s}\n")
-        out.write(f"    {'Core-hours':22s}  {r1['core_hours']:>10.2f}  {r2['core_hours']:>10.2f}\n")
-        out.write(f"    {'Ev/core-hour':22s}  {r1['ev_ch']:>10.0f}  {r2['ev_ch']:>10.0f}  {delta_ev_ch:>+7.1f}%\n")
-    elif r1:
-        out.write(f"\n  Throughput (Round 1): {r1['ev_ch']:.0f} ev/core-hour  |  "
-                  f"{r1['events']} events, {r1['core_hours']:.2f} core-hours\n")
+        # Jobs × Cores row
+        out.write(f"    {'Jobs \u00d7 Cores':22s}")
+        for m in round_metrics:
+            if m:
+                jc = f"{m['n_jobs']}\u00d7{m['request_cpus']}T"
+                out.write(f"  {jc:>10s}")
+        out.write("\n")
 
-    # Tuning summary
-    if job_multiplier > 1:
-        out.write(f"\n  Job split: {r1_jobs} \u2192 {r2_jobs} jobs (\u00d7{job_multiplier}), {r2_request_cpus}T\n")
+        # Core-hours row
+        out.write(f"    {'Core-hours':22s}")
+        for m in round_metrics:
+            if m:
+                out.write(f"  {m['core_hours']:>10.2f}")
+        out.write("\n")
+
+        # Ev/core-hour row with deltas
+        out.write(f"    {'Ev/core-hour':22s}")
+        for m in round_metrics:
+            if m:
+                out.write(f"  {m['ev_ch']:>10.0f}")
+        for i in range(1, len(round_metrics)):
+            prev, cur = round_metrics[i - 1], round_metrics[i]
+            if prev and cur and prev['ev_ch'] > 0:
+                delta = (cur['ev_ch'] - prev['ev_ch']) / prev['ev_ch'] * 100
+                out.write(f"  {delta:>+7.1f}%")
+        out.write("\n")
+
+    elif valid_metrics:
+        m = valid_metrics[0]
+        out.write(f"\n  Throughput (Round 1): {m['ev_ch']:.0f} ev/core-hour  |  "
+                  f"{m['events']} events, {m['core_hours']:.2f} core-hours\n")
+
+    # Tuning summary (from first replan decisions)
+    first_dec = all_decisions[0] if all_decisions else {}
+    first_jm = first_dec.get("job_multiplier", 1)
+    if first_jm > 1 and len(rounds) >= 2:
+        r1_jobs = rounds[0]["n_jobs"]
+        r2_jobs = rounds[1]["n_jobs"]
+        r2_cpus = rounds[1]["request_cpus"]
+        out.write(f"\n  Job split: {r1_jobs} \u2192 {r2_jobs} jobs"
+                  f" (\u00d7{first_jm}), {r2_cpus}T\n")
     else:
+        n_pipelines = first_dec.get("n_pipelines", 1)
+        per_step_tuning = first_dec.get("per_step", {})
         out.write(f"\n  Tuning: {orig_nt}T baseline")
         if n_pipelines > 1:
             out.write(f" \u2192 {n_pipelines} pipelines")
@@ -395,11 +492,14 @@ def _print_adaptive_report(
     if mem_per_core > 0:
         out.write(f"  Memory: {mem_per_core} MB/core (R1)")
         if max_mem_per_core > 0:
-            out.write(f", max {max_mem_per_core} MB/core (R2)")
-        if job_multiplier > 1:
-            r2_mem = adaptive.get("new_request_memory_mb", 0)
+            out.write(f", max {max_mem_per_core} MB/core")
+        if first_jm > 1:
+            r2_mem = first_dec.get("new_request_memory_mb", 0)
+            mem_src = first_dec.get("memory_source", "")
             if r2_mem > 0:
-                out.write(f"\n  R2 request_memory: {r2_mem} MB ({r2_request_cpus} cores)")
+                src_str = f"  [{mem_src}]" if mem_src else ""
+                out.write(f"\n  R2 request_memory: {r2_mem} MB"
+                          f" ({first_dec.get('new_request_cpus', orig_nt)} cores){src_str}")
         elif ideal_mem > 0 and actual_mem > 0 and ideal_mem > actual_mem:
             out.write(f"\n  Memory needed: {ideal_mem} MB"
                       f" ({ideal_mem // orig_nt if orig_nt else 0} MB/core)"
@@ -409,8 +509,8 @@ def _print_adaptive_report(
         out.write("\n")
 
     # Ideal n_parallel (if memory-constrained, not for job split)
-    if job_multiplier <= 1:
-        step0_tuning = per_step_tuning.get("0", {})
+    if first_jm <= 1:
+        step0_tuning = first_dec.get("per_step", {}).get("0", {})
         ideal_n_par = step0_tuning.get("ideal_n_parallel", 0)
         actual_n_par = step0_tuning.get("n_parallel", 1)
         if ideal_n_par > actual_n_par:
@@ -420,13 +520,17 @@ def _print_adaptive_report(
     # Probe data (if probe split was used)
     probe_data = adaptive.get("probe_data", {})
     if probe_data:
-        cg = probe_data.get("per_instance_cgroup_mb", 0)
+        pk = probe_data.get("per_instance_peak_mb", 0)
+        # Backward compat: try old key name too
+        if not pk:
+            pk = probe_data.get("per_instance_cgroup_mb", 0)
         rss = probe_data.get("max_instance_rss_mb", 0)
         n_inst = probe_data.get("num_instances", 0)
-        mem_src = step0_tuning.get("memory_source", "") if per_step_tuning else ""
-        inst_mem = step0_tuning.get("instance_mem_mb", 0) if per_step_tuning else 0
+        step0_tuning = first_dec.get("per_step", {}).get("0", {})
+        mem_src = step0_tuning.get("memory_source", "")
+        inst_mem = step0_tuning.get("instance_mem_mb", 0)
         out.write(f"  Probe: {n_inst} instances,"
-                  f" {round(cg)} MB/instance cgroup,"
+                  f" {round(pk)} MB/instance peak,"
                   f" {round(rss)} MB/instance RSS"
                   f"  [{mem_src}]\n")
         if inst_mem > 0 and ideal_mem > 0 and orig_nt > 0:
@@ -434,50 +538,81 @@ def _print_adaptive_report(
                       f" {ideal_mem // orig_nt} MB/core"
                       f" (current max: {max_mem_per_core} MB/core)\n")
 
-    # Round 1 table
-    r1_cpu_pct = 0.0
-    if round1_steps:
-        out.write(f"\n  Round 1 (baseline, {orig_nt}T, {r1_jobs} jobs):\n")
-        _, _, r1_cpu_pct, _ = _print_step_table(
-            round1_steps, orig_nt, out, show_nthreads=False,
-            n_concurrent=1, n_jobs=r1_jobs, request_cpus=orig_nt)
+    # Per-round tables
+    round_cpu_pcts: list[float] = []
+    round_peak_rss: list[float] = []
+    for rd in rounds:
+        if not rd["steps"]:
+            round_cpu_pcts.append(0.0)
+            round_peak_rss.append(0.0)
+            continue
 
-    # Round 2 table
-    r2_cpu_pct = 0.0
-    if round2_steps:
-        # Build nthreads map for R2
-        r2_nt_map = {}
-        for i in range(len(round2_steps)):
-            si_str = str(i)
-            if si_str in per_step_tuning:
-                r2_nt_map[i] = per_step_tuning[si_str].get("tuned_nthreads", orig_nt)
-            else:
-                r2_nt_map[i] = orig_nt
+        ri = rd["num"]
+        n_jobs = rd["n_jobs"]
+        request_cpus = rd["request_cpus"]
+        n_pipelines = rd["n_pipelines"]
+        per_step_tuning = rd["per_step_tuning"]
 
-        desc_parts = []
-        if job_multiplier > 1:
-            desc_parts.append(f"{r2_jobs} jobs")
-            desc_parts.append(f"{r2_request_cpus}T")
+        if ri == 1:
+            # Round 1: baseline
+            out.write(f"\n  Round {ri} (baseline, {orig_nt}T, {n_jobs} jobs):\n")
+            _, _, cpu_pct, peak_rss = _print_step_table(
+                rd["steps"], orig_nt, out, show_nthreads=False,
+                n_concurrent=1, n_jobs=n_jobs, request_cpus=orig_nt)
         else:
-            if n_pipelines > 1:
-                desc_parts.append(f"{n_pipelines} pipelines")
-            tuned_unique = sorted(set(r2_nt_map.values()))
-            if len(tuned_unique) == 1:
-                desc_parts.append(f"{tuned_unique[0]}T")
-            else:
-                desc_parts.append("per-step tuned")
+            # Build nthreads map for tuned rounds
+            nt_map = {}
+            for i in range(len(rd["steps"])):
+                si_str = str(i)
+                if si_str in per_step_tuning:
+                    nt_map[i] = per_step_tuning[si_str].get("tuned_nthreads", orig_nt)
+                else:
+                    nt_map[i] = orig_nt
 
-        out.write(f"\n  Round 2 ({', '.join(desc_parts)}):\n")
-        _, _, r2_cpu_pct, _ = _print_step_table(
-            round2_steps, r2_nt_map, out, show_nthreads=True,
-            n_concurrent=n_pipelines, n_jobs=r2_jobs, request_cpus=r2_request_cpus)
+            desc_parts = []
+            jm = rd["job_multiplier"]
+            if jm > 1:
+                desc_parts.append(f"{n_jobs} jobs")
+                desc_parts.append(f"{request_cpus}T")
+            else:
+                if n_pipelines > 1:
+                    desc_parts.append(f"{n_pipelines} pipelines")
+                tuned_unique = sorted(set(nt_map.values()))
+                if len(tuned_unique) == 1:
+                    desc_parts.append(f"{tuned_unique[0]}T")
+                else:
+                    desc_parts.append("per-step tuned")
+
+            out.write(f"\n  Round {ri} ({', '.join(desc_parts)}):\n")
+            _, _, cpu_pct, peak_rss = _print_step_table(
+                rd["steps"], nt_map, out, show_nthreads=True,
+                n_concurrent=n_pipelines, n_jobs=n_jobs, request_cpus=request_cpus)
+
+        round_cpu_pcts.append(cpu_pct)
+        round_peak_rss.append(peak_rss)
 
     # Overall CPU efficiency summary
-    if r1_cpu_pct > 0:
-        out.write(f"\n  CPU efficiency per job: R1 {r1_cpu_pct:.0f}%")
-        if r2_cpu_pct > 0:
-            delta = r2_cpu_pct - r1_cpu_pct
-            out.write(f"  R2 {r2_cpu_pct:.0f}%  ({delta:+.0f}pp)")
+    active_pcts = [(i + 1, p) for i, p in enumerate(round_cpu_pcts) if p > 0]
+    if active_pcts:
+        out.write("\n  CPU efficiency per job:")
+        for ri, p in active_pcts:
+            out.write(f"  R{ri} {p:.0f}%")
+        # Show delta between first and last
+        if len(active_pcts) >= 2:
+            delta = active_pcts[-1][1] - active_pcts[0][1]
+            out.write(f"  ({delta:+.0f}pp)")
+        out.write("\n")
+
+    # Per-round peak memory summary
+    active_rss = [(i + 1, r) for i, r in enumerate(round_peak_rss) if r > 0]
+    if active_rss:
+        out.write("  Peak memory per job: ")
+        parts = []
+        for ri, rss in active_rss:
+            n_jobs = rounds[ri - 1]["n_jobs"]
+            machine_gb = rss * n_jobs / 1024
+            parts.append(f"R{ri} {rss:.0f} MB ({machine_gb:.1f} GB × {n_jobs} jobs)")
+        out.write("  ".join(parts))
         out.write("\n")
 
     # Time breakdown

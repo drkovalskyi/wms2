@@ -55,6 +55,8 @@ class WorkflowDef:
     split_uniform_threads: bool = False  # uniform nThreads across all steps in pipeline split
     overcommit_max: float = 1.0  # max CPU overcommit ratio (1.0 = disabled)
     split_tmpfs: bool = False  # use tmpfs for parallel split instances
+    split_tmpfs_from_wu: int = 0  # only inject tmpfs for WU >= this index
+    memory_mb_per_wu: dict[int, int] = field(default_factory=dict)  # per-WU memory overrides
     probe_split: bool = False  # run one WU0 proc as 2×(N/2)T probe for R2 memory estimation
     job_split: bool = False  # adaptive job split: more jobs with fewer cores in Round 2
     memory_per_core_mb: int = 2000  # MB per core for Round 1 request_memory
