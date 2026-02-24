@@ -2680,3 +2680,63 @@ The testing infrastructure had grown to ~13K lines across unit tests, integratio
 - Formatting follows main spec conventions (tables, inline code, `##`/`###` hierarchy)
 
 **Key fix:** `compute_job_split` previously used `max_memory_per_core` as the per-core formula base. Now uses `memory_per_core` (default) as floor and `max_memory_per_core` as ceiling, matching the spec's clamp semantics.
+
+---
+
+## 2026-02-24 — Cgroup memory monitor for accurate memory estimation
+
+### Problem
+
+FJR `PeakValueRss` only measures the main cmsRun process via `/proc/PID/stat`. For GEN workflows with `ExternalLHEProducer`, the gridpack subprocess memory is invisible to FJR. Verified experimentally with workflow 392.1:
+
+| Metric | FJR | Memory monitor (cgroup) |
+|---|---|---|
+| Step 0 peak RSS | 1241 MB | 3753 MB (anon) |
+| Peak shmem (tmpfs) | not measured | 1494 MB |
+| Peak non-reclaimable (anon+shmem) | not measured | 5126 MB |
+
+The adaptive algorithm was using FJR RSS + hardcoded constants (`TMPFS_PER_INSTANCE_MB=2000`, `CGROUP_HEADROOM_MB=1000`), which produced wrong memory estimates and caused systematic OOM when tmpfs was enabled.
+
+### Root cause analysis
+
+CMSSW's `SimpleMemoryCheck` service (`FWCore/Services/plugins/ProcInfoFetcher.cc`) reads `/proc/<pid>/stat` field 24 (rss in pages) for the main cmsRun process only. `ExternalLHEProducer` spawns a child process to run the gridpack — its memory is invisible to this measurement. The cgroup, however, captures all processes.
+
+Controlled 3-round experiment (392.1):
+- **R1** (no tmpfs, 4337 MB): OK. Peak anon=3754, shmem=0. Cgroup hit limit but kernel reclaimed file cache.
+- **R2** (tmpfs, 6000 MB): OK. Peak anon=3755, shmem=1494. Peak non-reclaimable=5126 MB.
+- **R3** (tmpfs, 4337 MB): OOM at ~4285 MB. Non-reclaimable (5126) far exceeds limit (4337).
+
+### Solution
+
+Use the existing memory monitor (already sampling `memory.stat` every 2 seconds) to produce structured cgroup data for the adaptive algorithm.
+
+**Wrapper (`dag_planner.py`)**:
+- After killing the memory monitor, compute peak non-reclaimable split by `tmpfs_present` flag using awk
+- Write `proc_${NODE_INDEX}_cgroup.json` with: `peak_anon_mb`, `peak_shmem_mb`, `peak_nonreclaim_mb`, `tmpfs_peak_nonreclaim_mb`, `no_tmpfs_peak_anon_mb`
+- Stage cgroup file alongside metrics during output transfer
+
+**Adaptive (`adaptive.py`)**:
+- New `load_cgroup_metrics()` function reads `proc_*_cgroup.json` files, aggregates peaks across jobs
+- `analyze_wu_metrics()` attaches cgroup data to return dict
+- `merge_round_metrics()` propagates cgroup from latest round
+- `compute_job_split()` and `compute_per_step_nthreads()` gain `cgroup` parameter — when available, use measured `peak_nonreclaim_mb` instead of FJR RSS + hardcoded constants
+- Existing FJR-based logic remains as fallback for jobs without cgroup data
+
+### Memory formula
+
+```
+binding_constraint = max(
+    tmpfs_peak_nonreclaim_mb,    # step 0: anon + shmem (both non-reclaimable)
+    no_tmpfs_peak_anon_mb,       # other steps: anon only (file cache reclaimable)
+)
+request_memory = binding_constraint × (1 + safety_margin)
+```
+
+With 392.1 R2 data and 10% margin: `max(5126, 2990) × 1.10 = 5638 MB` — correctly covers the 5126 MB non-reclaimable peak. The old FJR-based estimate would have been ~4633 MB, still causing OOM.
+
+### Verification
+
+- `proc_0_cgroup.json` (R1, no tmpfs): `peak_anon=3754, shmem=0, tmpfs_peak_nr=0`
+- `proc_1_cgroup.json` (R2, tmpfs): `peak_anon=3755, shmem=1494, tmpfs_peak_nr=5126, no_tmpfs_peak=2990`
+- Adaptive algorithm correctly selects `cgroup_measured` source and computes 5638 MB
+- Backward compatible: jobs without `proc_*_cgroup.json` fall through to existing FJR+estimate logic
