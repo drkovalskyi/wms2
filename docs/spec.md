@@ -2887,6 +2887,8 @@ Token support is an external dependency (HTCondor + WLCG infrastructure), not a 
 
 **Deliverables**: Full request lifecycle working (submit → DAG → outputs registered → blocks archived → adaptive optimization on recovery); clean stop and catastrophic recovery tested; site management; production-like deployment; monitoring dashboards; operator documentation.
 
+**Testing**: See `docs/testing.md` for the complete testing specification covering test levels, matrix runner, cmsRun simulator, adaptive testing, fault injection, and environment verification.
+
 ---
 
 ## 11. Migration Strategy
