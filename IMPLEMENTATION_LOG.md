@@ -2859,3 +2859,42 @@ Created `docs/adaptive.md` (1139 lines) — a standalone algorithm specification
 - Memory source hierarchy priority order matches code: `compute_per_step_nthreads()` lines 585–601, `compute_job_split()` lines 818–857
 - Spec.md §5.1–§5.5 cross-references verified against actual section locations
 - Cross-reference sentence added to `docs/spec.md` Section 5.1
+
+---
+
+## Propagate Spec v2.8.0 Adaptive/Round-Tracking Fields into Code
+
+**Date**: 2026-02-25
+**Spec Version**: 2.8.0
+**Commit**: 3640b64
+
+### What Was Built
+
+Propagated new fields from spec v2.8.0 (multi-round adaptive lifecycle) into the application code. Renamed the `pilot_metrics` DB/model field to `step_metrics` to match spec terminology, and added round-tracking fields for multi-round execution.
+
+### Changes
+
+| File | Change |
+|---|---|
+| `src/wms2/models/request.py` | Added `adaptive: bool = True` to `RequestCreate`, `RequestUpdate`, `Request` |
+| `src/wms2/models/workflow.py` | Renamed `pilot_metrics` → `step_metrics`, added `current_round`, `next_first_event`, `file_cursor` |
+| `src/wms2/db/tables.py` | Added `adaptive` to `RequestRow`, renamed + added fields to `WorkflowRow` |
+| `src/wms2/db/migrations/versions/002_adaptive_round_fields.py` | New Alembic migration (add_column, alter_column rename, with downgrade) |
+| `src/wms2/core/dag_planner.py` | Renamed `pilot_metrics=` → `step_metrics=` in `update_workflow()` call |
+| `src/wms2/api/workflows.py` | Renamed field in serialization, added `current_round`, `next_first_event`, `file_cursor` |
+| `tests/unit/test_models.py` | Added 3 tests: adaptive default/override, workflow round-tracking defaults |
+
+### Design Decisions
+
+- **Keep `pilot_cluster_id`, `pilot_schedd`, `pilot_output_path` unchanged**: These track the pilot HTCondor job (cluster ID, schedd, output directory) — a different concern than `step_metrics` (aggregated FJR data). Renaming them would break working code for no spec benefit; the spec doesn't prescribe these implementation details.
+- **Rename only `pilot_metrics` → `step_metrics`**: This is the one field the spec explicitly names in the new terminology, and the code already uses it the same way (aggregated metrics from completed work units). The `PilotMetrics` class name stays — it's still a valid description of the data structure.
+- **`adaptive` defaults to `True`**: Matches spec intent that multi-round is the default execution mode. Non-adaptive (single-pass) is the exception.
+- **`pilot_metrics.json` file name unchanged**: The on-disk JSON file written by pilot_runner.py and transferred by HTCondor keeps its name. Only the DB column and model field were renamed.
+
+### Verification
+
+- Alembic migration 002 applied successfully against local DB
+- DB schema verified: `requests.adaptive` (boolean, default true), `workflows.step_metrics` (renamed), `workflows.current_round` (int, default 0), `workflows.next_first_event` (int, default 1), `workflows.file_cursor` (int, default 0)
+- 275/276 unit tests pass (1 pre-existing failure in `test_handle_active_processes_work_units`)
+- 8/8 integration tests pass
+- No stale `pilot_metrics` references in `src/` outside of file-on-disk names (pilot_runner.py, dag_planner HTCondor submit templates) and migration files
