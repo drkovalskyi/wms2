@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.7.0 |
+| **Spec Version** | 2.8.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-23 |
+| **Date** | 2026-02-25 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -236,6 +236,10 @@ class Request(BaseModel):
     #   → first 10% of work units at original priority, next 40% at 80k, rest at 50k
     production_steps: List[ProductionStep] = []
 
+    # Adaptive execution — multi-round lifecycle with pilot round
+    # See docs/processing.md §6.2 for the multi-round lifecycle.
+    adaptive: bool = True            # Enable multi-round adaptive execution
+
     # Payload Configuration
     payload_config: Dict[str, Any]  # Opaque to WMS2, passed to sandbox
 
@@ -318,6 +322,11 @@ class Workflow(BaseModel):
     # recovery rounds). Passed to sandbox via step_profile.json for adaptive
     # per-step optimization. Structure defined in Section 5.6.
     step_metrics: Optional[Dict[str, Any]]
+
+    # Multi-round tracking (see docs/processing.md §6.5)
+    current_round: int = 0           # Current processing round (0 = pilot)
+    next_first_event: int = 1        # GEN: next event number to produce
+    file_cursor: int = 0             # File-based: index of next unprocessed file
 
     # DAG Reference (set after DAG submission)
     dag_id: Optional[UUID]
@@ -588,6 +597,7 @@ CREATE TABLE requests (
     priority INTEGER DEFAULT 100000,
     urgent BOOLEAN DEFAULT FALSE,
     production_steps JSONB DEFAULT '[]',
+    adaptive BOOLEAN DEFAULT TRUE,
     status VARCHAR(50) NOT NULL DEFAULT 'new',
     status_transitions JSONB DEFAULT '[]',
     -- Version linkage (catastrophic failure recovery)
@@ -607,6 +617,9 @@ CREATE TABLE workflows (
     sandbox_url TEXT,
     config_data JSONB,
     step_metrics JSONB,
+    current_round INTEGER DEFAULT 0,
+    next_first_event INTEGER DEFAULT 1,
+    file_cursor INTEGER DEFAULT 0,
     dag_id UUID,
     category_throttles JSONB DEFAULT '{"Processing": 5000, "Merge": 100, "Cleanup": 50}',
     total_nodes INTEGER DEFAULT 0,
@@ -749,10 +762,11 @@ CREATE INDEX idx_processing_blocks_status ON processing_blocks(status);
 │     - Prevent resource starvation and long tails                │
 │                                                                 │
 │  4. DAG Planner                                                 │
-│     - Split input data into DAG node specs                      │
-│     - Use request hints (round 1) or step_metrics (round 2+)   │
-│     - Plan merge nodes based on output size estimates           │
-│     - Generate DAGMan .dag and .sub files                       │
+│     - Split input data into processing nodes                    │
+│     - Round 0: use request defaults, fixed jobs_per_work_unit   │
+│     - Round 1+: use measured metrics for optimized sizing       │
+│     - Form merge groups (work units) and processing blocks      │
+│     - Generate DAGMan .dag and .sub files per round             │
 │     - Submit DAGs via condor_submit_dag                         │
 │                                                                 │
 │  5. DAG Monitor                                                 │
@@ -1287,31 +1301,34 @@ class DAGPlanner:
 
     async def plan_and_submit(self, workflow: Workflow) -> DAG:
         """
-        Build and submit the production DAG.
+        Build and submit a production DAG for one round.
 
-        Round 1 (no step_metrics): uses request resource hints directly.
-        Round 2+ (step_metrics populated from previous round's FJR data):
-        uses measured peak RSS for memory sizing. Writes step_profile.json
-        to submit dir so sandbox can apply per-step adaptive optimization.
+        Round 0 (no step_metrics, adaptive=True): pilot round using request
+        defaults with fixed jobs_per_work_unit. Collects metrics.
+        Round 1+ (step_metrics populated): uses measured data for optimized
+        events_per_job, jobs_per_group, memory. Each round builds only its
+        share of work units (see docs/processing.md §6.5).
+        Non-adaptive (adaptive=False): single DAG with all work.
         """
         request = await self.db.get_request(workflow.request_name)
 
-        # Determine resource parameters from step_metrics or request hints
+        # Resource parameters
         if workflow.step_metrics:
-            # Recovery round — use measured metrics for sizing
+            # Round 1+: measured metrics
             sm = workflow.step_metrics
             memory_mb = max(
                 s["rss_mb"] for s in sm["steps"].values()
-            ) + 512  # headroom
-            events_per_job = request.splitting_params.get("events_per_job", 10000)
-            time_per_job = int(request.time_per_event_sec * events_per_job)
-            output_size_per_event = request.size_per_event_kb
+            ) + safety_margin
+            # Tune events_per_job to target 8h wall time
+            measured_tpe = sm.get("time_per_event", request.time_per_event_sec)
+            events_per_job = int(target_wall_time_hours * 3600 / measured_tpe)
         else:
-            # First round — use request defaults
+            # Round 0 / non-adaptive: request defaults
             events_per_job = request.splitting_params.get("events_per_job", 10000)
             memory_mb = request.memory_mb
-            time_per_job = int(request.time_per_event_sec * events_per_job)
-            output_size_per_event = request.size_per_event_kb
+
+        # SizePerEvent → request_disk only (not merge group sizing)
+        request_disk_kb = int(events_per_job * request.size_per_event_kb)
 
         # 2. Fetch input files and locations
         input_files = await self.dbs_adapter.get_files(
@@ -1328,24 +1345,37 @@ class DAGPlanner:
         # 3. Split into processing nodes
         splitter_cls = self.SPLITTERS[workflow.splitting_algo]
         splitter = splitter_cls(**workflow.splitting_params)
+        time_per_job = int(
+            (workflow.step_metrics.get("time_per_event", request.time_per_event_sec)
+             if workflow.step_metrics else request.time_per_event_sec)
+            * events_per_job
+        )
         processing_nodes = splitter.split(
             files=input_files, workflow=workflow,
             memory_mb=memory_mb, time_per_job=time_per_job,
         )
 
         # 4. Plan merge groups (each group = processing nodes + merge + cleanup)
-        merge_groups = self._plan_merge_groups(
-            processing_nodes, workflow, output_size_per_event
-        )
+        if workflow.step_metrics and "output_sizes" in workflow.step_metrics:
+            merge_groups = self._plan_merge_groups(
+                processing_nodes, workflow,
+                measured_sizes=workflow.step_metrics["output_sizes"],
+            )
+        else:
+            merge_groups = self._plan_merge_groups(
+                processing_nodes, workflow,
+                jobs_per_work_unit=request.splitting_params.get(
+                    "jobs_per_work_unit", 8),
+            )
 
         total_nodes = sum(g.total_nodes for g in merge_groups)
 
         # 5. Generate DAG files (outer DAG + per-group sub-DAGs)
         submit_dir = self._create_submit_dir(workflow)
 
-        # Write step_profile.json if step_metrics exist (recovery round).
+        # Write step_profile.json if step_metrics exist (Round 1+).
         # The sandbox reads this file for per-step adaptive optimization
-        # (see Section 5.4). Absent on round 1 — sandbox uses defaults.
+        # (see Section 5.4). Absent on Round 0 — sandbox uses defaults.
         if workflow.step_metrics:
             profile_path = os.path.join(submit_dir, "step_profile.json")
             with open(profile_path, "w") as f:
@@ -1382,37 +1412,32 @@ class DAGPlanner:
 
     # ── Merge Group Planning ─────────────────────────────────────
 
-    def _plan_merge_groups(self, processing_nodes, workflow, output_size_per_event_kb,
-                           target_merged_size_kb=4_000_000) -> List[MergeGroup]:
+    def _plan_merge_groups(self, processing_nodes, workflow,
+                           jobs_per_work_unit=None,
+                           measured_sizes=None) -> List[MergeGroup]:
         """
-        Group processing nodes into work units based on expected output size.
-        Each work unit becomes a SUBDAG EXTERNAL (merge group) containing:
-          landing node → processing nodes → merge node → cleanup node
-        Group composition is fixed at planning time (from request hints
-        or step_metrics). Site assignment is deferred to runtime (landing
-        node mechanism).
+        Group processing nodes into work units (merge groups).
+
+        Two modes (see docs/processing.md §4.2):
+        - Fixed count (Round 0 / non-adaptive): jobs_per_work_unit from config
+        - Measured sizing (Round 1+): use measured per-tier output sizes to
+          target min_merge_size..max_merge_size for the largest tier
         """
+        if measured_sizes:
+            # Target: largest-tier merged file in [min_merge_size, max_merge_size]
+            largest_tier_per_job = max(measured_sizes.values())
+            jobs_per_group = max(1, int(
+                target_merge_size / largest_tier_per_job
+            ))
+        else:
+            jobs_per_group = jobs_per_work_unit or 8  # config default
+
         groups = []
-        current_procs = []
-        current_size = 0
-
-        for proc in processing_nodes:
-            est_output = proc.input_events * output_size_per_event_kb
-            if current_size + est_output > target_merged_size_kb and current_procs:
-                groups.append(MergeGroup(
-                    group_index=len(groups),
-                    processing_nodes=current_procs,
-                    estimated_output_kb=int(current_size),
-                ))
-                current_procs, current_size = [], 0
-            current_procs.append(proc)
-            current_size += est_output
-
-        if current_procs:
+        for i in range(0, len(processing_nodes), jobs_per_group):
+            chunk = processing_nodes[i:i + jobs_per_group]
             groups.append(MergeGroup(
                 group_index=len(groups),
-                processing_nodes=current_procs,
-                estimated_output_kb=int(current_size),
+                processing_nodes=chunk,
             ))
         return groups
 
@@ -1421,7 +1446,6 @@ class MergeGroup(BaseModel):
     """A work unit — a self-contained merge group implementing one unit of progress."""
     group_index: int
     processing_nodes: List[DAGNodeSpec]
-    estimated_output_kb: int
 
     @property
     def total_nodes(self) -> int:
@@ -1695,6 +1719,11 @@ class EventBasedSplitter:
                 idx += 1
         return nodes
 ```
+
+> **See also**: `docs/processing.md` for the complete processing logic
+> specification covering splitting algorithms, merge group formation,
+> processing blocks, multi-round adaptive lifecycle, and lumi-section
+> assignment.
 
 ### 4.6 DAG Monitor
 
@@ -2254,38 +2283,41 @@ else:
 
 ### 5.3 Execution Rounds
 
-**Round 1** (fresh submission, no `step_profile.json`):
-- **Production jobs**: Use `default_memory_per_core × Multicore` as `request_memory` (unless the request itself demands more — see Section 5.2). This maximizes the site pool.
-- **Probe jobs** (optional, 1–2 jobs): Use `max_memory_per_core × Multicore` as `request_memory`. Probes test splitting configurations (e.g., 2 parallel instances within one slot) that need headroom to avoid OOM. The wider memory envelope is acceptable because only 1–2 jobs are affected. Probe results (cgroup memory peaks, CPU utilization) feed the Round 2 adaptive sizing.
-- DAG Planner uses request resource hints: `Memory`, `TimePerEvent`, `SizePerEvent`
-- Sandbox runs each job with default resource allocation
-- FJR data is collected per work unit but not yet aggregated
+The adaptive lifecycle uses multiple processing rounds, each as a separate
+DAG. See `docs/processing.md` §6.2–6.5 for the complete specification.
 
-**Round 2+** (rescue DAG after clean stop or partial failure):
-- Lifecycle Manager aggregates FJR data from completed work units into `workflow.step_metrics`
-- DAG Planner writes `step_profile.json` to submit directory
-- Sandbox reads `step_profile.json` and applies per-step optimization:
-  - Memory sizing based on measured data + 20% safety margin (Section 5.5), within the `[default, max] × Multicore` window
-  - Per-step splitting for CPU-inefficient steps (Section 5.4)
-- Rescue DAG skips completed nodes — only remaining work uses updated parameters
+**Round 0** (pilot, `current_round=0`, `adaptive=true`):
+- Uses request resource defaults (Memory, TimePerEvent)
+- Fixed `jobs_per_work_unit` (default 8) for merge group sizing
+- Produces `work_units_per_round` work units (default 10)
+- Collects FJR metrics: per-step RSS, CPU efficiency, time-per-event,
+  per-tier output sizes
+- On completion: metrics aggregated into `workflow.step_metrics`,
+  request returns to admission queue
+
+**Round 1+** (production, `current_round>=1`, `adaptive=true`):
+- `events_per_job` tuned to target wall time (default 8h)
+- `jobs_per_group` sized from measured per-tier output to target
+  `min_merge_size..max_merge_size`
+- Memory sized to measured peak + 20% safety margin
+- Each round builds only its share of work units
+- On completion: metrics refined, request returns to queue if work remains
+
+**Non-adaptive** (`adaptive=false`):
+- Single DAG with all work, request defaults throughout
+- No pilot round, no inter-round optimization
 
 ```
-Round 1: Request hints → DAG → jobs run → FJR data collected
-              │         (production: default mem/core)
-              │         (probes: max mem/core)
+Round 0: Request defaults → pilot DAG (10 WUs) → metrics collected
               │
-              ▼ (clean stop, partial failure, or production step)
-         Lifecycle Manager: _prepare_recovery()
-              │  Aggregates FJR data → workflow.step_metrics
-              ▼
-Round 2: step_metrics → DAG Planner writes step_profile.json
-              │  Sandbox applies per-step optimization
-              │  Memory sized to measured data + 20%, within [default, max] window
-              ▼
-         Rescue DAG resumes with adaptive parameters
+              ▼ (DAG completes, request returns to queue)
+         Lifecycle Manager: aggregate metrics → step_metrics
               │
-              ▼ (if another recovery round)
-Round 3+: Refined step_metrics → further optimization (diminishing returns)
+              ▼
+Round 1: Optimized params → production DAG (10 WUs) → metrics refined
+              │
+              ▼ (if work remains, request returns to queue)
+Round K: Remaining work (≤10 WUs) → final DAG → COMPLETED
 ```
 
 ### 5.4 Per-Step Splitting Optimization
@@ -2971,7 +3003,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 | ReqMgr2 schema changes | Medium | Medium | Flexible JSONB storage, validation layer |
 | DAGMan status file parsing brittleness | Medium | Medium | Use condor_q as fallback; version-pin HTCondor |
 | Processing block sizing | Medium | Medium | Block too small → tape fragmentation; block too large → data sits on disk too long. Needs tuning with real production patterns |
-| First-round resource estimates inaccurate | Low | Medium | Auto-corrects from round 2 via step_metrics; conservative memory headroom on round 1 |
+| First-round resource estimates inaccurate | Low | Medium | Auto-corrects from Round 1 via step_metrics; conservative memory headroom on Round 0 |
 | Feature gaps discovered late | High | Medium | Close collaboration with operations team |
 | Team bandwidth | Medium | High | Phased approach, MVP focus |
 | Silent request stalling | High | Medium | Lifecycle Manager timeout detection alerts when any request exceeds its expected duration in a given status; no request can be "forgotten" |
@@ -2986,7 +3018,7 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 1. **Sandbox/Wrapper Design**: How does the per-node manifest communicate input data to the job? What format? This is tightly coupled to sandbox architecture and needs dedicated design discussion.
 2. **Sandbox Scope**: Exact boundary between WMS2 and sandbox responsibilities — manifest generation, adaptive per-step optimization (reading `step_profile.json`, per-step splitting), POST script logic, FJR metric extraction.
 3. **Existing Micro-Services**: Which CMS micro-services currently handle output registration and data placement? Are they reusable with clean APIs?
-4. **DAG Size Partitioning**: If a workflow exceeds practical DAG size limits (discovered during load testing), what's the partitioning strategy?
+4. **DAG Size Partitioning**: If a workflow exceeds practical DAG size limits (discovered during load testing), what's the partitioning strategy? *Partially resolved by multi-round lifecycle — each round has a bounded number of WUs (default 10), so DAG size is naturally limited. See `docs/processing.md` §6.5.*
 5. **DAGMan Status Polling vs. Event-Based**: Should WMS2 poll `.status` files or use event log callbacks? Performance implications at scale. The Lifecycle Manager's main loop uses polling by default; event-based callbacks could replace the poll_dag() call if HTCondor supports efficient event delivery.
 6. **Shared Filesystem**: Is a shared filesystem between submit host and WMS2 service guaranteed, or do DAG files need to be transferred?
 7. **GPU Jobs**: Include `request_gpus` support in submit files for MVP?
@@ -2996,13 +3028,13 @@ The following capabilities are required from HTCondor / DAGMan and will be devel
 11. **Concurrent Version Limit**: Should there be a maximum number of version increments for a single request (e.g., max 3 retries) to prevent infinite retry loops from catastrophic infrastructure issues?
 12. **Merge Group Stagger Depth**: How many merge groups should run concurrently (`MAXJOBS MergeGroup`)? Too few underutilizes the pool; too many causes landing nodes to cluster on the same site before processing backpressure takes effect. Needs tuning with real pool behavior.
 13. **Landing Node Site Discovery**: Is `MATCH_GLIDEIN_CMSSite` reliably set across all CMS glidein configurations? Are there worker node environments where this classad is missing or named differently?
-14. **Work Unit Granularity**: With few work units (e.g., a workflow with only 5 merge groups), the actual fraction may differ significantly from the requested fraction. A `production_steps` entry of `{"fraction": 0.1}` cannot be honored — the closest achievable step is 20% (1 out of 5). Should WMS2 warn at submission time or silently round?
+14. **Work Unit Granularity**: With few work units (e.g., a workflow with only 5 merge groups), the actual fraction may differ significantly from the requested fraction. A `production_steps` entry of `{"fraction": 0.1}` cannot be honored — the closest achievable step is 20% (1 out of 5). Should WMS2 warn at submission time or silently round? *Resolved by multi-round lifecycle — fraction tracking is in events, not work units. See `docs/processing.md` §6.3, OQ-P9.*
 15. **Partial Production on ACTIVE Requests**: Can `production_steps` be set via `PATCH /api/v1/requests/{name}` on an already-ACTIVE request? This could trigger an immediate clean stop on the next Lifecycle Manager cycle if the fraction threshold is already met. Should this be allowed, or should `production_steps` be immutable after submission?
 16. **Default Thread Count for First Round**: What default thread count should the sandbox use when no `step_profile.json` exists? Should it match the request's `Multicore` field, or should WMS2 suggest a conservative default? Per-step CPU efficiency data suggests some steps are highly inefficient at high thread counts.
 17. **Metric Aggregation Strategy**: Should `step_metrics` use median or p90 for RSS? Median is robust to outliers but may underestimate memory needs for skewed distributions. P90 is safer but wastes memory for most jobs.
 18. **Minimum Sample Size for Reliable step_metrics**: How many completed work units are needed before `step_metrics` are considered reliable? With only 2–3 work units, one outlier can skew medians significantly. Should there be a minimum sample threshold below which the DAG Planner ignores step_metrics and falls back to request hints?
-19. **Processing Block Sizing**: What criteria determine how many work units go into a processing block? Options include: target total output size (e.g., 1–2 TB per block for efficient tape writes), fixed work unit count, or input-data-driven boundaries (e.g., one block per input DBS block). Too small → tape fragmentation; too large → data sits on disk unprotected by tape for too long. The right size depends on tape capacity (18 TB), expected file sizes (2–4 GB), and production timelines.
-20. **Block Completion Priority**: Should WMS2 actively prioritize completing in-progress blocks before starting new ones? This could mean biasing work unit scheduling within a DAG to finish partial blocks first, or limiting how many blocks can be open simultaneously. Tradeoff: strict block completion ordering may reduce site utilization if a block's remaining work units are waiting for specific sites.
+19. **Processing Block Sizing**: What criteria determine how many work units go into a processing block? Options include: target total output size (e.g., 1–2 TB per block for efficient tape writes), fixed work unit count, or input-data-driven boundaries (e.g., one block per input DBS block). Too small → tape fragmentation; too large → data sits on disk unprotected by tape for too long. The right size depends on tape capacity (18 TB), expected file sizes (2–4 GB), and production timelines. *See `docs/processing.md` §5 and OQ-P2 for current design (one block per output dataset per DAG).*
+20. **Block Completion Priority**: Should WMS2 actively prioritize completing in-progress blocks before starting new ones? This could mean biasing work unit scheduling within a DAG to finish partial blocks first, or limiting how many blocks can be open simultaneously. Tradeoff: strict block completion ordering may reduce site utilization if a block's remaining work units are waiting for specific sites. *Partially resolved — each round's DAG creates self-contained blocks. See `docs/processing.md` §5.4 (DD-P2).*
 21. **Rucio Retry Max Duration**: What is the right default for `RUCIO_MAX_RETRY_DURATION`? Currently 3 days (covers a weekend outage). Should this be configurable per request? A campaign deadline might require shorter timeout with faster operator escalation.
 
 ---
@@ -3104,11 +3136,27 @@ The design reuses the clean stop flow entirely — no new request states, no new
 - *New request status (e.g., DEPRIORITIZED)*: Unnecessary — the existing STOPPING → RESUBMITTING → QUEUED → ACTIVE flow handles everything. Adding states increases the state machine complexity for no benefit.
 - *Separate partial production queue*: Over-engineering. The admission queue already handles priority ordering; demoting the request's priority achieves the same effect.
 
+**Update**: For adaptive workflows (`adaptive=true`), the multi-round lifecycle
+(`docs/processing.md` §6.2) naturally subsumes this mechanism. Each round
+completes fully (FIFO, no priority preemption), and `production_steps` priority
+demotion is applied when the request re-enters the admission queue between
+rounds. Clean stop is no longer the trigger — round completion is.
+Non-adaptive workflows still use the original clean-stop mechanism.
+
 ### DD-12: Adaptive execution instead of dedicated pilot
 
-**Decision**: WMS2 does not run a separate pilot job to measure performance before the production DAG. Instead, the first production DAG uses resource hints from the request (TimePerEvent, Memory, SizePerEvent). As work units complete, per-step FJR data (CPU efficiency, peak RSS, wall time) is aggregated by the Lifecycle Manager. When a recovery round occurs (rescue DAG after clean stop, partial failure, or partial production step), the accumulated metrics are written to `step_profile.json` for the sandbox to use in per-step optimization.
+**Decision**: WMS2 uses the first processing round (Round 0) as an implicit
+pilot. It processes a small fixed number of work units (default 10) using
+request resource defaults. The outputs are real production data (registered
+in DBS, archived to tape), not throwaway measurements. After Round 0
+completes, FJR metrics are aggregated and used to optimize all parameters
+for Round 1+. See `docs/processing.md` §6.2.
 
-**Why**: A dedicated pilot phase adds ~8 hours of latency before the first production job runs, and the pilot's measurements may not represent the full dataset (different input files, different sites). The adaptive model starts producing real results immediately and converges to optimal parameters asymptotically — most gains are realized by round 2. Partial production steps (Section 6.2.1) are natural re-optimization points, so the bulk of every workflow benefits from measured data even on first submission. This also simplifies the state machine (no `PILOT_RUNNING` status) and removes pilot-specific tracking fields.
+**Why**: A dedicated pilot phase adds ~8 hours of latency and produces no
+usable output. Round 0 starts producing real results immediately while
+collecting the same performance data. Most optimization gains are realized
+by Round 1. The multi-round lifecycle means every workflow benefits from
+measured data for the bulk of its processing.
 
 **Rejected alternative**: *Dedicated pilot job with iterative measurement*. Adds latency, complexity (extra request/workflow states, pilot tracking fields, pilot parsing logic), and may not be representative. The adaptive approach achieves the same goal (accurate resource estimates) without a separate phase, using production data that is inherently representative.
 
