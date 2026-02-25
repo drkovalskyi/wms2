@@ -272,6 +272,7 @@ def _make_mock_repo() -> MagicMock:
     repo.create_dag = AsyncMock(return_value=dag_row)
     repo.update_dag = AsyncMock()
     repo.update_workflow = AsyncMock()
+    repo.create_processing_block = AsyncMock()
     return repo
 
 
@@ -772,6 +773,14 @@ def _collect_adaptive_perf(
     perf.raw_job_step_data = job_step_data
     # Store primary decisions for backward compat, plus full list for N-round
     adaptive_info["_all_decisions"] = all_decisions
+    adaptive_info["safety_margin"] = wf.safety_margin
+    # Load cgroup data from the last merge group for next-round projection
+    from tests.matrix.adaptive import load_cgroup_metrics
+    last_mg = sorted(wf_dir.glob("mg_*"))
+    if last_mg:
+        cgroup = load_cgroup_metrics(last_mg[-1])
+        if cgroup:
+            adaptive_info["cgroup"] = cgroup
     perf.raw_job_step_data["_adaptive"] = adaptive_info
     perf.cpu_samples = cpu_samples
 
@@ -783,8 +792,54 @@ def _collect_adaptive_perf(
         perf.steps.append(_aggregate_step(step_name, samples, wf.events_per_job))
 
     # Time breakdown — parse from both merge groups
+    # Also collect per-round absolute timestamps for plot annotation.
+    from datetime import datetime as _dt
+    round_times: list[dict] = []
+    overall_start_ts: _dt | None = None
+    ts_pat = re.compile(r"\{(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\}")
+    nd_pat = re.compile(
+        r"ULOG_(EXECUTE|JOB_TERMINATED) for HTCondor Node (\S+)"
+    )
     for gd in sorted(wf_dir.glob("mg_*")):
         _parse_dagman_times_from_dir(gd, perf)
+        # Parse per-round processing start/end
+        dagman_out = gd / "group.dag.dagman.out"
+        if not dagman_out.exists():
+            round_times.append({})
+            continue
+        try:
+            content = dagman_out.read_text()
+        except OSError:
+            round_times.append({})
+            continue
+        proc_s: list[_dt] = []
+        proc_e: list[_dt] = []
+        for line in content.splitlines():
+            nm = nd_pat.search(line)
+            tm = ts_pat.search(line)
+            if not nm or not tm:
+                continue
+            evt, node = nm.group(1), nm.group(2)
+            if not node.startswith("proc_"):
+                continue
+            ts = _dt.strptime(tm.group(1), "%m/%d/%y %H:%M:%S")
+            if evt == "EXECUTE":
+                proc_s.append(ts)
+            else:
+                proc_e.append(ts)
+        if proc_s and proc_e:
+            rstart = min(proc_s)
+            rend = max(proc_e)
+            if overall_start_ts is None:
+                overall_start_ts = rstart
+            round_times.append({
+                "start_sec": (rstart - overall_start_ts).total_seconds(),
+                "end_sec": (rend - overall_start_ts).total_seconds(),
+            })
+        else:
+            round_times.append({})
+    if round_times and any(rt for rt in round_times):
+        adaptive_info["_round_times"] = round_times
 
     # Output sizes
     pfn_prefix = "/mnt/shared"
@@ -1020,6 +1075,10 @@ class MatrixRunner:
         else:
             create_sandbox(sandbox_path, wf.request_spec, mode=wf.sandbox_mode)
 
+        # Dispatch to production path if enabled
+        if wf.production_path:
+            return await self._execute_production(wf, result, work_dir, sandbox_path)
+
         # Dispatch to adaptive path if enabled
         if wf.adaptive:
             return await self._execute_adaptive(wf, result, work_dir, sandbox_path)
@@ -1237,6 +1296,7 @@ class MatrixRunner:
                 + (f" --split-tmpfs" if wf.split_tmpfs else "")
                 + (f" --job-split --events-per-job {wf.events_per_job}"
                    f" --num-jobs {wf.num_jobs}" if wf.job_split else "")
+                + (f" --min-threads {wf.min_threads}" if wf.min_threads != 2 else "")
                 # Probe node only for first replan (it's in WU0)
                 + (f" --probe-node {probe_node_name}"
                    if probe_node_name and replan_idx == 0 else "")
@@ -1286,6 +1346,44 @@ class MatrixRunner:
 
         # Step 8: Sweep — always keep artifacts for inspection
         sweep_post(wf.wf_id, keep_artifacts=True)
+
+        return result
+
+    async def _execute_production(
+        self,
+        wf: WorkflowDef,
+        result: WorkflowResult,
+        work_dir: Path,
+        sandbox_path: str,
+    ) -> WorkflowResult:
+        """Production-path execution: real DB + real HTCondor + mock DBS/Rucio.
+
+        Wires all production components together and drives the lifecycle
+        from SUBMITTED → COMPLETED, verifying the full output pipeline.
+        """
+        from tests.integration.test_production_pipeline import ProductionPipelineTest
+
+        test = ProductionPipelineTest(
+            wf=wf,
+            work_dir=work_dir,
+            sandbox_path=sandbox_path,
+        )
+        try:
+            await test.setup()
+            final_status = await test.run()
+            verification = await test.verify()
+
+            result.status = "passed" if verification["all_passed"] else "failed"
+            result.dag_status = final_status
+            result.reason = verification.get("summary", "")
+            result.submit_dir = str(work_dir / "submit")
+        except Exception as exc:
+            result.status = "error"
+            result.reason = str(exc)
+            logger.exception("Production-path wf %.1f error", wf.wf_id)
+        finally:
+            await test.cleanup()
+            sweep_post(wf.wf_id, keep_artifacts=True)
 
         return result
 

@@ -274,7 +274,17 @@ class DAGPlanner:
             status=DAGStatus.READY.value,
         )
 
-        # 10. Submit DAG to HTCondor
+        # 10. Create processing blocks for output management
+        if output_datasets:
+            for i, ds in enumerate(output_datasets):
+                await self.db.create_processing_block(
+                    workflow_id=workflow.id,
+                    block_index=i,
+                    dataset_name=ds.get("dataset_name", ""),
+                    total_work_units=len(merge_groups),
+                )
+
+        # 11. Submit DAG to HTCondor
         cluster_id, schedd = await self.condor.submit_dag(dag_file_path)
         now = datetime.now(timezone.utc)
         await self.db.update_dag(
@@ -3117,6 +3127,36 @@ if root_files:
             with open(wu_path, "w") as f:
                 json.dump(work_unit, f, indent=2)
             print(f"Wrote work_unit_metrics.json: {len(per_step)} step(s), {len(all_proc_metrics)} jobs")
+
+    # Write merge_output.json for DAGMonitor → OutputManager bridge
+    merge_output = {
+        "group_index": group_index,
+        "site": "local",
+        "datasets": {},
+    }
+    for ds in datasets:
+        tier = ds.get("data_tier", "")
+        merged_base = ds.get("merged_lfn_base", "")
+        ds_name = ds.get("dataset_name", "")
+        merged_dir = lfn_to_pfn(local_pfn_prefix, f"{merged_base}/{group_index:06d}")
+        if os.path.isdir(merged_dir):
+            files = []
+            for f in sorted(os.listdir(merged_dir)):
+                fp = os.path.join(merged_dir, f)
+                if os.path.isfile(fp):
+                    files.append({
+                        "lfn": f"{merged_base}/{group_index:06d}/{f}",
+                        "size": os.path.getsize(fp),
+                    })
+            merge_output["datasets"][ds_name] = {
+                "data_tier": tier,
+                "files": files,
+            }
+    mo_path = os.path.join(group_dir, "merge_output.json")
+    with open(mo_path, "w") as f:
+        json.dump(merge_output, f, indent=2)
+    print(f"Wrote merge_output.json: {len(merge_output['datasets'])} dataset(s)")
+
 else:
     print(f"Detected {len(text_files)} text file(s) — using text merge mode")
     merge_text_files(datasets, text_files, local_pfn_prefix, group_index)

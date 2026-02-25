@@ -214,6 +214,13 @@ _SIMULATOR_PROFILES: dict[str, dict[str, float]] = {
         "wall_sec_per_event": 0.03,
         "output_size_per_event_kb": 20,
     },
+    "MINI": {
+        "serial_fraction": 0.08,
+        "base_memory_mb": 1600,
+        "marginal_per_thread_mb": 200,
+        "wall_sec_per_event": 0.02,
+        "output_size_per_event_kb": 15,
+    },
     "NANO": {
         "serial_fraction": 0.05,
         "base_memory_mb": 1200,
@@ -231,7 +238,7 @@ def _get_simulator_profile(step_name: str) -> dict[str, float]:
     Falls back to DIGI profile for unknown step types.
     """
     name_upper = step_name.upper()
-    for prefix in ("GEN", "NANO", "RECO", "DIGI"):
+    for prefix in ("GEN", "NANO", "MINI", "RECO", "DIGI"):
         if name_upper.startswith(prefix):
             return dict(_SIMULATOR_PROFILES[prefix])
     return dict(_SIMULATOR_PROFILES["DIGI"])

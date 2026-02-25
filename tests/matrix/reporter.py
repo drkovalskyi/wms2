@@ -325,6 +325,104 @@ def _print_standard_report(
     _print_time_breakdown(result, perf, out)
 
 
+def _print_next_round_projection(
+    all_decisions: list[dict],
+    rounds: list[dict],
+    perf: PerfData,
+    orig_nt: int,
+    mem_per_core: int,
+    max_mem_per_core: int,
+    safety_margin: float,
+    min_threads: int,
+    out: TextIO,
+) -> None:
+    """Print what the algorithm would recommend for the next round.
+
+    Uses the last round's observed CPU efficiency and cgroup data to project
+    the next tuned_nthreads and request_memory, with no floor (min_threads=1)
+    to show the unconstrained recommendation.
+    """
+    if not rounds or not all_decisions:
+        return
+    last_round = rounds[-1]
+    last_steps = last_round.get("steps", [])
+    if not last_steps:
+        return
+
+    # Get step 0 CPU efficiency from the last round
+    step0_steps = [s for s in last_steps if s.step_name.endswith("Step 1")]
+    if not step0_steps:
+        return
+    step0 = step0_steps[0]
+    last_nt = last_round.get("request_cpus", orig_nt)
+    cpu_eff = step0.cpu_eff_mean
+    eff_cores = cpu_eff * last_nt
+
+    # Compute projected tuned_nthreads (no floor — show unconstrained)
+    from tests.matrix.adaptive import _nearest_power_of_2
+    proj_nt = _nearest_power_of_2(eff_cores) if eff_cores > 0 else last_nt
+    proj_nt = min(proj_nt, orig_nt)
+    proj_nt_uncapped = max(proj_nt, 1)
+
+    # Apply the configured min_threads to see what would actually run
+    proj_nt_actual = max(proj_nt_uncapped, min_threads)
+
+    # Projected memory: use cgroup data from adaptive if available
+    cgroup = perf.raw_job_step_data.get("_adaptive", {}).get("cgroup")
+    margin_mult = 1 + safety_margin
+
+    proj_mem_uncapped = 0
+    proj_mem_source = ""
+    if cgroup and cgroup.get("peak_nonreclaim_mb", 0) > 0:
+        if cgroup.get("tmpfs_peak_nonreclaim_mb", 0) > 0:
+            binding = max(
+                cgroup["tmpfs_peak_nonreclaim_mb"],
+                cgroup.get("no_tmpfs_peak_anon_mb", 0),
+            )
+        else:
+            binding = cgroup["peak_nonreclaim_mb"]
+        proj_mem_uncapped = int(binding * margin_mult)
+        proj_mem_source = "cgroup_measured"
+    else:
+        # Fall back to peak RSS from last round
+        peak_rss = max((s.rss_mb_max for s in last_steps), default=0)
+        if peak_rss > 0:
+            proj_mem_uncapped = int(peak_rss * margin_mult)
+            proj_mem_source = "rss_estimated"
+
+    if proj_nt_uncapped < 1 or proj_mem_uncapped <= 0:
+        return
+
+    # What the next round would look like
+    proj_jobs = last_round.get("n_jobs", 0) * (last_nt // proj_nt_uncapped) if proj_nt_uncapped < last_nt else last_round.get("n_jobs", 0)
+    proj_mb_core = proj_mem_uncapped // proj_nt_uncapped if proj_nt_uncapped else 0
+
+    # Clamped version (what would actually be requested with current limits)
+    mem_floor = proj_nt_uncapped * mem_per_core
+    mem_ceil = proj_nt_uncapped * max_mem_per_core
+    proj_mem_clamped = max(mem_floor, min(proj_mem_uncapped, mem_ceil))
+    proj_mb_core_clamped = proj_mem_clamped // proj_nt_uncapped if proj_nt_uncapped else 0
+
+    out.write(f"\n  Next round projection (from R{len(rounds)} data, "
+              f"step 0 eff={eff_cores:.1f} cores):\n")
+
+    # Show unconstrained first
+    out.write(f"    Uncapped: {proj_nt_uncapped}T, {proj_jobs} jobs, "
+              f"{proj_mem_uncapped} MB ({proj_mb_core} MB/core)  [{proj_mem_source}]\n")
+
+    # Show what constraints would change
+    notes = []
+    if proj_nt_uncapped < min_threads:
+        notes.append(f"min_threads={min_threads} would keep {min_threads}T")
+    if proj_mem_uncapped > mem_ceil:
+        notes.append(f"max_memory_per_core_mb={max_mem_per_core} caps to {proj_mem_clamped} MB "
+                      f"({proj_mb_core_clamped} MB/core)")
+        notes.append(f"need max_memory_per_core_mb >= {proj_mb_core} to avoid capping")
+    if notes:
+        for note in notes:
+            out.write(f"    Note: {note}\n")
+
+
 def _print_adaptive_report(
     result: WorkflowResult,
     perf: PerfData,
@@ -462,15 +560,40 @@ def _print_adaptive_report(
         out.write(f"\n  Throughput (Round 1): {m['ev_ch']:.0f} ev/core-hour  |  "
                   f"{m['events']} events, {m['core_hours']:.2f} core-hours\n")
 
-    # Tuning summary (from first replan decisions)
+    # Planning decisions: show what each round was configured with
     first_dec = all_decisions[0] if all_decisions else {}
     first_jm = first_dec.get("job_multiplier", 1)
+    mem_per_core = adaptive.get("memory_per_core_mb", 0)
+    max_mem_per_core = adaptive.get("max_memory_per_core_mb", 0)
+    min_threads = first_dec.get("min_threads", 2)
+
     if first_jm > 1 and len(rounds) >= 2:
         r1_jobs = rounds[0]["n_jobs"]
         r2_jobs = rounds[1]["n_jobs"]
         r2_cpus = rounds[1]["request_cpus"]
         out.write(f"\n  Job split: {r1_jobs} \u2192 {r2_jobs} jobs"
                   f" (\u00d7{first_jm}), {r2_cpus}T\n")
+        # Per-round memory decisions
+        out.write(f"  Memory: {mem_per_core} MB/core (R1)")
+        if max_mem_per_core > 0:
+            out.write(f", max {max_mem_per_core} MB/core")
+        if min_threads != 2:
+            out.write(f", min {min_threads}T")
+        out.write("\n")
+        # R1 baseline
+        r1_mem = mem_per_core * orig_nt
+        out.write(f"  R1 request_memory: {r1_mem} MB"
+                  f" ({orig_nt} cores, {mem_per_core} MB/core)  [baseline]\n")
+        # Each replan decision
+        for di, dec in enumerate(all_decisions):
+            ri = di + 2
+            req_mem = dec.get("new_request_memory_mb", 0)
+            req_cpus = dec.get("new_request_cpus", orig_nt)
+            mem_src = dec.get("memory_source", "")
+            mb_core = req_mem // req_cpus if req_cpus else 0
+            out.write(f"  R{ri} request_memory: {req_mem} MB"
+                      f" ({req_cpus} cores, {mb_core} MB/core)"
+                      f"  [{mem_src}]\n")
     else:
         n_pipelines = first_dec.get("n_pipelines", 1)
         per_step_tuning = first_dec.get("per_step", {})
@@ -481,62 +604,35 @@ def _print_adaptive_report(
         if tuned_vals and len(set(tuned_vals)) == 1:
             out.write(f" \u00d7 {tuned_vals[0]}T (uniform)")
         elif tuned_vals:
-            out.write(f", per-step: [{', '.join(str(v) for v in tuned_vals)}]")
+            vals_str = ', '.join(str(v) for v in tuned_vals)
+            out.write(f", per-step: [{vals_str}]")
         out.write("\n")
+        if mem_per_core > 0:
+            out.write(f"  Memory: {mem_per_core} MB/core (R1)")
+            if max_mem_per_core > 0:
+                out.write(f", max {max_mem_per_core} MB/core")
+            out.write("\n")
 
-    # Memory limits
-    mem_per_core = adaptive.get("memory_per_core_mb", 0)
-    max_mem_per_core = adaptive.get("max_memory_per_core_mb", 0)
-    ideal_mem = adaptive.get("ideal_memory_mb", 0)
-    actual_mem = adaptive.get("actual_memory_mb", 0)
-    if mem_per_core > 0:
-        out.write(f"  Memory: {mem_per_core} MB/core (R1)")
-        if max_mem_per_core > 0:
-            out.write(f", max {max_mem_per_core} MB/core")
-        if first_jm > 1:
-            r2_mem = first_dec.get("new_request_memory_mb", 0)
-            mem_src = first_dec.get("memory_source", "")
-            if r2_mem > 0:
-                src_str = f"  [{mem_src}]" if mem_src else ""
-                out.write(f"\n  R2 request_memory: {r2_mem} MB"
-                          f" ({first_dec.get('new_request_cpus', orig_nt)} cores){src_str}")
-        elif ideal_mem > 0 and actual_mem > 0 and ideal_mem > actual_mem:
-            out.write(f"\n  Memory needed: {ideal_mem} MB"
-                      f" ({ideal_mem // orig_nt if orig_nt else 0} MB/core)"
-                      f" — capped at {actual_mem} MB")
-        elif actual_mem > 0 and actual_mem > mem_per_core * orig_nt:
-            out.write(f"\n  R2 request_memory: {actual_mem} MB")
-        out.write("\n")
-
-    # Ideal n_parallel (if memory-constrained, not for job split)
-    if first_jm <= 1:
-        step0_tuning = first_dec.get("per_step", {}).get("0", {})
-        ideal_n_par = step0_tuning.get("ideal_n_parallel", 0)
-        actual_n_par = step0_tuning.get("n_parallel", 1)
-        if ideal_n_par > actual_n_par:
-            out.write(f"  Step 0 split: {actual_n_par} instances"
-                      f" (ideal: {ideal_n_par}, memory-constrained)\n")
+    # Projected next round
+    _print_next_round_projection(
+        all_decisions, rounds, perf, orig_nt, mem_per_core, max_mem_per_core,
+        adaptive.get("safety_margin", 0.20), min_threads, out,
+    )
 
     # Probe data (if probe split was used)
     probe_data = adaptive.get("probe_data", {})
     if probe_data:
         pk = probe_data.get("per_instance_peak_mb", 0)
-        # Backward compat: try old key name too
         if not pk:
             pk = probe_data.get("per_instance_cgroup_mb", 0)
         rss = probe_data.get("max_instance_rss_mb", 0)
         n_inst = probe_data.get("num_instances", 0)
         step0_tuning = first_dec.get("per_step", {}).get("0", {})
         mem_src = step0_tuning.get("memory_source", "")
-        inst_mem = step0_tuning.get("instance_mem_mb", 0)
         out.write(f"  Probe: {n_inst} instances,"
                   f" {round(pk)} MB/instance peak,"
                   f" {round(rss)} MB/instance RSS"
                   f"  [{mem_src}]\n")
-        if inst_mem > 0 and ideal_mem > 0 and orig_nt > 0:
-            out.write(f"  To split {ideal_n_par}×: need"
-                      f" {ideal_mem // orig_nt} MB/core"
-                      f" (current max: {max_mem_per_core} MB/core)\n")
 
     # Per-round tables
     round_cpu_pcts: list[float] = []
@@ -677,34 +773,26 @@ def _annotate_phases(ax, perf: PerfData) -> None:
                    color=c, alpha=a, label="Cleanup")
 
 
-def _find_r1r2_boundary(cores: list[float], perf: PerfData) -> int | None:
-    """Estimate R1/R2 boundary sample index for adaptive workflows.
+def _get_round_boundaries(perf: PerfData) -> list[float]:
+    """Return x-axis positions (seconds) for round boundaries.
 
-    Looks for the deepest sustained dip in CPU usage (the replan gap)
-    between the two processing bursts.  Only searches the middle 80%
-    of the timeline.
+    Uses per-round timestamps stored by _collect_adaptive_perf.
+    Each boundary is at the midpoint between one round's last proc
+    TERMINATED and the next round's first proc EXECUTE.
     """
-    n = len(cores)
-    if n < 40:
-        return None
-    # Search in the middle 60% of the timeline
-    lo = n // 5
-    hi = 4 * n // 5
-    # Smooth heavily to find the valley
-    window = max(12, n // 20)
-    smoothed = _rolling_mean(cores, window)
-    # Find the minimum in the search window
-    min_val = float("inf")
-    min_idx = lo
-    for i in range(lo, hi):
-        if smoothed[i] < min_val:
-            min_val = smoothed[i]
-            min_idx = i
-    # Only report if the dip is significant (below 50% of expected)
-    expected = perf.cpu_expected_pct / 100.0
-    if expected > 0 and min_val < expected * 0.5:
-        return min_idx
-    return None
+    adaptive = perf.raw_job_step_data.get("_adaptive")
+    if not adaptive:
+        return []
+    round_times = adaptive.get("_round_times", [])
+    if len(round_times) < 2:
+        return []
+    boundaries: list[float] = []
+    for i in range(len(round_times) - 1):
+        rt = round_times[i]
+        rt_next = round_times[i + 1]
+        if "end_sec" in rt and "start_sec" in rt_next:
+            boundaries.append((rt["end_sec"] + rt_next["start_sec"]) / 2)
+    return boundaries
 
 
 def _save_cpu_plot(
@@ -750,13 +838,12 @@ def _save_cpu_plot(
     # Phase annotations
     _annotate_phases(ax, perf)
 
-    # Adaptive R1/R2 boundary
-    adaptive = perf.raw_job_step_data.get("_adaptive")
-    if adaptive:
-        boundary = _find_r1r2_boundary(cores, perf)
-        if boundary is not None:
-            ax.axvline(x=t[boundary], color="#9C27B0", linestyle=":",
-                       alpha=0.7, label="R1\u2192R2 replan")
+    # Adaptive round boundaries
+    boundaries = _get_round_boundaries(perf)
+    for bi, bx in enumerate(boundaries):
+        label = f"R{bi+1}\u2192R{bi+2}"
+        ax.axvline(x=bx, color="#9C27B0", linestyle=":",
+                   alpha=0.7, label=label)
 
     ax.legend(loc="upper right", fontsize=8)
     ax.set_xlim(0, t[-1])

@@ -430,6 +430,44 @@ _WF_391_2 = WorkflowDef(
     ),
 )
 
+_WF_391_3 = WorkflowDef(
+    wf_id=391.3,
+    title="DY2L adaptive 3-round no-probe (8T, 2 GB/core, no tmpfs R1, 10% margin)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=400,
+    num_jobs=4,
+    num_work_units=3,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    split_tmpfs=True,
+    split_tmpfs_from_wu=1,
+    probe_split=False,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=3000,
+    safety_margin=0.10,
+    multicore=8,
+    size="large",
+    timeout_sec=16200,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 # ── Adaptive execution ────────────────────────────────────────
 
 _WF_350_0 = WorkflowDef(
@@ -770,6 +808,79 @@ _WF_510_0 = WorkflowDef(
 
 # ── Simulator mode ────────────────────────────────────────────
 
+_SIM_OUTPUT_5STEP = [
+    {
+        "dataset_name": "/TestPrimary/Test-v1/GEN-SIM",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/GEN-SIM/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/GEN-SIM/v1",
+        "data_tier": "GEN-SIM",
+    },
+    {
+        "dataset_name": "/TestPrimary/Test-v1/DIGI",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/DIGI/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/DIGI/v1",
+        "data_tier": "DIGI",
+    },
+    {
+        "dataset_name": "/TestPrimary/Test-v1/RECO",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/RECO/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/RECO/v1",
+        "data_tier": "RECO",
+    },
+    {
+        "dataset_name": "/TestPrimary/Test-v1/MINIAODSIM",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/MINIAODSIM/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/MINIAODSIM/v1",
+        "data_tier": "MINIAODSIM",
+    },
+    {
+        "dataset_name": "/TestPrimary/Test-v1/NANOAODSIM",
+        "merged_lfn_base": "/store/mc/Test/TestPrimary/NANOAODSIM/v1",
+        "unmerged_lfn_base": "/store/unmerged/Test/TestPrimary/NANOAODSIM/v1",
+        "data_tier": "NANOAODSIM",
+    },
+]
+
+_WF_160_0 = WorkflowDef(
+    wf_id=160.0,
+    title="Production-path simulator 5-step, 2 jobs",
+    sandbox_mode="simulator",
+    request_spec={
+        "RequestName": "matrix_prod_160_0",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Step1": {"StepName": "GEN-SIM"},
+        "Step2": {"StepName": "DIGI"},
+        "Step3": {"StepName": "RECO"},
+        "Step4": {"StepName": "MINIAODSIM"},
+        "Step5": {"StepName": "NANOAODSIM"},
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 0.05,
+        "SizePerEvent": 50.0,
+        "SplittingAlgo": "EventBased",
+        "SplittingParams": {"events_per_job": 10},
+        "InputDataset": "",
+        "Requestor": "integration-test",
+        "Campaign": "NPS-Run3Summer22EEGS",
+        "Priority": 100000,
+    },
+    events_per_job=10,
+    num_jobs=2,
+    output_datasets=_SIM_OUTPUT_5STEP,
+    memory_mb=16000,
+    multicore=8,
+    size="medium",
+    timeout_sec=600,
+    requires=("condor",),
+    production_path=True,
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 _SIM_OUTPUT_1TIER = [
     {
         "dataset_name": "/TestPrimary/Test-v1/GEN-SIM",
@@ -1035,6 +1146,7 @@ CATALOG: dict[float, WorkflowDef] = {
     for wf in [
         _WF_100_0,
         _WF_100_1,
+        _WF_160_0,
         _WF_150_0,
         _WF_150_1,
         _WF_151_0,
@@ -1050,6 +1162,7 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_391_0,
         _WF_391_1,
         _WF_391_2,
+        _WF_391_3,
         _WF_392_0,
         _WF_392_1,
         _WF_350_0,

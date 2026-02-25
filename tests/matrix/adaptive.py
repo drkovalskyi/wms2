@@ -494,6 +494,7 @@ def compute_per_step_nthreads(
     probe_num_instances: int = 0,
     safety_margin: float = 0.20,
     cgroup: dict | None = None,
+    min_threads: int = 2,
 ) -> dict:
     """Derive optimal nThreads for step 0 parallel splitting and optional overcommit.
 
@@ -549,10 +550,7 @@ def compute_per_step_nthreads(
             TMPFS_PER_INSTANCE_MB = 1500
             tuned = _nearest_power_of_2(eff_cores)
             tuned = min(tuned, original_nthreads)
-            # Minimum 2 threads per instance: each parallel instance
-            # extracts a full gridpack (~1.4 GB tmpfs), so fewer larger
-            # instances is better for memory than many 1-thread instances.
-            tuned = max(tuned, 2)
+            tuned = max(tuned, min_threads)
             n_par = request_cpus // tuned
             # Cap parallel instances to limit tmpfs usage for gridpack
             # extraction (each uses ~1.4 GB counted against job memory).
@@ -617,7 +615,7 @@ def compute_per_step_nthreads(
                 )
                 found = False
                 for p in candidates:
-                    t = max(request_cpus // p, 2)
+                    t = max(request_cpus // p, min_threads)
                     total = SANDBOX_OVERHEAD_MB + p * instance_mem
                     if total <= effective_max:
                         n_par = p
@@ -722,6 +720,8 @@ def compute_job_split(
     probe_rss_mb: float = 0,
     split_tmpfs: bool = False,
     cgroup: dict | None = None,
+    last_round_nthreads: int = 0,
+    min_threads: int = 2,
 ) -> dict:
     """Compute adaptive job split: more jobs with fewer cores per job.
 
@@ -768,15 +768,24 @@ def compute_job_split(
     eff_cores = mean_eff * original_nthreads
 
     tuned = _nearest_power_of_2(eff_cores)
-    # Floor at 2: single-threaded has similar base memory to multi-threaded
-    # (CMSSW base memory ~70% doesn't scale with threads), so going to 1T
-    # multiplies job count without proportional memory savings, causing OOM.
-    tuned = max(tuned, 2)
+    tuned = max(tuned, min_threads)
     tuned = min(tuned, original_nthreads)
 
     job_multiplier = original_nthreads // tuned
     if job_multiplier < 1:
         job_multiplier = 1
+    # Cap step-down to ×2 when tmpfs will be enabled but we have no measured
+    # tmpfs data.  Tmpfs adds ~1.5 GB non-reclaimable memory per job that's
+    # invisible to FJR; jumping ×4 without measurement risks mass OOM.
+    # Once we have cgroup tmpfs data, or if tmpfs is disabled, no cap needed.
+    has_tmpfs_data = (cgroup is not None
+                      and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) > 0)
+    if split_tmpfs and not has_tmpfs_data:
+        prev_nt = last_round_nthreads if last_round_nthreads > 0 else original_nthreads
+        min_tuned = max(prev_nt // 2, min_threads)
+        if tuned < min_tuned:
+            tuned = min_tuned
+            job_multiplier = original_nthreads // tuned
 
     new_events_per_job = events_per_job // job_multiplier
     if new_events_per_job < 1:
@@ -825,16 +834,24 @@ def compute_job_split(
         # Measured cgroup data: peak non-reclaimable (anon + shmem).
         # This captures subprocess memory that FJR PeakValueRss misses.
         if split_tmpfs and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) > 0:
-            # Use max of tmpfs-phase peak (step 0: anon+shmem) vs
-            # non-tmpfs peak (other steps: anon only, shmem reclaimed)
+            # Have tmpfs measurement: use max of tmpfs-phase peak
+            # (step 0: anon+shmem) vs non-tmpfs peak (other steps: anon only)
             binding = max(
                 cgroup["tmpfs_peak_nonreclaim_mb"],
                 cgroup.get("no_tmpfs_peak_anon_mb", 0),
             )
+            memory_from_measured = int(binding * margin_mult)
+            memory_source = "cgroup_measured"
+        elif split_tmpfs and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) == 0:
+            # Prior round ran WITHOUT tmpfs but next round WILL use tmpfs.
+            # We have no tmpfs memory data — cannot safely estimate.
+            # Jump to max memory allowed so the job survives.
+            memory_from_measured = tuned * max_memory_per_core_mb
+            memory_source = "cgroup_no_tmpfs_data"
         else:
             binding = cgroup["peak_nonreclaim_mb"]
-        memory_from_measured = int(binding * margin_mult)
-        memory_source = "cgroup_measured"
+            memory_from_measured = int(binding * margin_mult)
+            memory_source = "cgroup_measured"
     elif probe_rss_mb > 0:
         memory_from_measured = int(probe_rss_mb * margin_mult + TMPFS_PER_INSTANCE_MB)
         memory_source = "probe_rss"
@@ -1397,6 +1414,8 @@ def _replan_cli(args: list[str]) -> None:
                         help="Safety margin on measured memory (0.20 = 20%%)")
     parser.add_argument("--replan-index", type=int, default=0,
                         help="Replan index (0-based) for decision file naming")
+    parser.add_argument("--min-threads", type=int, default=2,
+                        help="Minimum threads per job (floor for adaptive tuning)")
     opts = parser.parse_args(args)
 
     # Resolve prior dirs: --prior-wu-dirs takes precedence, --wu0-dir as fallback
@@ -1491,6 +1510,7 @@ def _replan_cli(args: list[str]) -> None:
     if opts.job_split:
         print(f"mode: adaptive job split")
         print(f"events_per_job: {opts.events_per_job}  num_jobs: {opts.num_jobs}")
+        last_round_nt = round_metrics[-1]["nthreads"] if round_metrics else 0
         split_result = compute_job_split(
             metrics, original_nthreads,
             request_cpus=ncores,
@@ -1504,6 +1524,8 @@ def _replan_cli(args: list[str]) -> None:
             probe_rss_mb=probe_rss_mb,
             split_tmpfs=opts.split_tmpfs,
             cgroup=cgroup,
+            last_round_nthreads=last_round_nt,
+            min_threads=opts.min_threads,
         )
         job_multiplier = split_result["job_multiplier"]
         tuned_nt = split_result["tuned_nthreads"]
@@ -1540,6 +1562,7 @@ def _replan_cli(args: list[str]) -> None:
             "memory_source": split_result.get("memory_source", "unknown"),
             "memory_per_core_mb": mem_per_core,
             "max_memory_per_core_mb": max_mem_per_core,
+            "min_threads": opts.min_threads,
             "rounds_analyzed": len(round_metrics),
             "per_round_nthreads": [rm["nthreads"] for rm in round_metrics],
             "per_step": {
@@ -1591,6 +1614,7 @@ def _replan_cli(args: list[str]) -> None:
             probe_num_instances=probe_num_instances,
             safety_margin=safety_margin,
             cgroup=cgroup,
+            min_threads=opts.min_threads,
         )
         for si in sorted(tuning["per_step"]):
             t = tuning["per_step"][si]

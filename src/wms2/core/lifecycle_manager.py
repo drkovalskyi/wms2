@@ -190,10 +190,19 @@ class RequestLifecycleManager:
 
             # Process completed work units through output manager
             if result.newly_completed_work_units and self.output_manager:
+                blocks = await self.db.get_processing_blocks(workflow.id)
                 for wu in result.newly_completed_work_units:
-                    await self.output_manager.handle_work_unit_completion(
-                        workflow.id, wu["block_id"], wu
-                    )
+                    manifest = wu.get("manifest") or {}
+                    datasets_info = manifest.get("datasets", {})
+                    for block in blocks:
+                        ds_info = datasets_info.get(block.dataset_name, {})
+                        await self.output_manager.handle_work_unit_completion(
+                            workflow.id, block.id, {
+                                "output_files": ds_info.get("files", []),
+                                "site": manifest.get("site", "local"),
+                                "node_name": wu["group_name"],
+                            }
+                        )
 
             # Every cycle: retry failed Rucio calls
             if self.output_manager:

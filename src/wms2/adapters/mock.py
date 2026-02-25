@@ -42,11 +42,18 @@ class MockCondorAdapter(CondorAdapter):
 
 
 class MockReqMgrAdapter(ReqMgrAdapter):
-    def __init__(self):
+    def __init__(self, requests: dict[str, dict] | None = None):
         self.calls: list[tuple[str, tuple, dict]] = []
+        self._requests: dict[str, dict] = requests or {}
+
+    def seed_request(self, request_name: str, spec: dict) -> None:
+        """Pre-configure a request spec to return from get_request()."""
+        self._requests[request_name] = spec
 
     async def get_request(self, request_name: str) -> dict[str, Any]:
         self.calls.append(("get_request", (request_name,), {}))
+        if request_name in self._requests:
+            return self._requests[request_name]
         return {
             "RequestName": request_name,
             "InputDataset": "/TestPrimary/TestProcessed/RECO",

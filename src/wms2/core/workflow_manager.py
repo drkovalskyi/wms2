@@ -10,7 +10,8 @@ from wms2.db.repository import Repository
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_FIELDS = ("InputDataset", "SplittingAlgo", "SandboxUrl")
+REQUIRED_FIELDS_DEFAULT = ("InputDataset", "SplittingAlgo", "SandboxUrl")
+REQUIRED_FIELDS_STEPCHAIN = ("SplittingAlgo",)  # StepChain/GEN don't need InputDataset or SandboxUrl
 
 
 class WorkflowManager:
@@ -22,8 +23,12 @@ class WorkflowManager:
         """Fetch request from ReqMgr2, validate, create workflow row."""
         data = await self.reqmgr.get_request(request_name)
 
-        # Validate required fields
-        missing = [f for f in REQUIRED_FIELDS if not data.get(f)]
+        # Validate required fields (relaxed for StepChain/GEN)
+        if data.get("StepChain"):
+            required = REQUIRED_FIELDS_STEPCHAIN
+        else:
+            required = REQUIRED_FIELDS_DEFAULT
+        missing = [f for f in required if not data.get(f)]
         if missing:
             raise ValueError(
                 f"Request {request_name} missing required fields: {', '.join(missing)}"
@@ -31,16 +36,16 @@ class WorkflowManager:
 
         workflow = await self.db.create_workflow(
             request_name=request_name,
-            input_dataset=data["InputDataset"],
+            input_dataset=data.get("InputDataset", ""),
             splitting_algo=data["SplittingAlgo"],
             splitting_params=data.get("SplittingParams", {}),
-            sandbox_url=data["SandboxUrl"],
+            sandbox_url=data.get("SandboxUrl", ""),
             config_data=self._build_config_data(data),
         )
 
         logger.info(
             "Imported request %s as workflow %s (dataset=%s, splitting=%s)",
-            request_name, workflow.id, data["InputDataset"], data["SplittingAlgo"],
+            request_name, workflow.id, data.get("InputDataset", ""), data["SplittingAlgo"],
         )
         return workflow
 
@@ -57,6 +62,18 @@ class WorkflowManager:
             "requestor": data.get("Requestor"),
             "priority": data.get("Priority"),
         }
+
+        # GEN detection: no InputDataset means event generation
+        if not data.get("InputDataset"):
+            config_data["_is_gen"] = True
+
+        # Pass-through fields from request spec for production path
+        if data.get("OutputDatasets"):
+            config_data["output_datasets"] = data["OutputDatasets"]
+        if data.get("RequestNumEvents"):
+            config_data["request_num_events"] = data["RequestNumEvents"]
+        if data.get("SandboxUrl"):
+            config_data["sandbox_path"] = data["SandboxUrl"]
 
         if data.get("StepChain"):
             spec = parse_stepchain(data)
