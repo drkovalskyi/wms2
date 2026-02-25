@@ -1748,6 +1748,7 @@ run_cmssw_mode() {
     MEMMON_PID=$!
     echo "Memory monitor started (pid $MEMMON_PID, log: memory_monitor.log)"
 
+    GRIDPACK_DISK_MB=0
     for step_idx in $(seq 0 $((NUM_STEPS - 1))); do
         step_num=$((step_idx + 1))
 
@@ -1851,6 +1852,48 @@ with open(pset, 'a') as f:
 
         echo "  cmsRun $CMSRUN_ARGS"
         STEP_START=$(date +%s)
+
+        # Pre-measure gridpack uncompressed size from CVMFS (before step 0)
+        # Parse ExternalLHEProducer.args from PSet to find gridpack path,
+        # then use xz/gzip headers to get uncompressed size without extracting.
+        if [[ $step_idx -eq 0 ]]; then
+            GRIDPACK_DISK_MB=$(python3 -c "
+import re, subprocess, os
+pset = '${PSET_PATH}'
+try:
+    text = open(pset).read()
+    # CMS gridpacks are always on /cvmfs/ — match the path directly
+    m = re.search(r'(/cvmfs/\S+\.tar\.\w+)', text)
+    if not m:
+        print(0)
+        raise SystemExit
+    gp = m.group(1)
+    if not os.path.isfile(gp):
+        print(0)
+        raise SystemExit
+    if gp.endswith('.tar.xz') or gp.endswith('.xz'):
+        r = subprocess.run(['xz', '-l', '--robot', gp], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.strip().split(chr(10)):
+            if line.startswith('totals'):
+                parts = line.split()
+                print(int(int(parts[4]) / 1048576))
+                raise SystemExit
+    elif gp.endswith('.tar.gz') or gp.endswith('.tgz'):
+        sz = os.path.getsize(gp)
+        # gzip -l unreliable for >4GB; estimate 10x ratio for gridpacks
+        print(int(sz * 10 / 1048576))
+        raise SystemExit
+    print(0)
+except SystemExit:
+    pass
+except Exception:
+    print(0)
+" 2>/dev/null)
+            GRIDPACK_DISK_MB=${GRIDPACK_DISK_MB:-0}
+            if [[ "$GRIDPACK_DISK_MB" -gt 0 ]]; then
+                echo "  gridpack_uncompressed_mb: $GRIDPACK_DISK_MB"
+            fi
+        fi
 
         # Tmpfs for non-parallel step 0: use /dev/shm for gridpack extraction
         # (same benefit as parallel split tmpfs, but for single-instance jobs)
@@ -1977,6 +2020,7 @@ data = {
     'tmpfs_peak_nonreclaim_mb': int('${TMPFS_PEAK_NR}'),
     'no_tmpfs_peak_anon_mb': int('${NO_TMPFS_PEAK_ANON}'),
     'num_samples': int('${SAMPLES}'),
+    'gridpack_disk_mb': int('${GRIDPACK_DISK_MB}'),
 }
 out = 'proc_${NODE_INDEX}_cgroup.json'
 with open(out, 'w') as f:

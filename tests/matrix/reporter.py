@@ -580,6 +580,13 @@ def _print_adaptive_report(
         if min_threads != 2:
             out.write(f", min {min_threads}T")
         out.write("\n")
+        # Gridpack extraction size (from R1 cgroup data)
+        gridpack_mb = first_dec.get("gridpack_disk_mb", 0)
+        if gridpack_mb > 0:
+            out.write(f"  Gridpack extraction: {gridpack_mb} MB on disk")
+            if first_dec.get("split_tmpfs") is False:
+                out.write("  (tmpfs disabled — too large)")
+            out.write("\n")
         # R1 baseline
         r1_mem = mem_per_core * orig_nt
         out.write(f"  R1 request_memory: {r1_mem} MB"

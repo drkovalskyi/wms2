@@ -468,6 +468,44 @@ _WF_391_3 = WorkflowDef(
     ),
 )
 
+_WF_391_4 = WorkflowDef(
+    wf_id=391.4,
+    title="DY2L adaptive 3-round no-probe (8T, 2 GB/core, no tmpfs R1, 10% margin, 40 ev)",
+    sandbox_mode="cached",
+    cached_sandbox_path="/mnt/shared/work/wms2_real_condor_test/sandbox_gen_dy2l.tar.gz",
+    request_spec={
+        "RequestName": "cmsunified_task_GEN-Run3Summer22EEwmLHEGS-00600__v1_T_250902_211552_8573",
+        "RequestType": "StepChain",
+        "StepChain": 5,
+        "Multicore": 8,
+        "Memory": 16000,
+        "TimePerEvent": 11.35,
+        "SizePerEvent": 1570.7,
+    },
+    events_per_job=40,
+    num_jobs=4,
+    num_work_units=3,
+    adaptive=True,
+    adaptive_split=False,
+    job_split=True,
+    split_tmpfs=True,
+    split_tmpfs_from_wu=1,
+    probe_split=False,
+    output_datasets=_GEN_DY2L_OUTPUT_DATASETS,
+    memory_per_core_mb=2000,
+    max_memory_per_core_mb=3000,
+    safety_margin=0.10,
+    multicore=8,
+    size="large",
+    timeout_sec=16200,
+    requires=("condor", "cvmfs", "siteconf", "apptainer"),
+    verify=VerifySpec(
+        expect_success=True,
+        expect_merged_outputs=True,
+        expect_cleanup_ran=True,
+    ),
+)
+
 # ── Adaptive execution ────────────────────────────────────────
 
 _WF_350_0 = WorkflowDef(
@@ -1163,6 +1201,7 @@ CATALOG: dict[float, WorkflowDef] = {
         _WF_391_1,
         _WF_391_2,
         _WF_391_3,
+        _WF_391_4,
         _WF_392_0,
         _WF_392_1,
         _WF_350_0,

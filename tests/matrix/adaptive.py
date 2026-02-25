@@ -324,6 +324,7 @@ def load_cgroup_metrics(
         "peak_nonreclaim_mb": 0,
         "tmpfs_peak_nonreclaim_mb": 0,
         "no_tmpfs_peak_anon_mb": 0,
+        "gridpack_disk_mb": 0,
     }
 
     for search_dir in search_dirs:
@@ -774,18 +775,35 @@ def compute_job_split(
     job_multiplier = original_nthreads // tuned
     if job_multiplier < 1:
         job_multiplier = 1
-    # Cap step-down to ×2 when tmpfs will be enabled but we have no measured
-    # tmpfs data.  Tmpfs adds ~1.5 GB non-reclaimable memory per job that's
-    # invisible to FJR; jumping ×4 without measurement risks mass OOM.
-    # Once we have cgroup tmpfs data, or if tmpfs is disabled, no cap needed.
+    # Cap step-down when tmpfs will be enabled but we lack actual tmpfs
+    # cgroup data.  Two cases:
+    # (a) Have gridpack size from xz -l: estimate tmpfs memory as
+    #     peak_anon + gridpack_disk_mb, then find minimum threads where
+    #     tuned × max_memory_per_core_mb >= estimated_memory.
+    # (b) No data at all: blind ×2 cap (conservative fallback).
     has_tmpfs_data = (cgroup is not None
                       and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) > 0)
+    has_gridpack_size = (cgroup is not None
+                         and cgroup.get("gridpack_disk_mb", 0) > 0)
     if split_tmpfs and not has_tmpfs_data:
-        prev_nt = last_round_nthreads if last_round_nthreads > 0 else original_nthreads
-        min_tuned = max(prev_nt // 2, min_threads)
-        if tuned < min_tuned:
-            tuned = min_tuned
+        if has_gridpack_size:
+            # Memory-aware cap: find minimum threads where memory fits
+            est_mem = int((cgroup["peak_anon_mb"] + cgroup["gridpack_disk_mb"])
+                         * (1.0 + safety_margin))
+            while tuned < original_nthreads:
+                if tuned * max_memory_per_core_mb >= est_mem:
+                    break
+                tuned *= 2
+            tuned = max(tuned, min_threads)
+            tuned = min(tuned, original_nthreads)
             job_multiplier = original_nthreads // tuned
+        else:
+            # No data at all — blind ×2 step-down cap
+            prev_nt = last_round_nthreads if last_round_nthreads > 0 else original_nthreads
+            min_tuned = max(prev_nt // 2, min_threads)
+            if tuned < min_tuned:
+                tuned = min_tuned
+                job_multiplier = original_nthreads // tuned
 
     new_events_per_job = events_per_job // job_multiplier
     if new_events_per_job < 1:
@@ -844,10 +862,19 @@ def compute_job_split(
             memory_source = "cgroup_measured"
         elif split_tmpfs and cgroup.get("tmpfs_peak_nonreclaim_mb", 0) == 0:
             # Prior round ran WITHOUT tmpfs but next round WILL use tmpfs.
-            # We have no tmpfs memory data — cannot safely estimate.
-            # Jump to max memory allowed so the job survives.
-            memory_from_measured = tuned * max_memory_per_core_mb
-            memory_source = "cgroup_no_tmpfs_data"
+            gridpack_mb = cgroup.get("gridpack_disk_mb", 0)
+            if gridpack_mb > 0:
+                # Have gridpack uncompressed size from xz -l: estimate tmpfs
+                # impact as peak_anon + gridpack (gridpack extraction goes to
+                # /dev/shm as shmem, process RSS stays as anon).
+                binding = cgroup["peak_anon_mb"] + gridpack_mb
+                memory_from_measured = int(binding * margin_mult)
+                memory_source = "cgroup_gridpack_estimated"
+            else:
+                # No gridpack size, no tmpfs data — cannot safely estimate.
+                # Jump to max memory allowed so the job survives.
+                memory_from_measured = tuned * max_memory_per_core_mb
+                memory_source = "cgroup_no_tmpfs_data"
         else:
             binding = cgroup["peak_nonreclaim_mb"]
             memory_from_measured = int(binding * margin_mult)
@@ -1499,6 +1526,18 @@ def _replan_cli(args: list[str]) -> None:
               f"  (anon={cgroup['peak_anon_mb']} shmem={cgroup['peak_shmem_mb']})"
               f"  tmpfs_phase={cgroup.get('tmpfs_peak_nonreclaim_mb', 0)}"
               f"  no_tmpfs={cgroup.get('no_tmpfs_peak_anon_mb', 0)}")
+        gridpack_mb = cgroup.get("gridpack_disk_mb", 0)
+        if gridpack_mb > 0:
+            anon_mb = cgroup.get("peak_anon_mb", 0)
+            print(f"Gridpack uncompressed: {gridpack_mb} MB"
+                  f"  (estimated tmpfs total: {anon_mb} + {gridpack_mb}"
+                  f" = {anon_mb + gridpack_mb} MB)")
+            # Disable tmpfs if gridpack extraction is too large for RAM
+            TMPFS_MAX_GRIDPACK_MB = 4000
+            if opts.split_tmpfs and gridpack_mb > TMPFS_MAX_GRIDPACK_MB:
+                print(f"  WARNING: gridpack {gridpack_mb} MB exceeds tmpfs"
+                      f" threshold ({TMPFS_MAX_GRIDPACK_MB} MB) — disabling tmpfs")
+                opts.split_tmpfs = False
 
     # 2. Compute per-step optimal nThreads
     print(f"\n--- Computing per-step nThreads ---")
@@ -1563,6 +1602,8 @@ def _replan_cli(args: list[str]) -> None:
             "memory_per_core_mb": mem_per_core,
             "max_memory_per_core_mb": max_mem_per_core,
             "min_threads": opts.min_threads,
+            "split_tmpfs": opts.split_tmpfs,
+            "gridpack_disk_mb": cgroup.get("gridpack_disk_mb", 0) if cgroup else 0,
             "rounds_analyzed": len(round_metrics),
             "per_round_nthreads": [rm["nthreads"] for rm in round_metrics],
             "per_step": {
