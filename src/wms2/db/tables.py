@@ -31,6 +31,7 @@ class RequestRow(Base):
     priority: Mapped[int] = mapped_column(Integer, default=100000)
     urgent: Mapped[bool] = mapped_column(Boolean, default=False)
     production_steps: Mapped[list] = mapped_column(JSONB, default=list)
+    adaptive: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="new")
     status_transitions: Mapped[list] = mapped_column(JSONB, default=list)
     previous_version_request: Mapped[str | None] = mapped_column(
@@ -57,7 +58,10 @@ class WorkflowRow(Base):
     pilot_cluster_id: Mapped[str | None] = mapped_column(String(50))
     pilot_schedd: Mapped[str | None] = mapped_column(String(255))
     pilot_output_path: Mapped[str | None] = mapped_column(Text)
-    pilot_metrics: Mapped[dict | None] = mapped_column(JSONB)
+    step_metrics: Mapped[dict | None] = mapped_column(JSONB)
+    current_round: Mapped[int] = mapped_column(Integer, default=0)
+    next_first_event: Mapped[int] = mapped_column(Integer, default=1)
+    file_cursor: Mapped[int] = mapped_column(Integer, default=0)
     dag_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     category_throttles: Mapped[dict] = mapped_column(
         JSONB, default=lambda: {"Processing": 5000, "Merge": 100, "Cleanup": 50}

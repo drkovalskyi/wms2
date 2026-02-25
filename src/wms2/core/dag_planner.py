@@ -177,7 +177,7 @@ class DAGPlanner:
 
         await self.db.update_workflow(
             workflow.id,
-            pilot_metrics=pilot_data,
+            step_metrics=pilot_data,
         )
         return await self.plan_production_dag(workflow, metrics=metrics)
 

@@ -84,3 +84,32 @@ def test_single_production_step_is_valid():
 def test_request_missing_required_fields():
     with pytest.raises(ValidationError):
         RequestCreate(request_name="test")
+
+
+def test_request_adaptive_default_true():
+    req = RequestCreate(**_valid_request())
+    assert req.adaptive is True
+
+
+def test_request_adaptive_false():
+    req = RequestCreate(**_valid_request(adaptive=False))
+    assert req.adaptive is False
+
+
+def test_workflow_round_tracking_defaults():
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from wms2.models.workflow import Workflow
+
+    now = datetime.now(timezone.utc)
+    wf = Workflow(
+        id=uuid4(),
+        request_name="test-request-001",
+        created_at=now,
+        updated_at=now,
+    )
+    assert wf.step_metrics is None
+    assert wf.current_round == 0
+    assert wf.next_first_event == 1
+    assert wf.file_cursor == 0

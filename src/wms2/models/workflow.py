@@ -40,7 +40,10 @@ class Workflow(BaseModel):
     pilot_cluster_id: Optional[str] = None
     pilot_schedd: Optional[str] = None
     pilot_output_path: Optional[str] = None
-    pilot_metrics: Optional[PilotMetrics] = None
+    step_metrics: Optional[PilotMetrics] = None
+    current_round: int = 0
+    next_first_event: int = 1
+    file_cursor: int = 0
     dag_id: Optional[UUID] = None
     category_throttles: dict[str, int] = {
         "Processing": 5000,

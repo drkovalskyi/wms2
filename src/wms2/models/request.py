@@ -40,6 +40,7 @@ class RequestCreate(BaseModel):
     priority: int = 100000
     urgent: bool = False
     production_steps: list[ProductionStep] = []
+    adaptive: bool = True
     payload_config: dict[str, Any] = {}
     cleanup_policy: CleanupPolicy = CleanupPolicy.KEEP_UNTIL_REPLACED
 
@@ -66,6 +67,7 @@ class RequestUpdate(BaseModel):
     site_whitelist: Optional[list[str]] = None
     site_blacklist: Optional[list[str]] = None
     production_steps: Optional[list[ProductionStep]] = None
+    adaptive: Optional[bool] = None
     urgent: Optional[bool] = None
 
 
@@ -86,6 +88,7 @@ class Request(BaseModel):
     priority: int = 100000
     urgent: bool = False
     production_steps: list[ProductionStep] = []
+    adaptive: bool = True
     status: RequestStatus = RequestStatus.NEW
     status_transitions: list[StatusTransition] = []
     previous_version_request: Optional[str] = None
