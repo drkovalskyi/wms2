@@ -255,24 +255,16 @@ class RequestLifecycleManager:
                     return
                 await self.transition(request, RequestStatus.COMPLETED)
                 return
-            elif result.status == DAGStatus.PARTIAL:
+            elif result.status in (DAGStatus.PARTIAL, DAGStatus.FAILED):
                 if self.error_handler:
-                    action = await self.error_handler.handle_dag_partial_failure(
+                    action = await self.error_handler.handle_dag_completion(
                         dag, request, workflow
                     )
                     if action == "rescue":
                         await self.transition(request, RequestStatus.RESUBMITTING)
                         return
-                    elif action == "abort":
-                        await self.transition(request, RequestStatus.FAILED)
-                        return
-                # No error_handler or action == "review"
+                # No error_handler or action == "hold"
                 await self.transition(request, RequestStatus.PARTIAL)
-                return
-            elif result.status == DAGStatus.FAILED:
-                if self.error_handler:
-                    await self.error_handler.handle_dag_failure(dag, request, workflow)
-                await self.transition(request, RequestStatus.FAILED)
                 return
             # RUNNING — no transition, will poll again next cycle
             return
@@ -285,22 +277,16 @@ class RequestLifecycleManager:
                 await self._handle_round_completion(request, workflow, dag)
                 return
             await self.transition(request, RequestStatus.COMPLETED)
-        elif dag.status == DAGStatus.PARTIAL.value:
+        elif dag.status in (DAGStatus.PARTIAL.value, DAGStatus.FAILED.value):
             if self.error_handler:
-                action = await self.error_handler.handle_dag_partial_failure(
+                action = await self.error_handler.handle_dag_completion(
                     dag, request, workflow
                 )
                 if action == "rescue":
                     await self.transition(request, RequestStatus.RESUBMITTING)
                     return
-                elif action == "abort":
-                    await self.transition(request, RequestStatus.FAILED)
-                    return
+            # No error_handler or action == "hold"
             await self.transition(request, RequestStatus.PARTIAL)
-        elif dag.status == DAGStatus.FAILED.value:
-            if self.error_handler:
-                await self.error_handler.handle_dag_failure(dag, request, workflow)
-            await self.transition(request, RequestStatus.FAILED)
 
     async def _handle_stopping(self, request):
         """Monitor clean stop progress."""

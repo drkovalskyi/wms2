@@ -65,8 +65,7 @@ class Settings(BaseSettings):
     pilot_step_timeout: int = 900       # 15 minutes per step
 
     # Error Handler
-    error_auto_rescue_threshold: float = 0.05
-    error_abort_threshold: float = 0.30
+    error_hold_threshold: float = 0.20
     error_max_rescue_attempts: int = 3
 
     # API

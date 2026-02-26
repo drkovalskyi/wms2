@@ -373,7 +373,7 @@ async def test_active_partial_with_rescue(mock_repository, mock_condor, settings
     from wms2.core.dag_monitor import DAGPollResult
 
     mock_error_handler = AsyncMock()
-    mock_error_handler.handle_dag_partial_failure.return_value = "rescue"
+    mock_error_handler.handle_dag_completion.return_value = "rescue"
 
     dag = _make_dag(status="submitted", nodes_done=19, nodes_failed=1)
     workflow = _make_workflow(dag_id=dag.id)
@@ -396,7 +396,7 @@ async def test_active_partial_with_rescue(mock_repository, mock_condor, settings
     request = make_request_row(status="active")
     await lm.evaluate_request(request)
 
-    mock_error_handler.handle_dag_partial_failure.assert_called_once_with(
+    mock_error_handler.handle_dag_completion.assert_called_once_with(
         dag, request, workflow
     )
     req_update = mock_repository.update_request.call_args
@@ -433,11 +433,11 @@ async def test_active_partial_without_error_handler(mock_repository, mock_condor
 
 
 async def test_active_failed_with_error_handler(mock_repository, mock_condor, settings):
-    """FAILED + error_handler called → request FAILED."""
+    """FAILED + error_handler returns 'hold' → request PARTIAL (held for operator)."""
     from wms2.core.dag_monitor import DAGPollResult
 
     mock_error_handler = AsyncMock()
-    mock_error_handler.handle_dag_failure.return_value = "abort"
+    mock_error_handler.handle_dag_completion.return_value = "hold"
 
     dag = _make_dag(status="submitted", nodes_done=0, nodes_failed=20)
     workflow = _make_workflow(dag_id=dag.id)
@@ -460,11 +460,11 @@ async def test_active_failed_with_error_handler(mock_repository, mock_condor, se
     request = make_request_row(status="active")
     await lm.evaluate_request(request)
 
-    mock_error_handler.handle_dag_failure.assert_called_once_with(
+    mock_error_handler.handle_dag_completion.assert_called_once_with(
         dag, request, workflow
     )
     req_update = mock_repository.update_request.call_args
-    assert req_update[1]["status"] == RequestStatus.FAILED.value
+    assert req_update[1]["status"] == RequestStatus.PARTIAL.value
 
 
 async def test_handle_queued_rescue_dag_submits(lifecycle_manager, mock_repository, mock_condor):

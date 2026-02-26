@@ -3167,3 +3167,64 @@ Created `docs/error_handling.md` — a comprehensive error handling specificatio
 - Error Handler section updated to match new threshold model
 - DD-14 added to Design Decisions (Section 16)
 - POST script sketch updated with UNLESS-EXIT/ABORT-DAG-ON codes and side file collection
+
+---
+
+## POST Script Implementation (2026-02-26)
+
+Implemented the full POST script error classification and data collection pipeline per `docs/error_handling.md`. Replaces the stub POST script with a two-part system: a shell POST script that controls DAGMan retry behavior, and a Python collector that parses FJR/HTCondor logs and writes structured JSON side files.
+
+### What Was Built
+
+#### New Files
+
+| File | Purpose |
+|------|---------|
+| `src/wms2/core/post_classifier.py` | Error classification logic + collector script generator |
+| `tests/unit/test_post_classifier.py` | 64 unit tests for classification and collector |
+
+#### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/wms2/core/dag_planner.py` | Full POST script (was stub), collector writer, UNLESS-EXIT 42, ABORT-DAG-ON 43, expanded POST macros ($JOB $RETURN $RETRY $MAX_RETRIES), merge node POST script |
+| `src/wms2/core/error_handler.py` | Single 20% threshold (was three-tier 5%/30%), unified `handle_dag_completion()` (was separate `handle_dag_failure()` + `handle_dag_partial_failure()`), `read_post_data()`, `analyze_site_failures()` |
+| `src/wms2/config.py` | `error_hold_threshold=0.20` replaces `error_auto_rescue_threshold=0.05` + `error_abort_threshold=0.30` |
+| `src/wms2/core/lifecycle_manager.py` | Updated to use `handle_dag_completion()`, PARTIAL and FAILED both go through same path, "hold" maps to PARTIAL |
+| `tests/unit/test_dag_generator.py` | Updated assertions for UNLESS-EXIT 42, ABORT-DAG-ON, expanded macros, collector file, merge POST |
+| `tests/unit/test_error_handler.py` | Rewritten for single threshold model, read_post_data, analyze_site_failures |
+| `tests/unit/test_lifecycle.py` | Updated for `handle_dag_completion()`, FAILED+hold→PARTIAL |
+| `tests/matrix/adaptive.py` | UNLESS-EXIT 2→42, added ABORT-DAG-ON directives |
+
+### Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| POST script is shell, collector is Python | Shell handles DAGMan exit code logic (sleep, case/esac). Python handles FJR XML parsing and JSON output. Clean separation. |
+| Collector is self-contained (no wms2 imports) | Runs on submit host in DAGMan context where wms2 package may not be installed. All classification tables embedded inline. |
+| Classification tables from WMAgent's WMExceptions.py | Proven taxonomy from years of CMS production. Adapted but not reinvented. |
+| `infrastructure_memory` sub-category | Memory kills need special handling (bump request_memory by 50%) before retry. Separate from general infrastructure. |
+| ABORT-DAG-ON exit code 43 | Circuit breaker for catastrophic errors. Separate from UNLESS-EXIT 42 (per-node permanent) vs 43 (entire DAG abort). |
+| FAILED is manual only | Error handler never sets workflow to FAILED. Returns "hold" instead. Operator must explicitly fail a request (per docs/error_handling.md EH-4). |
+| Single 20% threshold | Replaces three-tier model. Simpler to reason about and configure. Below threshold → rescue, at/above → hold. |
+
+### Error Classification Table
+
+| Category | Exit Codes (examples) | POST Exit | Retryable |
+|----------|----------------------|-----------|-----------|
+| Permanent | 8001, 8009, 8501, 50664 | 42 | No |
+| Data | 8021, 8028, 8016 | 42 | No |
+| Infrastructure | 10018, 60321, 8020 | 1 (with 5min cooloff) | Yes |
+| Infrastructure (memory) | 50660, 50661, 8004 | 1 (with memory bump) | Yes |
+| Transient | signals, unknown codes | 1 (with exp backoff) | Yes |
+| Catastrophic | (reserved for future) | 43 | No (aborts DAG) |
+
+### Verification
+
+- `pytest tests/unit/test_post_classifier.py -v` — 64/64 passed
+- `pytest tests/unit/test_dag_generator.py -v` — 48/48 passed
+- `pytest tests/unit/test_error_handler.py -v` — 17/17 passed
+- `pytest tests/unit/ -v` — 369/369 passed (zero regressions)
+- Generated `wms2_post_collect.py` compiles as valid Python
+- Generated `post_script.sh` handles all classification categories
+- Collector integration test: writes correct post.json from mock FJR XML

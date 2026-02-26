@@ -537,6 +537,7 @@ def _generate_dag_files(
     _write_elect_site_script(str(submit_path / "elect_site.sh"))
     _write_pin_site_script(str(submit_path / "pin_site.sh"))
     _write_post_script(str(submit_path / "post_script.sh"))
+    _write_post_collector(str(submit_path / "wms2_post_collect.py"))
     _write_proc_script(str(submit_path / "wms2_proc.sh"))
     _write_merge_script(str(submit_path / "wms2_merge.py"))
     _write_cleanup_script(str(submit_path / "wms2_cleanup.py"))
@@ -740,7 +741,7 @@ def _generate_group_dag(
             f"SCRIPT PRE {node_name} {submit_dir / 'pin_site.sh'} {node_name}.sub elected_site"
         )
         lines.append(
-            f"SCRIPT POST {node_name} {submit_dir / 'post_script.sh'} {node_name} $RETURN"
+            f"SCRIPT POST {node_name} {submit_dir / 'post_script.sh'} $JOB $RETURN $RETRY $MAX_RETRIES"
         )
         lines.append("")
 
@@ -759,6 +760,9 @@ def _generate_group_dag(
     lines.append("JOB merge merge.sub")
     lines.append(
         f"SCRIPT PRE merge {submit_dir / 'pin_site.sh'} merge.sub elected_site"
+    )
+    lines.append(
+        f"SCRIPT POST merge {submit_dir / 'post_script.sh'} $JOB $RETURN $RETRY $MAX_RETRIES"
     )
     lines.append("")
 
@@ -781,9 +785,16 @@ def _generate_group_dag(
     # Retries
     for node in proc_nodes:
         node_name = f"proc_{node.node_index:06d}"
-        lines.append(f"RETRY {node_name} 3 UNLESS-EXIT 2")
-    lines.append("RETRY merge 2 UNLESS-EXIT 2")
+        lines.append(f"RETRY {node_name} 3 UNLESS-EXIT 42")
+    lines.append("RETRY merge 2 UNLESS-EXIT 42")
     lines.append("RETRY cleanup 1")
+    lines.append("")
+
+    # Abort-DAG-on (catastrophic failure circuit breaker)
+    for node in proc_nodes:
+        node_name = f"proc_{node.node_index:06d}"
+        lines.append(f"ABORT-DAG-ON {node_name} 43 RETURN 1")
+    lines.append("ABORT-DAG-ON merge 43 RETURN 1")
     lines.append("")
 
     # Dependencies
@@ -925,14 +936,57 @@ exit 0
 def _write_post_script(path: str) -> None:
     _write_file(path, """\
 #!/bin/bash
-# post_script.sh — POST script for processing nodes
-NODE_NAME=$1
-RETURN_CODE=$2
-if [ "$RETURN_CODE" != "0" ]; then
-    echo "Node $NODE_NAME failed with exit code $RETURN_CODE" >&2
+# post_script.sh — POST script for processing/merge nodes
+# Called by DAGMan: SCRIPT POST <node> post_script.sh $JOB $RETURN $RETRY $MAX_RETRIES
+NODE_NAME=$1; EXIT_CODE=$2; RETRY_NUM=${3:-0}; MAX_RETRIES=${4:-3}
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+UNLESS_EXIT=42
+ABORT_EXIT=43
+
+# Run collector — writes post.json, prints classification category to stdout
+CLASSIFICATION=$(python3 "$SCRIPT_DIR/wms2_post_collect.py" \
+    "$NODE_NAME" "$EXIT_CODE" "$RETRY_NUM" "$MAX_RETRIES" 2>/dev/null || echo "transient")
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+    exit 0
 fi
-exit $RETURN_CODE
+
+# Memory adjustment: if OOM, bump request_memory by 50%
+if [ "$CLASSIFICATION" = "infrastructure_memory" ]; then
+    SUB_FILE="${NODE_NAME}.sub"
+    if [ -f "$SUB_FILE" ]; then
+        current_mem=$(grep -oP 'request_memory\\s*=\\s*\\K\\d+' "$SUB_FILE")
+        if [ -n "$current_mem" ]; then
+            new_mem=$((current_mem * 3 / 2))
+            sed -i "s/request_memory = .*/request_memory = ${new_mem}/" "$SUB_FILE"
+        fi
+    fi
+fi
+
+case "$CLASSIFICATION" in
+    transient)
+        SLEEP_TIME=$((60 * (2 ** RETRY_NUM)))
+        [ "$SLEEP_TIME" -gt 600 ] && SLEEP_TIME=600
+        sleep $SLEEP_TIME
+        exit 1 ;;
+    permanent|data)
+        exit $UNLESS_EXIT ;;
+    infrastructure|infrastructure_memory)
+        sleep 300
+        exit 1 ;;
+    catastrophic)
+        exit $ABORT_EXIT ;;
+    *)
+        exit 1 ;;
+esac
 """)
+    os.chmod(path, 0o755)
+
+
+def _write_post_collector(path: str) -> None:
+    from wms2.core.post_classifier import generate_collector_script
+    _write_file(path, generate_collector_script())
     os.chmod(path, 0o755)
 
 

@@ -109,9 +109,17 @@ class TestDAGFileGeneration:
         assert "PARENT landing CHILD" in content
         assert "CHILD merge" in content
         assert "PARENT merge CHILD cleanup" in content
-        assert "RETRY proc_000000 3 UNLESS-EXIT 2" in content
-        assert "RETRY merge 2 UNLESS-EXIT 2" in content
+        assert "RETRY proc_000000 3 UNLESS-EXIT 42" in content
+        assert "RETRY merge 2 UNLESS-EXIT 42" in content
         assert "RETRY cleanup 1" in content
+        # ABORT-DAG-ON circuit breakers
+        assert "ABORT-DAG-ON proc_000000 43 RETURN 1" in content
+        assert "ABORT-DAG-ON merge 43 RETURN 1" in content
+        # POST script with expanded macros
+        assert "$JOB $RETURN $RETRY $MAX_RETRIES" in content
+        # Merge node has POST script
+        assert "SCRIPT POST merge" in content
+        assert "post_script.sh" in content
         assert "CATEGORY proc_000000 Processing" in content
         assert "CATEGORY merge Merge" in content
         assert "CATEGORY cleanup Cleanup" in content
@@ -148,6 +156,71 @@ class TestDAGFileGeneration:
         # Check executable
         assert os.access(str(tmp_path / "elect_site.sh"), os.X_OK)
         assert os.access(str(tmp_path / "pin_site.sh"), os.X_OK)
+
+    def test_post_collector_created(self, tmp_path):
+        """wms2_post_collect.py generated in submit directory."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        collector = tmp_path / "wms2_post_collect.py"
+        assert collector.exists()
+        assert os.access(str(collector), os.X_OK)
+        # Should be valid Python
+        content = collector.read_text()
+        compile(content, "wms2_post_collect.py", "exec")
+
+    def test_post_script_has_classification_logic(self, tmp_path):
+        """post_script.sh references the collector and UNLESS-EXIT 42."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "post_script.sh").read_text()
+        assert "wms2_post_collect.py" in content
+        assert "UNLESS_EXIT=42" in content
+        assert "ABORT_EXIT=43" in content
+        assert "infrastructure_memory" in content
+
+    def test_abort_dag_on_directives(self, tmp_path):
+        """ABORT-DAG-ON present for all proc nodes and merge."""
+        groups = _make_merge_groups(1, 2)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "mg_000000" / "group.dag").read_text()
+        assert "ABORT-DAG-ON proc_000000 43 RETURN 1" in content
+        assert "ABORT-DAG-ON proc_000001 43 RETURN 1" in content
+        assert "ABORT-DAG-ON merge 43 RETURN 1" in content
+
+    def test_merge_node_has_post_script(self, tmp_path):
+        """Merge node has POST script with expanded macros."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "mg_000000" / "group.dag").read_text()
+        # Find the merge POST line
+        merge_post_lines = [l for l in content.splitlines()
+                            if "SCRIPT POST merge" in l and "elect_site" not in l]
+        assert len(merge_post_lines) == 1
+        assert "$JOB $RETURN $RETRY $MAX_RETRIES" in merge_post_lines[0]
 
     def test_dagman_config_created(self, tmp_path):
         groups = _make_merge_groups(1, 1)

@@ -1177,9 +1177,15 @@ def rewrite_wu_for_job_split(
 
     # Retries
     for name in proc_names:
-        new_dag_lines.append(f"RETRY {name} 3 UNLESS-EXIT 2")
-    new_dag_lines.append("RETRY merge 2 UNLESS-EXIT 2")
+        new_dag_lines.append(f"RETRY {name} 3 UNLESS-EXIT 42")
+    new_dag_lines.append("RETRY merge 2 UNLESS-EXIT 42")
     new_dag_lines.append("RETRY cleanup 1")
+    new_dag_lines.append("")
+
+    # Abort-DAG-on (catastrophic failure circuit breaker)
+    for name in proc_names:
+        new_dag_lines.append(f"ABORT-DAG-ON {name} 43 RETURN 1")
+    new_dag_lines.append("ABORT-DAG-ON merge 43 RETURN 1")
     new_dag_lines.append("")
 
     # Dependencies
