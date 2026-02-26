@@ -11,6 +11,19 @@ from wms2.models.enums import DAGStatus, RequestStatus, WorkflowStatus
 logger = logging.getLogger(__name__)
 
 
+def _aggregate_round_metrics(existing_metrics, dag, round_number):
+    """Merge this round's DAG stats into cumulative step_metrics."""
+    prior = existing_metrics or {}
+    return {
+        **prior,
+        "rounds_completed": round_number + 1,
+        "cumulative_nodes_done": prior.get("cumulative_nodes_done", 0) + (dag.nodes_done or 0),
+        "cumulative_nodes_failed": prior.get("cumulative_nodes_failed", 0) + (dag.nodes_failed or 0),
+        "last_round_nodes_done": dag.nodes_done or 0,
+        "last_round_work_units": dag.total_work_units or 0,
+    }
+
+
 class RequestLifecycleManager:
     """
     Single owner of the request state machine. Runs a continuous loop that
@@ -214,6 +227,12 @@ class RequestLifecycleManager:
                     if not await self.output_manager.all_blocks_archived(workflow.id):
                         # Stay ACTIVE, retry on next cycle
                         return
+                # Check adaptive round completion
+                if getattr(request, "adaptive", False):
+                    # Re-fetch dag — poll_dag updated DB but our object is stale
+                    dag = await self.db.get_dag(workflow.dag_id)
+                    await self._handle_round_completion(request, workflow, dag)
+                    return
                 await self.transition(request, RequestStatus.COMPLETED)
                 return
             elif result.status == DAGStatus.PARTIAL:
@@ -239,6 +258,12 @@ class RequestLifecycleManager:
             return
 
         if dag.status == DAGStatus.COMPLETED.value:
+            if self.output_manager:
+                if not await self.output_manager.all_blocks_archived(workflow.id):
+                    return
+            if getattr(request, "adaptive", False):
+                await self._handle_round_completion(request, workflow, dag)
+                return
             await self.transition(request, RequestStatus.COMPLETED)
         elif dag.status == DAGStatus.PARTIAL.value:
             if self.error_handler:
@@ -287,6 +312,88 @@ class RequestLifecycleManager:
         when the DAG first transitions to PARTIAL.
         """
         pass
+
+    # ── Adaptive Round Completion ──────────────────────────────
+
+    async def _handle_round_completion(self, request, workflow, dag):
+        """Handle completion of one adaptive round. Advance cursors, aggregate
+        metrics, and either complete the request or return it to the queue."""
+        config = workflow.config_data or {}
+        is_gen = config.get("_is_gen", False)
+        params = workflow.splitting_params or {}
+
+        # Compute how many events/files this round processed
+        if is_gen:
+            events_per_job = (params.get("events_per_job")
+                              or params.get("eventsPerJob") or 100_000)
+            total_jobs = dag.nodes_done  # processing nodes that completed
+            events_this_round = total_jobs * events_per_job
+            new_cursor = workflow.next_first_event + events_this_round
+            total_events = config.get("request_num_events", 0)
+            remaining = total_events - new_cursor + 1
+        else:
+            files_per_job = (params.get("files_per_job")
+                             or params.get("FilesPerJob") or 1)
+            total_jobs = dag.nodes_done
+            files_this_round = total_jobs * files_per_job
+            new_cursor = workflow.file_cursor + files_this_round
+            remaining = -1  # file-based: check via DBS in planner
+
+        # Aggregate step_metrics from completed DAG
+        new_metrics = _aggregate_round_metrics(
+            workflow.step_metrics, dag, workflow.current_round
+        )
+
+        new_round = workflow.current_round + 1
+
+        # Update workflow with new cursors and round
+        update_kwargs = {
+            "current_round": new_round,
+            "step_metrics": new_metrics,
+        }
+        if is_gen:
+            update_kwargs["next_first_event"] = new_cursor
+        else:
+            update_kwargs["file_cursor"] = new_cursor
+
+        await self.db.update_workflow(workflow.id, **update_kwargs)
+
+        # Check if all work is done
+        if is_gen and remaining <= 0:
+            await self.transition(request, RequestStatus.COMPLETED)
+            return
+
+        # Apply production_steps priority demotion between rounds
+        steps = request.production_steps or []
+        if steps:
+            if is_gen and total_events > 0:
+                progress = (new_cursor - 1) / total_events
+                step = steps[0]
+                fraction = step["fraction"] if isinstance(step, dict) else step.fraction
+                if progress >= fraction:
+                    priority = step["priority"] if isinstance(step, dict) else step.priority
+                    remaining_steps = steps[1:]
+                    await self.db.update_request(
+                        request.request_name,
+                        priority=priority,
+                        production_steps=[
+                            s if isinstance(s, dict)
+                            else {"fraction": s.fraction, "priority": s.priority}
+                            for s in remaining_steps
+                        ],
+                    )
+
+        logger.info(
+            "Request %s: round %d complete, advancing to round %d "
+            "(%s cursor: %s, remaining: %s)",
+            request.request_name, workflow.current_round, new_round,
+            "event" if is_gen else "file",
+            new_cursor,
+            remaining if remaining >= 0 else "unknown",
+        )
+
+        # Return to admission queue for next round
+        await self.transition(request, RequestStatus.QUEUED)
 
     # ── Clean Stop ──────────────────────────────────────────────
 

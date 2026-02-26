@@ -479,3 +479,262 @@ async def test_handle_queued_rescue_dag_submits(lifecycle_manager, mock_reposito
     # Request transitions to ACTIVE
     req_update = mock_repository.update_request.call_args
     assert req_update[1]["status"] == RequestStatus.ACTIVE.value
+
+
+# ── Adaptive Round Completion Tests ──────────────────────────
+
+
+async def test_round_completion_gen_returns_to_queued(mock_repository, mock_condor, settings):
+    """Adaptive GEN request with remaining events → QUEUED, cursors advanced."""
+    from wms2.core.dag_monitor import DAGPollResult
+    from wms2.core.lifecycle_manager import RequestLifecycleManager
+
+    # GEN workflow: 1M total events, 100k per job, round 0 with 8 processing jobs
+    dag = _make_dag(status="submitted", nodes_done=8, nodes_failed=0)
+    workflow = _make_workflow(
+        dag_id=dag.id,
+        config_data={"_is_gen": True, "request_num_events": 1_000_000},
+        splitting_params={"events_per_job": 100_000},
+        next_first_event=1,
+        file_cursor=0,
+        current_round=0,
+        step_metrics=None,
+        adaptive=True,
+    )
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.COMPLETED,
+        nodes_done=8, nodes_failed=0,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+    )
+
+    request = make_request_row(status="active", adaptive=True)
+    await lm.evaluate_request(request)
+
+    # Workflow updated with new round and cursor
+    wf_update = mock_repository.update_workflow.call_args
+    assert wf_update[1]["current_round"] == 1
+    assert wf_update[1]["next_first_event"] == 800_001  # 1 + 8*100_000
+    assert wf_update[1]["step_metrics"]["rounds_completed"] == 1
+    assert wf_update[1]["step_metrics"]["cumulative_nodes_done"] == 8
+
+    # Request transitions to QUEUED (not COMPLETED)
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.QUEUED.value
+
+
+async def test_round_completion_gen_all_done(mock_repository, mock_condor, settings):
+    """Adaptive GEN request where all events processed → COMPLETED."""
+    from wms2.core.dag_monitor import DAGPollResult
+    from wms2.core.lifecycle_manager import RequestLifecycleManager
+
+    # 1M events total, already at event 900_001 (9 rounds done), 1 job of 100k left
+    dag = _make_dag(status="submitted", nodes_done=1, nodes_failed=0)
+    workflow = _make_workflow(
+        dag_id=dag.id,
+        config_data={"_is_gen": True, "request_num_events": 1_000_000},
+        splitting_params={"events_per_job": 100_000},
+        next_first_event=900_001,
+        file_cursor=0,
+        current_round=9,
+        step_metrics={"rounds_completed": 9, "cumulative_nodes_done": 72},
+        adaptive=True,
+    )
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.COMPLETED,
+        nodes_done=1, nodes_failed=0,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+    )
+
+    request = make_request_row(status="active", adaptive=True)
+    await lm.evaluate_request(request)
+
+    # Workflow updated
+    wf_update = mock_repository.update_workflow.call_args
+    assert wf_update[1]["current_round"] == 10
+    assert wf_update[1]["next_first_event"] == 1_000_001
+
+    # Request transitions to COMPLETED (all done)
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.COMPLETED.value
+
+
+async def test_round_completion_file_based_returns_to_queued(
+    mock_repository, mock_condor, settings
+):
+    """Adaptive file-based request → QUEUED, file_cursor advanced."""
+    from wms2.core.dag_monitor import DAGPollResult
+    from wms2.core.lifecycle_manager import RequestLifecycleManager
+
+    dag = _make_dag(status="submitted", nodes_done=5, nodes_failed=0)
+    workflow = _make_workflow(
+        dag_id=dag.id,
+        config_data={"_is_gen": False},
+        splitting_params={"files_per_job": 2},
+        next_first_event=1,
+        file_cursor=0,
+        current_round=0,
+        step_metrics=None,
+        adaptive=True,
+    )
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.COMPLETED,
+        nodes_done=5, nodes_failed=0,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+    )
+
+    request = make_request_row(status="active", adaptive=True)
+    await lm.evaluate_request(request)
+
+    # Workflow updated with file_cursor (not next_first_event)
+    wf_update = mock_repository.update_workflow.call_args
+    assert wf_update[1]["current_round"] == 1
+    assert wf_update[1]["file_cursor"] == 10  # 5 jobs * 2 files_per_job
+    assert "next_first_event" not in wf_update[1]
+
+    # Request transitions to QUEUED
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.QUEUED.value
+
+
+async def test_non_adaptive_skips_round_handler(mock_repository, mock_condor, settings):
+    """Non-adaptive request → COMPLETED directly (existing behavior)."""
+    from wms2.core.dag_monitor import DAGPollResult
+    from wms2.core.lifecycle_manager import RequestLifecycleManager
+
+    dag = _make_dag(status="submitted", nodes_done=10, nodes_failed=0)
+    workflow = _make_workflow(dag_id=dag.id)
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.COMPLETED,
+        nodes_done=10, nodes_failed=0,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+    )
+
+    request = make_request_row(status="active")
+    await lm.evaluate_request(request)
+
+    # Request transitions to COMPLETED (no round handler)
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.COMPLETED.value
+    # update_workflow should NOT have been called with current_round
+    for call in mock_repository.update_workflow.call_args_list:
+        assert "current_round" not in call[1]
+
+
+async def test_round_completion_priority_demotion(mock_repository, mock_condor, settings):
+    """Adaptive request with production_steps → priority demoted when threshold crossed."""
+    from wms2.core.dag_monitor import DAGPollResult
+    from wms2.core.lifecycle_manager import RequestLifecycleManager
+
+    # 1000 events, 100 per job, 5 done this round → cursor moves to 501
+    # progress = 500/1000 = 0.5, matches first step's fraction
+    dag = _make_dag(status="submitted", nodes_done=5, nodes_failed=0)
+    workflow = _make_workflow(
+        dag_id=dag.id,
+        config_data={"_is_gen": True, "request_num_events": 1000},
+        splitting_params={"events_per_job": 100},
+        next_first_event=1,
+        file_cursor=0,
+        current_round=0,
+        step_metrics=None,
+        adaptive=True,
+    )
+
+    mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
+    mock_repository.get_dag = AsyncMock(return_value=dag)
+
+    mock_dag_monitor = AsyncMock()
+    mock_dag_monitor.poll_dag.return_value = DAGPollResult(
+        dag_id=str(dag.id), status=DAGStatus.COMPLETED,
+        nodes_done=5, nodes_failed=0,
+    )
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_monitor=mock_dag_monitor,
+    )
+
+    steps = [
+        {"fraction": 0.5, "priority": 80000},
+        {"fraction": 1.0, "priority": 100000},
+    ]
+    request = make_request_row(status="active", adaptive=True, production_steps=steps)
+    await lm.evaluate_request(request)
+
+    # update_request called for priority demotion AND for transition
+    req_calls = mock_repository.update_request.call_args_list
+    # Priority demotion call (first)
+    priority_call = req_calls[0]
+    assert priority_call[1]["priority"] == 80000
+    assert len(priority_call[1]["production_steps"]) == 1
+    assert priority_call[1]["production_steps"][0]["fraction"] == 1.0
+
+    # Transition call (second) — QUEUED
+    transition_call = req_calls[1]
+    assert transition_call[1]["status"] == RequestStatus.QUEUED.value
+
+
+async def test_aggregate_round_metrics():
+    """Unit test for _aggregate_round_metrics()."""
+    from wms2.core.lifecycle_manager import _aggregate_round_metrics
+
+    dag = MagicMock()
+    dag.nodes_done = 10
+    dag.nodes_failed = 2
+    dag.total_work_units = 3
+
+    # First round — no prior metrics
+    result = _aggregate_round_metrics(None, dag, 0)
+    assert result["rounds_completed"] == 1
+    assert result["cumulative_nodes_done"] == 10
+    assert result["cumulative_nodes_failed"] == 2
+    assert result["last_round_nodes_done"] == 10
+    assert result["last_round_work_units"] == 3
+
+    # Second round — accumulate
+    dag2 = MagicMock()
+    dag2.nodes_done = 8
+    dag2.nodes_failed = 1
+    dag2.total_work_units = 2
+
+    result2 = _aggregate_round_metrics(result, dag2, 1)
+    assert result2["rounds_completed"] == 2
+    assert result2["cumulative_nodes_done"] == 18  # 10 + 8
+    assert result2["cumulative_nodes_failed"] == 3  # 2 + 1
+    assert result2["last_round_nodes_done"] == 8
+    assert result2["last_round_work_units"] == 2

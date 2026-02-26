@@ -84,6 +84,7 @@ def make_request_row(
     status="new",
     priority=100000,
     urgent=False,
+    adaptive=False,
     production_steps=None,
     **kwargs,
 ):
@@ -101,6 +102,7 @@ def make_request_row(
     row.campaign = "TestCampaign"
     row.priority = priority
     row.urgent = urgent
+    row.adaptive = adaptive
     row.production_steps = production_steps or []
     row.status = status
     row.status_transitions = []

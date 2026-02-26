@@ -42,6 +42,7 @@ class Settings(BaseSettings):
 
     # Work unit sizing
     jobs_per_work_unit: int = 8  # processing jobs per merge group
+    work_units_per_round: int = 10  # work units per processing round (adaptive)
 
     # Job executables (override to /bin/true for local testing)
     processing_executable: str = "run_payload.sh"
