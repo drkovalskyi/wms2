@@ -2898,3 +2898,66 @@ Propagated new fields from spec v2.8.0 (multi-round adaptive lifecycle) into the
 - 275/276 unit tests pass (1 pre-existing failure in `test_handle_active_processes_work_units`)
 - 8/8 integration tests pass
 - No stale `pilot_metrics` references in `src/` outside of file-on-disk names (pilot_runner.py, dag_planner HTCondor submit templates) and migration files
+
+## Round-Completion Handler for Multi-Round Adaptive Execution
+
+**Date**: 2026-02-26
+**Commit**: 58ab99b
+
+### What Was Built
+
+Implemented the lifecycle manager logic that runs when an adaptive request's DAG completes. Previously, DAG completion always transitioned the request to `COMPLETED`. Now, for adaptive requests (`request.adaptive = True`), the round-completion handler checks whether more work remains and either completes the request or returns it to `QUEUED` for the next round.
+
+This is the **lifecycle manager side only** — it advances cursors and aggregates metrics. The DAG planner does not yet consume these cursors when planning (that's the next step).
+
+### Changes
+
+| File | Change |
+|---|---|
+| `src/wms2/config.py` | Added `work_units_per_round: int = 10` setting |
+| `src/wms2/core/lifecycle_manager.py` | Added `_aggregate_round_metrics()` module-level function, `_handle_round_completion()` method, modified `_handle_active()` at two DAG-completion points |
+| `tests/unit/conftest.py` | Added `adaptive=False` default to `make_request_row()` |
+| `tests/unit/test_lifecycle.py` | Added 6 tests for round-completion logic |
+
+### How It Works
+
+1. **`_handle_active()` — two insertion points**: When a DAG is detected as completed (either freshly via poll or already completed from a previous cycle), checks `request.adaptive`. If true, delegates to `_handle_round_completion()` instead of transitioning directly to `COMPLETED`.
+
+2. **`_handle_round_completion()`**:
+   - Reads workflow's `config_data._is_gen` to determine GEN vs file-based mode
+   - **GEN mode**: Computes `events_this_round = dag.nodes_done * events_per_job`, advances `next_first_event` cursor, checks if `remaining <= 0` → `COMPLETED`
+   - **File-based mode**: Computes `files_this_round = dag.nodes_done * files_per_job`, advances `file_cursor`, always returns to `QUEUED` (the planner will discover no files remain)
+   - Aggregates `step_metrics` via `_aggregate_round_metrics()` (cumulative node counts, round metadata)
+   - Applies `production_steps` priority demotion when cumulative progress crosses a fraction threshold
+   - Updates workflow with new `current_round`, cursor, and metrics
+   - Transitions request to `QUEUED` for the next round
+
+3. **`_aggregate_round_metrics()`**: Merges per-round DAG stats into cumulative metrics (rounds_completed, cumulative_nodes_done/failed, last_round stats).
+
+4. **Point B consistency fix**: The second DAG-completion path (dag already completed from previous cycle) was missing the `output_manager.all_blocks_archived()` check — added for consistency with Point A.
+
+5. **Stale object re-fetch**: In Point A (poll path), the `dag` object is stale after `poll_dag()` updates the DB. Added a re-fetch of `dag` before calling `_handle_round_completion()` to ensure `dag.nodes_done` is current.
+
+### Design Decisions
+
+- **`getattr(request, "adaptive", False)` guard**: Uses `getattr` with default to maintain backward compatibility — requests without the `adaptive` field (e.g., pre-migration) are treated as non-adaptive.
+- **GEN completion check is authoritative; file-based is not**: For GEN workflows, total events are known upfront, so the handler can definitively determine completion. For file-based workflows, the total file count isn't known at this layer — the handler always returns to `QUEUED`, and the planner will produce an empty node list if no files remain.
+- **Priority demotion mirrors `_prepare_recovery()`**: Uses the same pattern as clean-stop recovery — consumes the first `production_steps` entry when progress crosses its fraction threshold.
+- **`work_units_per_round` setting added but not yet consumed**: The config value is defined (default 10) for use by the DAG planner in a follow-up commit.
+
+### Verification
+
+- 281/282 unit tests pass (1 pre-existing failure in `test_handle_active_processes_work_units` — unrelated, was failing before this change)
+- All 6 new tests pass:
+  - `test_round_completion_gen_returns_to_queued`: GEN with remaining events → QUEUED, cursors advanced
+  - `test_round_completion_gen_all_done`: GEN all events processed → COMPLETED
+  - `test_round_completion_file_based_returns_to_queued`: File-based → QUEUED, file_cursor advanced
+  - `test_non_adaptive_skips_round_handler`: Non-adaptive → COMPLETED directly (regression guard)
+  - `test_round_completion_priority_demotion`: production_steps priority consumed on threshold crossing
+  - `test_aggregate_round_metrics`: Unit test for cumulative metric aggregation
+
+### What's Next
+
+- **DAG planner cursor consumption**: Update `plan_production_dag()` to read `next_first_event`, `file_cursor`, and `work_units_per_round` when planning subsequent rounds
+- **Round-aware DAG naming**: Generate unique submit directories per round (e.g., `submit/workflow/round_001/`)
+- **Fix pre-existing `test_handle_active_processes_work_units`**: Test's work unit dict structure doesn't match current manifest-based processing code
