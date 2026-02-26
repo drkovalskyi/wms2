@@ -2958,6 +2958,85 @@ This is the **lifecycle manager side only** — it advances progress offsets and
 
 ### What's Next
 
-- **DAG planner offset consumption**: Update `plan_production_dag()` to read `next_first_event`, `file_offset`, and `work_units_per_round` when planning subsequent rounds
-- **Round-aware DAG naming**: Generate unique submit directories per round (e.g., `submit/workflow/round_001/`)
+- ~~**DAG planner offset consumption**: Update `plan_production_dag()` to read `next_first_event`, `file_offset`, and `work_units_per_round` when planning subsequent rounds~~ → Done (see below)
+- ~~**Round-aware DAG naming**: Generate unique submit directories per round (e.g., `submit/workflow/round_001/`)~~ → Done (see below)
+- **Fix pre-existing `test_handle_active_processes_work_units`**: Test's work unit dict structure doesn't match current manifest-based processing code
+
+---
+
+## DAG Planner Offset Consumption for Multi-Round Adaptive Execution
+
+**Date**: 2026-02-26
+**Commit**: `bcee75d`
+
+### Context
+
+The round-completion handler (commit `58ab99b`) advances `next_first_event`, `file_offset`, and `current_round` on the workflow after each DAG completes, then transitions the request back to `QUEUED`. But when `plan_production_dag()` was called for the next round, it ignored these offsets — always planning from event 1 / file 0 and generating all remaining work in one DAG. This produced duplicate work on every round after the first.
+
+### What Was Built
+
+#### 1. DAG Planner: Adaptive offset consumption (`src/wms2/core/dag_planner.py`)
+
+**`plan_production_dag()`** — new `*, adaptive: bool = False` keyword parameter:
+- When adaptive, computes `max_jobs = settings.work_units_per_round * settings.jobs_per_work_unit` (default: 10 × 8 = 80 jobs per round)
+- Passes `max_jobs` to both `_plan_gen_nodes()` and `_plan_file_based_nodes()`
+- Round-aware submit directory: round 0 uses `submit_base_dir/<workflow_id>/`, round N uses `submit_base_dir/<workflow_id>/round_NNN/`
+- Skips processing block creation for `current_round > 0` (blocks are created once in round 0 and reused)
+- Log messages include round number
+
+**`_plan_gen_nodes()`** — new `*, max_jobs: int = 0` parameter:
+- Reads `workflow.next_first_event` (defaults to 1) to skip already-processed events
+- Computes `remaining_events = total_events - start_event + 1`; returns empty list when all events are done
+- Event range computation shifted: `first_event = start_event + i * events_per_job`
+- Applies `max_jobs` cap after the existing `max_files` cap
+
+**`_plan_file_based_nodes()`** — new `*, max_jobs: int = 0` parameter:
+- Slices `raw_files` by `workflow.file_offset` to skip files processed in prior rounds
+- Truncates file list to `max_jobs * files_per_job` when capped
+
+**`handle_pilot_completion()`** — new `*, adaptive: bool = False` parameter, forwarded to `plan_production_dag()`
+
+#### 2. Lifecycle Manager: Round-aware dispatch (`src/wms2/core/lifecycle_manager.py`)
+
+**`_handle_queued()`** — three-way branch replacing the previous urgent/pilot branch:
+- `current_round > 0`: Skip pilot, call `plan_production_dag(adaptive=True)` directly → ACTIVE
+- `urgent` (round 0): Call `plan_production_dag(adaptive=is_adaptive)` → ACTIVE
+- Default (round 0, non-urgent): Submit pilot → PILOT_RUNNING
+
+**`_handle_pilot_running()`** — passes `adaptive=getattr(request, 'adaptive', False)` to both `handle_pilot_completion()` and the fallback `plan_production_dag()` call
+
+#### 3. Tests
+
+**New file: `tests/unit/test_dag_planner.py`** — 5 unit tests:
+- `test_gen_nodes_uses_next_first_event`: `next_first_event=500_001` → nodes start at event 500,001
+- `test_gen_nodes_max_jobs_caps`: `max_jobs=6`, 10 remaining jobs → 6 nodes
+- `test_gen_nodes_all_done_returns_empty`: `next_first_event` past total → empty list
+- `test_file_based_skips_offset`: `file_offset=2`, 5 files → 3 files split
+- `test_file_based_max_jobs_caps`: `max_jobs=3` → 3 files processed
+
+**`tests/unit/test_lifecycle.py`** — 2 new tests:
+- `test_queued_round2_skips_pilot`: `current_round=1` → `plan_production_dag(adaptive=True)` called directly
+- `test_queued_round0_runs_pilot`: `current_round=0`, non-urgent → pilot submitted
+
+**`tests/integration/test_dag_planner.py`** — Updated `_make_workflow()` with `current_round=0`, `next_first_event=1`, `file_offset=0` defaults
+
+### Design Decisions
+
+- **`max_jobs` computed as `work_units_per_round * jobs_per_work_unit`**: This keeps the cap at the merge-group level — each round produces at most N work units, each containing M jobs. The planner generates exactly that many processing nodes, and `_plan_merge_groups()` groups them as before.
+- **Round 2+ always adaptive**: If a request reaches `current_round > 0`, it got there via the round-completion handler, which only fires for adaptive requests. So the planner unconditionally passes `adaptive=True`.
+- **Processing blocks created once**: Output management blocks represent the logical output datasets for the entire workflow. They're created in round 0 and reused across rounds — each round's completed work units feed into the same blocks.
+- **Round-aware submit dir**: Each round gets its own `round_NNN/` subdirectory to avoid DAG file collisions. Round 0 uses the base directory for backward compatibility.
+- **`getattr` defaults for offset fields**: Uses `getattr(workflow, "next_first_event", 1) or 1` to gracefully handle workflows created before the adaptive fields existed (they default to starting position).
+
+### Verification
+
+- 288/289 unit tests pass (1 pre-existing failure in `test_handle_active_processes_work_units` — unrelated)
+- All 7 new tests pass
+- All 3 integration tests pass
+- Manual trace confirmed: adaptive GEN round 0 (`next_first_event=1`) → capped nodes from event 1; round 1 (`next_first_event=800_001`) → remaining events only
+
+### What's Next
+
+- **End-to-end adaptive integration test**: Submit a multi-round adaptive GEN request through the full lifecycle (QUEUED → PILOT → ACTIVE → round complete → QUEUED → ACTIVE → COMPLETED)
+- **File-based completion detection**: The planner returns empty nodes when `file_offset` exceeds available files, but this raises `ValueError` — may need graceful completion path
 - **Fix pre-existing `test_handle_active_processes_work_units`**: Test's work unit dict structure doesn't match current manifest-based processing code
