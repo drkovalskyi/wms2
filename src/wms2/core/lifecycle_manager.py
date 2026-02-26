@@ -152,9 +152,18 @@ class RequestLifecycleManager:
                 await self.transition(request, RequestStatus.ACTIVE)
                 return
 
-        if request.urgent:
+        current_round = getattr(workflow, "current_round", 0) or 0
+        is_adaptive = getattr(request, "adaptive", False)
+
+        if current_round > 0:
+            # Round 2+: skip pilot, go straight to production (always adaptive)
+            await self.dag_planner.plan_production_dag(workflow, adaptive=True)
+            await self.transition(request, RequestStatus.ACTIVE)
+        elif request.urgent:
             # Skip pilot, go straight to production DAG
-            await self.dag_planner.plan_production_dag(workflow)
+            await self.dag_planner.plan_production_dag(
+                workflow, adaptive=is_adaptive,
+            )
             await self.transition(request, RequestStatus.ACTIVE)
         else:
             await self.dag_planner.submit_pilot(workflow)
@@ -174,14 +183,19 @@ class RequestLifecycleManager:
             workflow.pilot_cluster_id, workflow.pilot_schedd
         )
         if completed:
+            is_adaptive = getattr(request, "adaptive", False)
             report_path = os.path.join(
                 workflow.pilot_output_path or "", "pilot_metrics.json"
             )
             if os.path.exists(report_path):
-                await self.dag_planner.handle_pilot_completion(workflow, report_path)
+                await self.dag_planner.handle_pilot_completion(
+                    workflow, report_path, adaptive=is_adaptive,
+                )
             else:
                 # No pilot metrics — plan with defaults
-                await self.dag_planner.plan_production_dag(workflow)
+                await self.dag_planner.plan_production_dag(
+                    workflow, adaptive=is_adaptive,
+                )
             await self.transition(request, RequestStatus.ACTIVE)
 
     async def _handle_active(self, request):

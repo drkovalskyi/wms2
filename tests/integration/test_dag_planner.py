@@ -24,6 +24,9 @@ def _make_workflow(workflow_id=None):
     wf.config_data = {}
     wf.pilot_output_path = None
     wf.pilot_cluster_id = None
+    wf.current_round = 0
+    wf.next_first_event = 1
+    wf.file_offset = 0
     return wf
 
 

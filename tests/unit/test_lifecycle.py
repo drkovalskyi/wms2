@@ -709,6 +709,66 @@ async def test_round_completion_priority_demotion(mock_repository, mock_condor, 
     assert transition_call[1]["status"] == RequestStatus.QUEUED.value
 
 
+async def test_queued_round2_skips_pilot(mock_repository, mock_condor, settings):
+    """Round 2+ (current_round=1) → plan_production_dag called directly, no pilot."""
+    mock_dag_planner = AsyncMock()
+
+    workflow = _make_workflow(
+        current_round=1,
+        next_first_event=500_001,
+        file_offset=0,
+    )
+
+    mock_repository.count_active_dags.return_value = 0
+    request = make_request_row(status="queued", adaptive=True)
+    mock_repository.get_queued_requests.return_value = [request]
+    mock_repository.get_workflow_by_request.return_value = workflow
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_planner=mock_dag_planner,
+    )
+
+    await lm.evaluate_request(request)
+
+    # plan_production_dag called with adaptive=True, NOT submit_pilot
+    mock_dag_planner.plan_production_dag.assert_called_once_with(
+        workflow, adaptive=True,
+    )
+    mock_dag_planner.submit_pilot.assert_not_called()
+
+    # Request transitions to ACTIVE
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.ACTIVE.value
+
+
+async def test_queued_round0_runs_pilot(mock_repository, mock_condor, settings):
+    """Round 0, non-urgent → pilot submitted (existing behavior)."""
+    mock_dag_planner = AsyncMock()
+
+    workflow = _make_workflow(current_round=0)
+
+    mock_repository.count_active_dags.return_value = 0
+    request = make_request_row(status="queued", urgent=False)
+    mock_repository.get_queued_requests.return_value = [request]
+    mock_repository.get_workflow_by_request.return_value = workflow
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_planner=mock_dag_planner,
+    )
+
+    await lm.evaluate_request(request)
+
+    # submit_pilot called, NOT plan_production_dag
+    mock_dag_planner.submit_pilot.assert_called_once_with(workflow)
+    mock_dag_planner.plan_production_dag.assert_not_called()
+
+    # Request transitions to PILOT_RUNNING
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.PILOT_RUNNING.value
+
+
 async def test_aggregate_round_metrics():
     """Unit test for _aggregate_round_metrics()."""
     from wms2.core.lifecycle_manager import _aggregate_round_metrics

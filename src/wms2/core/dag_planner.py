@@ -150,7 +150,9 @@ class DAGPlanner:
         data = parse_pilot_report(path)
         return PilotMetrics.from_json(data)
 
-    async def handle_pilot_completion(self, workflow, report_path: str) -> Any:
+    async def handle_pilot_completion(
+        self, workflow, report_path: str, *, adaptive: bool = False,
+    ) -> Any:
         """Parse pilot metrics and proceed to production DAG planning.
 
         Pilot results are stored for reference but don't drive merge group
@@ -179,14 +181,23 @@ class DAGPlanner:
             workflow.id,
             step_metrics=pilot_data,
         )
-        return await self.plan_production_dag(workflow, metrics=metrics)
+        return await self.plan_production_dag(
+            workflow, metrics=metrics, adaptive=adaptive,
+        )
 
     # ── Production DAG ───────────────────────────────────────
 
     async def plan_production_dag(
-        self, workflow, metrics: PilotMetrics | None = None
+        self, workflow, metrics: PilotMetrics | None = None,
+        *, adaptive: bool = False,
     ) -> Any:
-        """Full pipeline: fetch files → split → merge groups → write DAG files → create DB row."""
+        """Full pipeline: fetch files → split → merge groups → write DAG files → create DB row.
+
+        When *adaptive* is True the planner caps each round to
+        ``settings.work_units_per_round * settings.jobs_per_work_unit`` jobs
+        and reads ``workflow.next_first_event`` / ``workflow.file_offset`` to
+        skip already-processed data.
+        """
         # 1. Resource parameters
         if metrics is None:
             metrics = PilotMetrics()  # defaults
@@ -194,11 +205,19 @@ class DAGPlanner:
         config = workflow.config_data or {}
         is_gen = config.get("_is_gen", False)
 
+        # Adaptive cap: limit the number of processing jobs per round
+        max_jobs = (
+            self.settings.work_units_per_round * self.settings.jobs_per_work_unit
+            if adaptive else 0
+        )
+
+        current_round = getattr(workflow, "current_round", 0) or 0
+
         if is_gen:
             # GEN workflow: no input files, create synthetic event-range nodes
-            nodes = self._plan_gen_nodes(workflow, config)
+            nodes = self._plan_gen_nodes(workflow, config, max_jobs=max_jobs)
         else:
-            nodes = await self._plan_file_based_nodes(workflow)
+            nodes = await self._plan_file_based_nodes(workflow, max_jobs=max_jobs)
 
         if not nodes:
             raise ValueError(
@@ -212,7 +231,12 @@ class DAGPlanner:
         )
 
         # 7. Generate DAG files on disk
-        submit_dir = os.path.join(self.settings.submit_base_dir, str(workflow.id))
+        # Round-aware submit directory for round 2+
+        base_submit_dir = os.path.join(self.settings.submit_base_dir, str(workflow.id))
+        if current_round > 0:
+            submit_dir = os.path.join(base_submit_dir, f"round_{current_round:03d}")
+        else:
+            submit_dir = base_submit_dir
         os.makedirs(submit_dir, exist_ok=True)
         executables = {
             "processing": self.settings.processing_executable,
@@ -274,8 +298,9 @@ class DAGPlanner:
             status=DAGStatus.READY.value,
         )
 
-        # 10. Create processing blocks for output management
-        if output_datasets:
+        # 10. Create processing blocks for output management (round 0 only —
+        #     subsequent rounds reuse existing blocks)
+        if output_datasets and current_round == 0:
             for i, ds in enumerate(output_datasets):
                 await self.db.create_processing_block(
                     workflow_id=workflow.id,
@@ -303,17 +328,42 @@ class DAGPlanner:
         )
 
         logger.info(
-            "Production DAG planned for workflow %s: %d groups, %d proc nodes, path=%s",
-            workflow.id, len(merge_groups), total_proc, dag_file_path,
+            "Production DAG planned for workflow %s (round %d): "
+            "%d groups, %d proc nodes, path=%s",
+            workflow.id, current_round, len(merge_groups), total_proc, dag_file_path,
         )
         return dag
 
-    async def _plan_file_based_nodes(self, workflow) -> list[DAGNodeSpec]:
-        """Fetch input files from DBS and split them into processing nodes."""
+    async def _plan_file_based_nodes(
+        self, workflow, *, max_jobs: int = 0,
+    ) -> list[DAGNodeSpec]:
+        """Fetch input files from DBS and split them into processing nodes.
+
+        For adaptive rounds, ``workflow.file_offset`` skips files processed
+        in prior rounds and ``max_jobs`` caps the number of jobs planned.
+        """
         limit = self.settings.max_input_files if self.settings.max_input_files > 0 else 0
         raw_files = await self.dbs.get_files(workflow.input_dataset, limit=limit)
         if not raw_files:
             return []
+
+        # Adaptive offset: skip files already processed in prior rounds
+        file_offset = getattr(workflow, "file_offset", 0) or 0
+        if file_offset > 0:
+            raw_files = raw_files[file_offset:]
+        if not raw_files:
+            return []
+
+        # Adaptive cap: limit files to max_jobs * files_per_job
+        if max_jobs > 0:
+            params = workflow.splitting_params or {}
+            files_per_job = (
+                params.get("files_per_job")
+                or params.get("FilesPerJob")
+                or 1
+            )
+            max_files_needed = max_jobs * files_per_job
+            raw_files = raw_files[:max_files_needed]
 
         lfns = [f["logical_file_name"] for f in raw_files]
         try:
@@ -338,11 +388,15 @@ class DAGPlanner:
         )
         return splitter.split(input_files)
 
-    def _plan_gen_nodes(self, workflow, config: dict) -> list[DAGNodeSpec]:
+    def _plan_gen_nodes(
+        self, workflow, config: dict, *, max_jobs: int = 0,
+    ) -> list[DAGNodeSpec]:
         """Create synthetic processing nodes for GEN workflows (no input files).
 
         Uses RequestNumEvents and EventsPerJob from the request to compute
-        the number of event-generation jobs needed.
+        the number of event-generation jobs needed.  For adaptive rounds,
+        ``workflow.next_first_event`` skips already-processed events and
+        ``max_jobs`` caps the batch size.
         """
         import math
 
@@ -355,16 +409,26 @@ class DAGPlanner:
             logger.warning("GEN workflow %s has no RequestNumEvents, using 1 node", workflow.id)
             total_events = events_per_job
 
-        num_jobs = math.ceil(total_events / events_per_job)
+        # Adaptive offset: skip events already processed in prior rounds
+        start_event = getattr(workflow, "next_first_event", 1) or 1
+        remaining_events = total_events - start_event + 1
+        if remaining_events <= 0:
+            return []
+
+        num_jobs = math.ceil(remaining_events / events_per_job)
 
         # Respect --max-files limit (reinterpreted as max jobs for GEN)
         if max_files > 0:
             num_jobs = min(num_jobs, max_files)
 
+        # Adaptive cap: limit batch size per round
+        if max_jobs > 0:
+            num_jobs = min(num_jobs, max_jobs)
+
         nodes: list[DAGNodeSpec] = []
         for i in range(num_jobs):
-            first_event = i * events_per_job + 1
-            last_event = min((i + 1) * events_per_job, total_events)
+            first_event = start_event + i * events_per_job
+            last_event = min(start_event + (i + 1) * events_per_job - 1, total_events)
             actual_events = last_event - first_event + 1
 
             # Create a synthetic InputFile so the rest of the pipeline works
@@ -385,8 +449,8 @@ class DAGPlanner:
             )
 
         logger.info(
-            "GEN workflow %s: %d nodes, %d events/job, %d total events",
-            workflow.id, num_jobs, events_per_job, total_events,
+            "GEN workflow %s: %d nodes, %d events/job, start_event=%d, total=%d",
+            workflow.id, num_jobs, events_per_job, start_event, total_events,
         )
         return nodes
 
