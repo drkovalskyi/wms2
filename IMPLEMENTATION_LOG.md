@@ -3105,3 +3105,65 @@ Three issues remained after DAG planner offset consumption (`bcee75d`):
 - **File-based adaptive integration test**: Similar to the GEN test but with file-based splitting and offset advancement
 - **Partial round handling**: What happens when a round's DAG completes with PARTIAL status during adaptive execution
 - **Production steps across rounds**: Verify priority demotion triggers correctly when progress crosses step thresholds
+
+---
+
+## Error Handling Specification — 2026-02-26
+
+**Spec Version**: 2.8.0 → 2.9.0
+
+### What Was Built
+
+Created `docs/error_handling.md` — a comprehensive error handling specification document that replaces the minimal failure-ratio classifier with a two-level error handling model.
+
+### Document Structure
+
+| Section | Content |
+|---|---|
+| §1 Overview | Two-level model summary, design principles |
+| §2 Level 1: Immediate | POST script + DAGMan RETRY mechanics, data collection (`{node_name}.post.json`), classification logic, ABORT-DAG-ON, merge group behavior |
+| §3 Level 2: Delayed | WMS2 Error Handler + rescue DAG, 20% failure threshold, max rescue attempts, adaptive round recovery flow |
+| §4 Request States | HELD state (new), FAILED state (manual only), kill and clone with output lifecycle |
+| §5 Workflow-Type Recovery | MC generation (offset advance, no gap tracking), input workflows (per-file state: not-yet-processed/attempted/processed/excluded) |
+| §6 Site Banning | Detection, two-level banning (per-workflow + system-wide), DB schema, DAG Planner integration |
+| §7 Clean Stop Interaction | Between-round and mid-round behavior, stop-rescues vs failure-rescues |
+| §8 Configuration | Error handler settings, POST script settings, per-request overrides (future) |
+| Appendix | Design decisions summary (EH-1 through EH-10) |
+
+### Spec Updates (`docs/spec.md`)
+
+1. **RequestStatus enum**: Added `HELD` state between ACTIVE and STOPPING
+2. **Section 4.1 component overview**: Updated Error Handler description to reflect new design
+3. **Section 4.2 Lifecycle Manager**:
+   - Added `_handle_held()` handler (no-op, waits for operator API calls)
+   - Added HELD to handler dispatch table and STATUS_TIMEOUTS (no timeout)
+   - Changed DAG FAILED path to route through PARTIAL/Error Handler (FAILED never set automatically)
+   - Updated `_handle_partial()` to call `handle_dag_completion()` instead of `handle_dag_partial_failure()`
+4. **Section 4.8 Error Handler**: Replaced three-tier classifier with 20% threshold model; references new doc
+5. **Section 6.1 Multi-Level Recovery**: Rewritten to reference `docs/error_handling.md`; updated level descriptions
+6. **Section 6.4 POST Script Design**: Updated sketch to show `post.json` side file collection, `UNLESS-EXIT`/`ABORT-DAG-ON` codes, and `classify_and_collect.py` call
+7. **Workflow.next_first_event comment**: Added clarification about advancing past all planned events
+8. **DD-14**: New design decision documenting HELD state and two-level error model rationale
+9. **Version bump**: 2.8.0 → 2.9.0
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Two-level model (not three) | Level 2 from spec (DAG-wide HTCondor feature) is aspirational. Practical model: POST+RETRY and WMS2+rescue. |
+| HELD replaces review + abort | Single operator-attention state. FAILED is manual only — prevents premature data loss from transient issues. |
+| 20% per-round threshold | Simple, configurable. Replaces three-tier 5%/30% split. |
+| Rescue first, then next round | Rescue handles transient issues. Next round only after rescue exhausted. |
+| No gap tracking for MC | Event offset advances past all planned events. 64-bit space, gaps are harmless. |
+| Per-file state tracking | Four states for input files. Attempted files deferred until fresh files exhausted. |
+| Two-level site banning | Per-workflow catches workflow-specific issues. Promotion to system-wide on N independent bans. |
+| POST script writes JSON side files | Bridge between Level 1 (per-node) and Level 2 (WMS2 aggregate). No per-job tracking in WMS2. |
+
+### Verification
+
+- Document is internally consistent and does not contradict `docs/spec.md`
+- All cross-references to spec sections are correct
+- HELD state added to RequestStatus enum, Lifecycle Manager dispatch, and STATUS_TIMEOUTS
+- Error Handler section updated to match new threshold model
+- DD-14 added to Design Decisions (Section 16)
+- POST script sketch updated with UNLESS-EXIT/ABORT-DAG-ON codes and side file collection

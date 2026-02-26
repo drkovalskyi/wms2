@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.8.0 |
+| **Spec Version** | 2.9.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-25 |
+| **Date** | 2026-02-26 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -263,6 +263,7 @@ class RequestStatus(str, Enum):
     QUEUED = "queued"              # In admission queue, waiting for capacity
     PLANNING = "planning"          # DAG Planner building production DAG
     ACTIVE = "active"              # DAG submitted to DAGMan
+    HELD = "held"                  # Failures exceed threshold, awaiting operator (see docs/error_handling.md §4.1)
     STOPPING = "stopping"          # Clean stop in progress (condor_rm issued)
     RESUBMITTING = "resubmitting"  # Recovery DAG prepared, re-entering queue
     COMPLETED = "completed"        # All nodes succeeded, outputs registered
@@ -326,6 +327,8 @@ class Workflow(BaseModel):
     # Multi-round tracking (see docs/processing.md §6.5)
     current_round: int = 0           # Current processing round (0 = pilot)
     next_first_event: int = 1        # GEN: next event number to produce
+                                     # Advances past ALL planned events per round, including
+                                     # failed WUs — no gap tracking (see docs/error_handling.md §5.1)
     file_offset: int = 0             # File-based: number of input files already processed
 
     # DAG Reference (set after DAG submission)
@@ -789,9 +792,12 @@ CREATE INDEX idx_processing_blocks_status ON processing_blocks(status);
 │     - Sync with CRIC                                            │
 │                                                                 │
 │  8. Error Handler (workflow-level only)                          │
-│     - Classify DAG-level failures                               │
-│     - Decide: submit rescue DAG, flag for review, or abort      │
+│     - Read POST script side files after DAG completion           │
+│     - Aggregate failures by work unit and site                   │
+│     - Decide: rescue DAG (<20% failures) or HELD (>=20%)        │
+│     - Manage site bans (per-workflow and system-wide)            │
 │     - Per-node retry handled by DAGMan RETRY + POST scripts     │
+│     - See docs/error_handling.md for full design                 │
 │                                                                 │
 │  9. Metrics Collector                                           │
 │     - Workflow/DAG lifecycle metrics                             │
@@ -835,6 +841,7 @@ class RequestLifecycleManager:
         RequestStatus.QUEUED: 86400 * 7,        # 7 days in admission queue
         RequestStatus.PLANNING: 3600,           # 1 hour for DAG planning
         RequestStatus.ACTIVE: 86400 * 30,       # 30 days for DAG execution
+        RequestStatus.HELD: None,               # No timeout — waits for operator action
         RequestStatus.STOPPING: 3600,           # 1 hour for clean stop
         RequestStatus.RESUBMITTING: 600,        # 10 minutes to prepare recovery
     }
@@ -870,6 +877,7 @@ class RequestLifecycleManager:
             RequestStatus.SUBMITTED: self._handle_submitted,
             RequestStatus.QUEUED: self._handle_queued,
             RequestStatus.ACTIVE: self._handle_active,
+            RequestStatus.HELD: self._handle_held,
             RequestStatus.STOPPING: self._handle_stopping,
             RequestStatus.RESUBMITTING: self._handle_resubmitting,
             RequestStatus.PARTIAL: self._handle_partial,
@@ -944,7 +952,9 @@ class RequestLifecycleManager:
             elif result.status == DAGStatus.PARTIAL:
                 await self.transition(request, RequestStatus.PARTIAL)
             elif result.status == DAGStatus.FAILED:
-                await self.transition(request, RequestStatus.FAILED)
+                # Total DAG failure also goes through Error Handler (PARTIAL path).
+                # FAILED is never set automatically — see docs/error_handling.md §4.2
+                await self.transition(request, RequestStatus.PARTIAL)
 
         # Process blocks every cycle — retry failed Rucio calls
         await self.output_manager.process_blocks_for_workflow(workflow.id)
@@ -983,10 +993,20 @@ class RequestLifecycleManager:
         await self.transition(request, RequestStatus.QUEUED)
 
     async def _handle_partial(self, request: Request):
-        """Handle partial DAG completion — delegate to Error Handler."""
+        """Handle partial DAG completion — delegate to Error Handler.
+        Error Handler reads POST script side files, aggregates failures,
+        and either submits a rescue DAG or transitions to HELD.
+        See docs/error_handling.md for the full decision logic."""
         workflow = await self.db.get_workflow_by_request(request.request_name)
         dag = await self.db.get_dag(workflow.dag_id)
-        await self.error_handler.handle_dag_partial_failure(dag)
+        await self.error_handler.handle_dag_completion(dag, request)
+
+    async def _handle_held(self, request: Request):
+        """HELD requests wait for operator action. No automatic processing.
+        Operators can: release (→ QUEUED), fail (→ FAILED), or restart
+        (kill and clone with processing_version + 1).
+        See docs/error_handling.md §4.1 for available operator actions."""
+        pass  # Nothing to do — HELD requests wait for operator API calls
 
     # ── Clean Stop ──────────────────────────────────────────────
 
@@ -2172,40 +2192,42 @@ class OutputManager:
 
 ### 4.8 Error Handler (Workflow-Level)
 
-Per-node retries are handled by DAGMan's `RETRY` directive combined with a WMS2-provided POST script. The POST script inspects exit codes, classifies errors, implements cool-off delays, and returns an appropriate exit code to DAGMan. This script is part of the sandbox and can be iterated independently.
+> **Detailed specification**: See [`docs/error_handling.md`](error_handling.md) for the complete error handling design including POST script data collection, classification logic, site banning, and workflow-type-specific recovery.
+
+Per-node retries are handled by DAGMan's `RETRY` directive combined with a WMS2-provided POST script that writes `{node_name}.post.json` side files. When a DAG terminates with failures, the Error Handler reads these side files, aggregates failures by work unit and by site, and applies a per-round threshold to decide the next action.
 
 ```python
 class ErrorHandler:
-    async def handle_dag_partial_failure(self, dag):
-        failure_ratio = dag.nodes_failed / max(dag.total_nodes, 1)
-        if failure_ratio < 0.05:
-            logger.info(f"DAG {dag.id}: {failure_ratio:.1%} failed, submitting rescue")
-            await self._submit_rescue_dag(dag)
-        elif failure_ratio < 0.30:
-            logger.warning(f"DAG {dag.id}: {failure_ratio:.1%} failed, needs review")
-            await self._flag_for_review(dag)
-            await self.db.update_request_by_dag(dag.id, status=RequestStatus.PARTIAL)
-        else:
-            logger.error(f"DAG {dag.id}: {failure_ratio:.1%} failed, aborting")
-            await self._abort_workflow(dag)
+    ERROR_HOLD_THRESHOLD = 0.20       # Configurable
+    MAX_RESCUE_ATTEMPTS = 3           # Configurable
 
-    async def handle_dag_failure(self, dag):
-        await self._abort_workflow(dag)
+    async def handle_dag_completion(self, dag, request):
+        """Called when a DAG terminates with failures (PARTIAL status)."""
+        post_data = self._read_post_data(dag.submit_dir)
+        failed_wus = self._count_failed_work_units(dag, post_data)
+        failure_ratio = failed_wus / max(dag.total_work_units, 1)
+        rescue_count = await self._get_failure_rescue_count(dag)
+
+        if failure_ratio < self.ERROR_HOLD_THRESHOLD and rescue_count < self.MAX_RESCUE_ATTEMPTS:
+            logger.info(f"DAG {dag.id}: {failure_ratio:.1%} WU failures, submitting rescue")
+            await self._analyze_site_failures(dag, post_data)  # May create site bans
+            await self._submit_rescue_dag(dag)
+        else:
+            reason = (f"failure_ratio={failure_ratio:.1%}" if failure_ratio >= self.ERROR_HOLD_THRESHOLD
+                      else f"rescue_count={rescue_count}>={self.MAX_RESCUE_ATTEMPTS}")
+            logger.warning(f"DAG {dag.id}: holding request — {reason}")
+            await self.db.update_request(request.request_name, status=RequestStatus.HELD)
 
     async def _submit_rescue_dag(self, dag):
         dagman_cluster_id, schedd_name = await self.condor_adapter.submit_dag(
             dag_file=dag.dag_file_path, submit_dir=dag.submit_dir,
         )
+        rescue_num = await self._next_rescue_number(dag)
         await self.db.update_dag(dag.id,
             dagman_cluster_id=dagman_cluster_id, schedd_name=schedd_name,
-            rescue_dag_path=f"{dag.dag_file_path}.rescue001",
+            rescue_dag_path=f"{dag.dag_file_path}.rescue{rescue_num:03d}",
             status=DAGStatus.SUBMITTED, submitted_at=datetime.utcnow(),
         )
-
-    async def _abort_workflow(self, dag):
-        await self.db.update_dag(dag.id, status=DAGStatus.FAILED)
-        await self.db.update_workflow(dag.workflow_id, status=WorkflowStatus.FAILED)
-        await self.db.update_request_by_dag(dag.id, status=RequestStatus.FAILED)
 ```
 
 ### 4.9 Site Manager
@@ -2414,24 +2436,30 @@ Partial production steps (Section 6.2.1) are natural re-optimization points: aft
 
 ### 6.1 Multi-Level Recovery
 
-**Level 1: Per-Node (owned by DAGMan + POST script)**
+> **Detailed specification**: See [`docs/error_handling.md`](error_handling.md) for the comprehensive error handling design — POST script data collection, classification logic, failure thresholds, HELD state mechanics, workflow-type-specific recovery, and site banning.
+
+**Level 1: Immediate (owned by POST script + DAGMan RETRY)**
 - DAGMan's `RETRY` directive retries failed nodes automatically
 - WMS2-provided POST script runs after each node completion/failure
-- POST script classifies errors, implements cool-off delays, controls retry
+- POST script classifies errors (transient / permanent / data / infrastructure)
+- POST script writes `{node_name}.post.json` side files for Level 2 consumption
+- Implements cool-off delays, parameter adjustment (e.g., memory increase), and retry/stop decisions
+- `UNLESS-EXIT` code stops retries for permanent failures; `ABORT-DAG-ON` kills the entire DAG for catastrophic errors
 - Lives in the sandbox, can be iterated independently
 
-**Level 2: DAG-wide (owned by HTCondor — feature requirement)**
-- Detect correlated failure patterns across nodes
-- Make DAG-level decisions: halt submission, avoid specific sites
-- Cannot be implemented in individual POST scripts
-- See Section 12 for HTCondor feature requirements
+**Level 2: Delayed (owned by WMS2 Error Handler + rescue DAG)**
+- When a DAG terminates with failures, WMS2 reads POST script side files and aggregates failure data
+- Per-round failure ratio determines action: below 20% → rescue DAG; 20% or above → HELD for operator
+- Max rescue attempts (default 3) as separate guard against endless loops
+- HELD state requires operator decision: release, release with modifications, fail, or kill and clone
+- FAILED is manual only — never set automatically by the Error Handler
+- Also handles site banning (per-workflow and system-wide) and workflow-type-specific recovery
 
-**Level 3: Workflow-level (owned by Request Lifecycle Manager)**
-- The Lifecycle Manager owns all workflow-level recovery decisions
-- When a DAG terminates with failures, it decides: rescue, review, or abort
-- Based on failure ratio thresholds (< 5% auto-rescue, 5–30% review, > 30% abort)
-- Rescue DAGs automatically skip completed nodes
-- Also handles clean stop recovery and catastrophic failure recovery
+**DAG-wide correlated failure detection (HTCondor feature requirement)**
+- Detect correlated failure patterns across nodes during DAG execution
+- Make DAG-level decisions: halt submission, avoid specific sites
+- Cannot be implemented in individual POST scripts (no cross-node visibility)
+- See Section 12 for HTCondor feature requirements
 
 ### 6.2 Clean Stop and Recovery Flow
 
@@ -2551,34 +2579,47 @@ Lifecycle Manager: handle_catastrophic_failure()
 
 ### 6.4 POST Script Design
 
+> **Detailed specification**: See [`docs/error_handling.md`](error_handling.md) Sections 2.2–2.4 for the complete POST script design including data collection, `{node_name}.post.json` side file format, error classification logic, and parameter adjustment for retries.
+
+The POST script runs on the submit host after each job attempt. It collects data from the FJR, HTCondor classads, and job logs, classifies the error, writes a `{node_name}.post.json` side file, and exits with a code that controls DAGMan's RETRY behavior:
+
 ```bash
 #!/bin/bash
 # post_script.sh — per-node error handler
-# Arguments: $1 = node_name, $2 = exit_code ($RETURN from DAGMan)
+# Called by DAGMan: SCRIPT POST node_name post_script.sh $JOB $RETURN $RETRY $MAX_RETRIES
+# Writes: {submit_dir}/{node_name}.post.json (consumed by WMS2 Error Handler at Level 2)
 
 NODE_NAME=$1
 EXIT_CODE=$2
+RETRY_NUM=$3
+MAX_RETRIES=$4
+UNLESS_EXIT=42    # Permanent failure — stop retrying
+ABORT_EXIT=43     # Catastrophic — kill entire DAG
 
 if [ "$EXIT_CODE" -eq 0 ]; then
-    exit 0  # Success
+    # Collect success metrics into post.json for WMS2
+    python3 collect_post_data.py "$NODE_NAME" "$EXIT_CODE" --final
+    exit 0
 fi
 
-ERROR_CLASS=$(python3 classify_error.py $NODE_NAME $EXIT_CODE)
+# Classify error and write post.json (includes FJR data, classads, log tail)
+CLASSIFICATION=$(python3 classify_and_collect.py "$NODE_NAME" "$EXIT_CODE" "$RETRY_NUM")
 
-case $ERROR_CLASS in
+case $CLASSIFICATION in
     "transient")
-        RETRY_COUNT=$(cat ${NODE_NAME}.retry_count 2>/dev/null || echo 0)
-        SLEEP_TIME=$((60 * (2 ** RETRY_COUNT)))
-        echo $((RETRY_COUNT + 1)) > ${NODE_NAME}.retry_count
+        SLEEP_TIME=$((60 * (2 ** RETRY_NUM)))
         sleep $SLEEP_TIME
         exit 1  # Failed, eligible for RETRY
         ;;
-    "permanent")
-        exit 2  # Failed, do not retry (UNLESS-EXIT 2)
+    "permanent"|"data")
+        exit $UNLESS_EXIT  # Stop retrying this node
         ;;
-    "site_issue")
+    "infrastructure")
         sleep 300
-        exit 1  # Retry, may land on different site
+        exit 1  # Retry — may land on different site
+        ;;
+    "catastrophic")
+        exit $ABORT_EXIT  # Kill entire DAG (ABORT-DAG-ON)
         ;;
 esac
 ```
@@ -3167,6 +3208,16 @@ measured data for the bulk of its processing.
 **Why**: CMS sites advertise resources as memory per core with a practical minimum. Requesting more than the minimum narrows the pool of matching sites, creating a tradeoff between accurate memory sizing and scheduling breadth. The two-knob window makes this tradeoff explicit and tunable. The 20% percentage-based margin (rather than fixed MB) scales naturally with job size — it provides proportionally more headroom for memory-heavy jobs and avoids being either too generous for small jobs (512 MB on a 2 GB job is 25%) or too thin for large jobs (512 MB on a 20 GB job is 2.5%). The margin accounts for memory leak accumulation (probes process fewer events than production), event-to-event RSS variation, and page cache pressure under concurrent load.
 
 **Rejected alternative**: *Fixed MB headroom* (512 MB above measured peak). Doesn't scale — too large for small jobs, too small for large ones. Also conflated two sources of uncertainty (measurement noise vs. extrapolation error) into a single buffer.
+
+### DD-14: HELD state and two-level error handling model
+
+**Decision**: Replace the three-tier error handling model (< 5% auto-rescue, 5–30% review, > 30% abort) with a two-level model. A single configurable threshold (default 20%) separates automatic rescue from operator attention. Add HELD as a new request status for the operator-attention case. FAILED is never set automatically — only by explicit operator or requestor action. Full design in [`docs/error_handling.md`](error_handling.md).
+
+**Why**: The three-tier model had two operator-attention states ("review" and "abort") with no clear distinction in operator actions. A single HELD state is simpler and equally capable — the operator can release (resume), fail (terminal), or kill-and-clone (restart). Making FAILED manual-only prevents premature data loss from transient infrastructure issues (a temporary site outage could cause 100% round failure on a valid request).
+
+**Rejected alternatives**:
+- *Three-tier thresholds (5%/30%)*: Two operator-attention states with no meaningful difference in available actions. Added complexity for no benefit.
+- *Automatic FAILED on high failure ratio*: Dangerous — transient infrastructure issues could trigger automatic failure and output invalidation on requests that would succeed after the issue resolves.
 
 ---
 
