@@ -59,7 +59,7 @@ async def get_workflow(
         "step_metrics": row.step_metrics,
         "current_round": row.current_round,
         "next_first_event": row.next_first_event,
-        "file_cursor": row.file_cursor,
+        "file_offset": row.file_offset,
         "dag_id": str(row.dag_id) if row.dag_id else None,
         "category_throttles": row.category_throttles,
         "status": row.status,

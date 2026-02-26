@@ -326,7 +326,7 @@ class Workflow(BaseModel):
     # Multi-round tracking (see docs/processing.md §6.5)
     current_round: int = 0           # Current processing round (0 = pilot)
     next_first_event: int = 1        # GEN: next event number to produce
-    file_cursor: int = 0             # File-based: index of next unprocessed file
+    file_offset: int = 0             # File-based: number of input files already processed
 
     # DAG Reference (set after DAG submission)
     dag_id: Optional[UUID]
@@ -619,7 +619,7 @@ CREATE TABLE workflows (
     step_metrics JSONB,
     current_round INTEGER DEFAULT 0,
     next_first_event INTEGER DEFAULT 1,
-    file_cursor INTEGER DEFAULT 0,
+    file_offset INTEGER DEFAULT 0,
     dag_id UUID,
     category_throttles JSONB DEFAULT '{"Processing": 5000, "Merge": 100, "Cleanup": 50}',
     total_nodes INTEGER DEFAULT 0,

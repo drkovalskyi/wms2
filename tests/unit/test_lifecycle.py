@@ -485,7 +485,7 @@ async def test_handle_queued_rescue_dag_submits(lifecycle_manager, mock_reposito
 
 
 async def test_round_completion_gen_returns_to_queued(mock_repository, mock_condor, settings):
-    """Adaptive GEN request with remaining events → QUEUED, cursors advanced."""
+    """Adaptive GEN request with remaining events → QUEUED, offsets advanced."""
     from wms2.core.dag_monitor import DAGPollResult
     from wms2.core.lifecycle_manager import RequestLifecycleManager
 
@@ -496,7 +496,7 @@ async def test_round_completion_gen_returns_to_queued(mock_repository, mock_cond
         config_data={"_is_gen": True, "request_num_events": 1_000_000},
         splitting_params={"events_per_job": 100_000},
         next_first_event=1,
-        file_cursor=0,
+        file_offset=0,
         current_round=0,
         step_metrics=None,
         adaptive=True,
@@ -519,7 +519,7 @@ async def test_round_completion_gen_returns_to_queued(mock_repository, mock_cond
     request = make_request_row(status="active", adaptive=True)
     await lm.evaluate_request(request)
 
-    # Workflow updated with new round and cursor
+    # Workflow updated with new round and offset
     wf_update = mock_repository.update_workflow.call_args
     assert wf_update[1]["current_round"] == 1
     assert wf_update[1]["next_first_event"] == 800_001  # 1 + 8*100_000
@@ -543,7 +543,7 @@ async def test_round_completion_gen_all_done(mock_repository, mock_condor, setti
         config_data={"_is_gen": True, "request_num_events": 1_000_000},
         splitting_params={"events_per_job": 100_000},
         next_first_event=900_001,
-        file_cursor=0,
+        file_offset=0,
         current_round=9,
         step_metrics={"rounds_completed": 9, "cumulative_nodes_done": 72},
         adaptive=True,
@@ -579,7 +579,7 @@ async def test_round_completion_gen_all_done(mock_repository, mock_condor, setti
 async def test_round_completion_file_based_returns_to_queued(
     mock_repository, mock_condor, settings
 ):
-    """Adaptive file-based request → QUEUED, file_cursor advanced."""
+    """Adaptive file-based request → QUEUED, file_offset advanced."""
     from wms2.core.dag_monitor import DAGPollResult
     from wms2.core.lifecycle_manager import RequestLifecycleManager
 
@@ -589,7 +589,7 @@ async def test_round_completion_file_based_returns_to_queued(
         config_data={"_is_gen": False},
         splitting_params={"files_per_job": 2},
         next_first_event=1,
-        file_cursor=0,
+        file_offset=0,
         current_round=0,
         step_metrics=None,
         adaptive=True,
@@ -612,10 +612,10 @@ async def test_round_completion_file_based_returns_to_queued(
     request = make_request_row(status="active", adaptive=True)
     await lm.evaluate_request(request)
 
-    # Workflow updated with file_cursor (not next_first_event)
+    # Workflow updated with file_offset (not next_first_event)
     wf_update = mock_repository.update_workflow.call_args
     assert wf_update[1]["current_round"] == 1
-    assert wf_update[1]["file_cursor"] == 10  # 5 jobs * 2 files_per_job
+    assert wf_update[1]["file_offset"] == 10  # 5 jobs * 2 files_per_job
     assert "next_first_event" not in wf_update[1]
 
     # Request transitions to QUEUED
@@ -661,7 +661,7 @@ async def test_round_completion_priority_demotion(mock_repository, mock_condor, 
     from wms2.core.dag_monitor import DAGPollResult
     from wms2.core.lifecycle_manager import RequestLifecycleManager
 
-    # 1000 events, 100 per job, 5 done this round → cursor moves to 501
+    # 1000 events, 100 per job, 5 done this round → offset moves to 501
     # progress = 500/1000 = 0.5, matches first step's fraction
     dag = _make_dag(status="submitted", nodes_done=5, nodes_failed=0)
     workflow = _make_workflow(
@@ -669,7 +669,7 @@ async def test_round_completion_priority_demotion(mock_repository, mock_condor, 
         config_data={"_is_gen": True, "request_num_events": 1000},
         splitting_params={"events_per_job": 100},
         next_first_event=1,
-        file_cursor=0,
+        file_offset=0,
         current_round=0,
         step_metrics=None,
         adaptive=True,

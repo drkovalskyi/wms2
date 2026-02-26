@@ -43,7 +43,7 @@ class Workflow(BaseModel):
     step_metrics: Optional[PilotMetrics] = None
     current_round: int = 0
     next_first_event: int = 1
-    file_cursor: int = 0
+    file_offset: int = 0
     dag_id: Optional[UUID] = None
     category_throttles: dict[str, int] = {
         "Processing": 5000,

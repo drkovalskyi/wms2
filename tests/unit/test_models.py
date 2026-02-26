@@ -112,4 +112,4 @@ def test_workflow_round_tracking_defaults():
     assert wf.step_metrics is None
     assert wf.current_round == 0
     assert wf.next_first_event == 1
-    assert wf.file_cursor == 0
+    assert wf.file_offset == 0

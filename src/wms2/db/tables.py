@@ -61,7 +61,7 @@ class WorkflowRow(Base):
     step_metrics: Mapped[dict | None] = mapped_column(JSONB)
     current_round: Mapped[int] = mapped_column(Integer, default=0)
     next_first_event: Mapped[int] = mapped_column(Integer, default=1)
-    file_cursor: Mapped[int] = mapped_column(Integer, default=0)
+    file_offset: Mapped[int] = mapped_column(Integer, default=0)
     dag_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     category_throttles: Mapped[dict] = mapped_column(
         JSONB, default=lambda: {"Processing": 5000, "Merge": 100, "Cleanup": 50}

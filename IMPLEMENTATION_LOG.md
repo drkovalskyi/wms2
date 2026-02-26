@@ -2877,11 +2877,11 @@ Propagated new fields from spec v2.8.0 (multi-round adaptive lifecycle) into the
 | File | Change |
 |---|---|
 | `src/wms2/models/request.py` | Added `adaptive: bool = True` to `RequestCreate`, `RequestUpdate`, `Request` |
-| `src/wms2/models/workflow.py` | Renamed `pilot_metrics` → `step_metrics`, added `current_round`, `next_first_event`, `file_cursor` |
+| `src/wms2/models/workflow.py` | Renamed `pilot_metrics` → `step_metrics`, added `current_round`, `next_first_event`, `file_offset` |
 | `src/wms2/db/tables.py` | Added `adaptive` to `RequestRow`, renamed + added fields to `WorkflowRow` |
 | `src/wms2/db/migrations/versions/002_adaptive_round_fields.py` | New Alembic migration (add_column, alter_column rename, with downgrade) |
 | `src/wms2/core/dag_planner.py` | Renamed `pilot_metrics=` → `step_metrics=` in `update_workflow()` call |
-| `src/wms2/api/workflows.py` | Renamed field in serialization, added `current_round`, `next_first_event`, `file_cursor` |
+| `src/wms2/api/workflows.py` | Renamed field in serialization, added `current_round`, `next_first_event`, `file_offset` |
 | `tests/unit/test_models.py` | Added 3 tests: adaptive default/override, workflow round-tracking defaults |
 
 ### Design Decisions
@@ -2894,7 +2894,7 @@ Propagated new fields from spec v2.8.0 (multi-round adaptive lifecycle) into the
 ### Verification
 
 - Alembic migration 002 applied successfully against local DB
-- DB schema verified: `requests.adaptive` (boolean, default true), `workflows.step_metrics` (renamed), `workflows.current_round` (int, default 0), `workflows.next_first_event` (int, default 1), `workflows.file_cursor` (int, default 0)
+- DB schema verified: `requests.adaptive` (boolean, default true), `workflows.step_metrics` (renamed), `workflows.current_round` (int, default 0), `workflows.next_first_event` (int, default 1), `workflows.file_offset` (int, default 0)
 - 275/276 unit tests pass (1 pre-existing failure in `test_handle_active_processes_work_units`)
 - 8/8 integration tests pass
 - No stale `pilot_metrics` references in `src/` outside of file-on-disk names (pilot_runner.py, dag_planner HTCondor submit templates) and migration files
@@ -2908,7 +2908,7 @@ Propagated new fields from spec v2.8.0 (multi-round adaptive lifecycle) into the
 
 Implemented the lifecycle manager logic that runs when an adaptive request's DAG completes. Previously, DAG completion always transitioned the request to `COMPLETED`. Now, for adaptive requests (`request.adaptive = True`), the round-completion handler checks whether more work remains and either completes the request or returns it to `QUEUED` for the next round.
 
-This is the **lifecycle manager side only** — it advances cursors and aggregates metrics. The DAG planner does not yet consume these cursors when planning (that's the next step).
+This is the **lifecycle manager side only** — it advances progress offsets and aggregates metrics. The DAG planner does not yet consume these offsets when planning (that's the next step).
 
 ### Changes
 
@@ -2925,11 +2925,11 @@ This is the **lifecycle manager side only** — it advances cursors and aggregat
 
 2. **`_handle_round_completion()`**:
    - Reads workflow's `config_data._is_gen` to determine GEN vs file-based mode
-   - **GEN mode**: Computes `events_this_round = dag.nodes_done * events_per_job`, advances `next_first_event` cursor, checks if `remaining <= 0` → `COMPLETED`
-   - **File-based mode**: Computes `files_this_round = dag.nodes_done * files_per_job`, advances `file_cursor`, always returns to `QUEUED` (the planner will discover no files remain)
+   - **GEN mode**: Computes `events_this_round = dag.nodes_done * events_per_job`, advances `next_first_event` offset, checks if `remaining <= 0` → `COMPLETED`
+   - **File-based mode**: Computes `files_this_round = dag.nodes_done * files_per_job`, advances `file_offset`, always returns to `QUEUED` (the planner will discover no files remain)
    - Aggregates `step_metrics` via `_aggregate_round_metrics()` (cumulative node counts, round metadata)
    - Applies `production_steps` priority demotion when cumulative progress crosses a fraction threshold
-   - Updates workflow with new `current_round`, cursor, and metrics
+   - Updates workflow with new `current_round`, offsets, and metrics
    - Transitions request to `QUEUED` for the next round
 
 3. **`_aggregate_round_metrics()`**: Merges per-round DAG stats into cumulative metrics (rounds_completed, cumulative_nodes_done/failed, last_round stats).
@@ -2949,15 +2949,15 @@ This is the **lifecycle manager side only** — it advances cursors and aggregat
 
 - 281/282 unit tests pass (1 pre-existing failure in `test_handle_active_processes_work_units` — unrelated, was failing before this change)
 - All 6 new tests pass:
-  - `test_round_completion_gen_returns_to_queued`: GEN with remaining events → QUEUED, cursors advanced
+  - `test_round_completion_gen_returns_to_queued`: GEN with remaining events → QUEUED, offsets advanced
   - `test_round_completion_gen_all_done`: GEN all events processed → COMPLETED
-  - `test_round_completion_file_based_returns_to_queued`: File-based → QUEUED, file_cursor advanced
+  - `test_round_completion_file_based_returns_to_queued`: File-based → QUEUED, file_offset advanced
   - `test_non_adaptive_skips_round_handler`: Non-adaptive → COMPLETED directly (regression guard)
   - `test_round_completion_priority_demotion`: production_steps priority consumed on threshold crossing
   - `test_aggregate_round_metrics`: Unit test for cumulative metric aggregation
 
 ### What's Next
 
-- **DAG planner cursor consumption**: Update `plan_production_dag()` to read `next_first_event`, `file_cursor`, and `work_units_per_round` when planning subsequent rounds
+- **DAG planner offset consumption**: Update `plan_production_dag()` to read `next_first_event`, `file_offset`, and `work_units_per_round` when planning subsequent rounds
 - **Round-aware DAG naming**: Generate unique submit directories per round (e.g., `submit/workflow/round_001/`)
 - **Fix pre-existing `test_handle_active_processes_work_units`**: Test's work unit dict structure doesn't match current manifest-based processing code

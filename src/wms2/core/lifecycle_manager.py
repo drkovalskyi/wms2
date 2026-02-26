@@ -316,8 +316,8 @@ class RequestLifecycleManager:
     # ── Adaptive Round Completion ──────────────────────────────
 
     async def _handle_round_completion(self, request, workflow, dag):
-        """Handle completion of one adaptive round. Advance cursors, aggregate
-        metrics, and either complete the request or return it to the queue."""
+        """Handle completion of one adaptive round. Advance progress offsets,
+        aggregate metrics, and either complete the request or return it to the queue."""
         config = workflow.config_data or {}
         is_gen = config.get("_is_gen", False)
         params = workflow.splitting_params or {}
@@ -328,15 +328,15 @@ class RequestLifecycleManager:
                               or params.get("eventsPerJob") or 100_000)
             total_jobs = dag.nodes_done  # processing nodes that completed
             events_this_round = total_jobs * events_per_job
-            new_cursor = workflow.next_first_event + events_this_round
+            new_offset = workflow.next_first_event + events_this_round
             total_events = config.get("request_num_events", 0)
-            remaining = total_events - new_cursor + 1
+            remaining = total_events - new_offset + 1
         else:
             files_per_job = (params.get("files_per_job")
                              or params.get("FilesPerJob") or 1)
             total_jobs = dag.nodes_done
             files_this_round = total_jobs * files_per_job
-            new_cursor = workflow.file_cursor + files_this_round
+            new_offset = workflow.file_offset + files_this_round
             remaining = -1  # file-based: check via DBS in planner
 
         # Aggregate step_metrics from completed DAG
@@ -346,15 +346,15 @@ class RequestLifecycleManager:
 
         new_round = workflow.current_round + 1
 
-        # Update workflow with new cursors and round
+        # Update workflow with new offsets and round
         update_kwargs = {
             "current_round": new_round,
             "step_metrics": new_metrics,
         }
         if is_gen:
-            update_kwargs["next_first_event"] = new_cursor
+            update_kwargs["next_first_event"] = new_offset
         else:
-            update_kwargs["file_cursor"] = new_cursor
+            update_kwargs["file_offset"] = new_offset
 
         await self.db.update_workflow(workflow.id, **update_kwargs)
 
@@ -367,7 +367,7 @@ class RequestLifecycleManager:
         steps = request.production_steps or []
         if steps:
             if is_gen and total_events > 0:
-                progress = (new_cursor - 1) / total_events
+                progress = (new_offset - 1) / total_events
                 step = steps[0]
                 fraction = step["fraction"] if isinstance(step, dict) else step.fraction
                 if progress >= fraction:
@@ -385,10 +385,10 @@ class RequestLifecycleManager:
 
         logger.info(
             "Request %s: round %d complete, advancing to round %d "
-            "(%s cursor: %s, remaining: %s)",
+            "(%s offset: %s, remaining: %s)",
             request.request_name, workflow.current_round, new_round,
             "event" if is_gen else "file",
-            new_cursor,
+            new_offset,
             remaining if remaining >= 0 else "unknown",
         )
 

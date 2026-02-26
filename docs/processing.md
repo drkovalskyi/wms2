@@ -606,17 +606,17 @@ The DAG Planner reads `next_first_event` and `RequestNumEvents` to determine rem
 
 The workflow row tracks which input files have been processed. Two approaches:
 
-1. **Cursor-based**: Input files are ordered deterministically (e.g., by LFN). Track the index of the next unprocessed file. Simple but assumes file list doesn't change between rounds.
+1. **Offset-based**: Input files are ordered deterministically (e.g., by LFN). Track the index of the next unprocessed file. Simple but assumes file list doesn't change between rounds.
 2. **Set-based**: Track the set of processed LFNs. More robust (handles file list changes between rounds, e.g., new replicas) but requires more storage.
 
-For MVP, cursor-based is sufficient. The file list is fetched once from DBS at request submission and stored on the workflow. Each round's splitter starts at the cursor position.
+For MVP, offset-based is sufficient. The file list is fetched once from DBS at request submission and stored on the workflow. Each round's splitter starts at the offset position.
 
 ```
-Round 0: cursor = 0, files_per_job = 5, jobs_per_work_unit = 8
+Round 0: file_offset = 0, files_per_job = 5, jobs_per_work_unit = 8
          Process files 0–399 (80 jobs × 5 files)
-         After completion: cursor = 400
+         After completion: file_offset = 400
 
-Round 1: cursor = 400, optimized files_per_job and jobs_per_group
+Round 1: file_offset = 400, optimized files_per_job and jobs_per_group
          Process files 400–499 (next batch)
          ...
 ```
@@ -631,7 +631,7 @@ round_work_units = min(work_units_per_round, ceil(remaining_jobs / jobs_per_grou
 round_jobs = round_work_units * jobs_per_group  # last WU may have fewer
 
 # File-based
-remaining_files = total_files - workflow.file_cursor
+remaining_files = total_files - workflow.file_offset
 remaining_jobs = ceil(remaining_files / files_per_job)
 round_work_units = min(work_units_per_round, ceil(remaining_jobs / jobs_per_group))
 ```
@@ -848,7 +848,7 @@ With `work_units_per_round=10`, each DAG has at most 10 × `jobs_per_group` proc
 | Merge group DAG generation | Implemented | `dag_planner.py:_generate_dag_files()` |
 | `SizePerEvent` → `request_disk` | Implemented | `dag_planner.py` submit file generation |
 | Multi-round adaptive lifecycle | **Not implemented** | Round 0 pilot → Round 1+ production → queue between rounds |
-| Round bookkeeping | **Not implemented** | `next_first_event` (GEN) / `file_cursor` (file-based) on workflow row |
+| Round bookkeeping | **Not implemented** | `next_first_event` (GEN) / `file_offset` (file-based) on workflow row |
 | Measured-output merge sizing | **Not implemented** | Round 1+ `jobs_per_group` from real file sizes |
 | Lumi-section assignment | **Not implemented** | Per-job (default) or per-WU mode |
 | `events_per_job` tuning | **Not implemented** | Round 1+ recomputes from measured time-per-event |
