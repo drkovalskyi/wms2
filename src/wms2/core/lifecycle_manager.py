@@ -157,14 +157,20 @@ class RequestLifecycleManager:
 
         if current_round > 0:
             # Round 2+: skip pilot, go straight to production (always adaptive)
-            await self.dag_planner.plan_production_dag(workflow, adaptive=True)
-            await self.transition(request, RequestStatus.ACTIVE)
+            dag = await self.dag_planner.plan_production_dag(workflow, adaptive=True)
+            if dag is None:
+                await self.transition(request, RequestStatus.COMPLETED)
+            else:
+                await self.transition(request, RequestStatus.ACTIVE)
         elif request.urgent:
             # Skip pilot, go straight to production DAG
-            await self.dag_planner.plan_production_dag(
+            dag = await self.dag_planner.plan_production_dag(
                 workflow, adaptive=is_adaptive,
             )
-            await self.transition(request, RequestStatus.ACTIVE)
+            if is_adaptive and dag is None:
+                await self.transition(request, RequestStatus.COMPLETED)
+            else:
+                await self.transition(request, RequestStatus.ACTIVE)
         else:
             await self.dag_planner.submit_pilot(workflow)
             await self.transition(request, RequestStatus.PILOT_RUNNING)
@@ -336,11 +342,16 @@ class RequestLifecycleManager:
         is_gen = config.get("_is_gen", False)
         params = workflow.splitting_params or {}
 
-        # Compute how many events/files this round processed
+        # Compute how many events/files this round processed.
+        # dag.nodes_done counts outer-DAG nodes (SUBDAGs), not processing
+        # jobs.  node_counts["processing"] is the actual job count set at
+        # planning time and is correct for completed DAGs.
+        node_counts = dag.node_counts or {}
+        total_jobs = node_counts.get("processing", dag.nodes_done)
+
         if is_gen:
             events_per_job = (params.get("events_per_job")
                               or params.get("eventsPerJob") or 100_000)
-            total_jobs = dag.nodes_done  # processing nodes that completed
             events_this_round = total_jobs * events_per_job
             new_offset = workflow.next_first_event + events_this_round
             total_events = config.get("request_num_events", 0)
@@ -348,7 +359,6 @@ class RequestLifecycleManager:
         else:
             files_per_job = (params.get("files_per_job")
                              or params.get("FilesPerJob") or 1)
-            total_jobs = dag.nodes_done
             files_this_round = total_jobs * files_per_job
             new_offset = workflow.file_offset + files_this_round
             remaining = -1  # file-based: check via DBS in planner

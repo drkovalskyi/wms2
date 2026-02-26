@@ -284,16 +284,30 @@ async def test_handle_active_processes_work_units(mock_repository, mock_condor, 
     mock_repository.get_workflow_by_request = AsyncMock(return_value=workflow)
     mock_repository.get_dag = AsyncMock(return_value=dag)
 
-    block_id = uuid.uuid4()
+    # Mock a processing block that get_processing_blocks returns
+    block = MagicMock()
+    block.id = uuid.uuid4()
+    block.dataset_name = "/TestPrimary/Test-v1/GEN-SIM"
+    mock_repository.get_processing_blocks = AsyncMock(return_value=[block])
 
-    # Mock dag_monitor to return newly completed work units
+    # Mock dag_monitor to return newly completed work units with manifest
     mock_dag_monitor = AsyncMock()
     mock_dag_monitor.poll_dag.return_value = DAGPollResult(
         dag_id=str(dag.id),
         status=DAGStatus.RUNNING,
         nodes_done=1,
         newly_completed_work_units=[
-            {"block_id": block_id, "node_name": "mg_000000", "output_files": []},
+            {
+                "group_name": "mg_000000",
+                "manifest": {
+                    "site": "T2_US_MIT",
+                    "datasets": {
+                        "/TestPrimary/Test-v1/GEN-SIM": {
+                            "files": ["/store/mc/test/output.root"],
+                        },
+                    },
+                },
+            },
         ],
     )
 
@@ -306,10 +320,14 @@ async def test_handle_active_processes_work_units(mock_repository, mock_condor, 
     request = make_request_row(status="active")
     await lm.evaluate_request(request)
 
-    # Output manager called for the completed work unit
+    # Output manager called for each block with data extracted from manifest
     mock_output_manager.handle_work_unit_completion.assert_called_once_with(
-        workflow.id, block_id,
-        {"block_id": block_id, "node_name": "mg_000000", "output_files": []},
+        workflow.id, block.id,
+        {
+            "output_files": ["/store/mc/test/output.root"],
+            "site": "T2_US_MIT",
+            "node_name": "mg_000000",
+        },
     )
     mock_output_manager.process_blocks_for_workflow.assert_called_once_with(workflow.id)
 
@@ -537,7 +555,10 @@ async def test_round_completion_gen_all_done(mock_repository, mock_condor, setti
     from wms2.core.lifecycle_manager import RequestLifecycleManager
 
     # 1M events total, already at event 900_001 (9 rounds done), 1 job of 100k left
-    dag = _make_dag(status="submitted", nodes_done=1, nodes_failed=0)
+    dag = _make_dag(
+        status="submitted", nodes_done=1, nodes_failed=0,
+        node_counts={"processing": 1, "merge": 1, "cleanup": 1},
+    )
     workflow = _make_workflow(
         dag_id=dag.id,
         config_data={"_is_gen": True, "request_num_events": 1_000_000},
@@ -583,7 +604,10 @@ async def test_round_completion_file_based_returns_to_queued(
     from wms2.core.dag_monitor import DAGPollResult
     from wms2.core.lifecycle_manager import RequestLifecycleManager
 
-    dag = _make_dag(status="submitted", nodes_done=5, nodes_failed=0)
+    dag = _make_dag(
+        status="submitted", nodes_done=5, nodes_failed=0,
+        node_counts={"processing": 5, "merge": 1, "cleanup": 1},
+    )
     workflow = _make_workflow(
         dag_id=dag.id,
         config_data={"_is_gen": False},
@@ -663,7 +687,10 @@ async def test_round_completion_priority_demotion(mock_repository, mock_condor, 
 
     # 1000 events, 100 per job, 5 done this round → offset moves to 501
     # progress = 500/1000 = 0.5, matches first step's fraction
-    dag = _make_dag(status="submitted", nodes_done=5, nodes_failed=0)
+    dag = _make_dag(
+        status="submitted", nodes_done=5, nodes_failed=0,
+        node_counts={"processing": 5, "merge": 1, "cleanup": 1},
+    )
     workflow = _make_workflow(
         dag_id=dag.id,
         config_data={"_is_gen": True, "request_num_events": 1000},
@@ -740,6 +767,62 @@ async def test_queued_round2_skips_pilot(mock_repository, mock_condor, settings)
     # Request transitions to ACTIVE
     req_update = mock_repository.update_request.call_args
     assert req_update[1]["status"] == RequestStatus.ACTIVE.value
+
+
+async def test_queued_round2_all_done_completes(mock_repository, mock_condor, settings):
+    """Round 2+ where plan_production_dag returns None → COMPLETED."""
+    mock_dag_planner = AsyncMock()
+    mock_dag_planner.plan_production_dag.return_value = None  # All work done
+
+    workflow = _make_workflow(
+        current_round=2,
+        next_first_event=1_000_001,
+        file_offset=0,
+    )
+
+    mock_repository.count_active_dags.return_value = 0
+    request = make_request_row(status="queued", adaptive=True)
+    mock_repository.get_queued_requests.return_value = [request]
+    mock_repository.get_workflow_by_request.return_value = workflow
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_planner=mock_dag_planner,
+    )
+
+    await lm.evaluate_request(request)
+
+    # plan_production_dag called with adaptive=True
+    mock_dag_planner.plan_production_dag.assert_called_once_with(
+        workflow, adaptive=True,
+    )
+
+    # Request transitions to COMPLETED (not ACTIVE)
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.COMPLETED.value
+
+
+async def test_queued_urgent_adaptive_all_done_completes(mock_repository, mock_condor, settings):
+    """Urgent adaptive round 0 where plan_production_dag returns None → COMPLETED."""
+    mock_dag_planner = AsyncMock()
+    mock_dag_planner.plan_production_dag.return_value = None
+
+    workflow = _make_workflow(current_round=0)
+
+    mock_repository.count_active_dags.return_value = 0
+    request = make_request_row(status="queued", urgent=True, adaptive=True)
+    mock_repository.get_queued_requests.return_value = [request]
+    mock_repository.get_workflow_by_request.return_value = workflow
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        dag_planner=mock_dag_planner,
+    )
+
+    await lm.evaluate_request(request)
+
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.COMPLETED.value
 
 
 async def test_queued_round0_runs_pilot(mock_repository, mock_condor, settings):

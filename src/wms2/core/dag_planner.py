@@ -220,6 +220,8 @@ class DAGPlanner:
             nodes = await self._plan_file_based_nodes(workflow, max_jobs=max_jobs)
 
         if not nodes:
+            if adaptive:
+                return None  # All work done — caller handles completion
             raise ValueError(
                 f"No processing nodes generated for workflow {workflow.id}"
             )

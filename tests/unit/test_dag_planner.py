@@ -146,3 +146,33 @@ class TestFileBasedNodesOffset:
         nodes = await planner._plan_file_based_nodes(wf, max_jobs=3)
 
         assert len(nodes) == 3
+
+
+# ── Adaptive empty-nodes tests ───────────────────────────────────
+
+
+class TestAdaptiveEmptyReturnsNone:
+    async def test_plan_production_dag_adaptive_empty_returns_none(self, tmp_path):
+        """GEN workflow past total events + adaptive=True → returns None (no ValueError)."""
+        planner = _make_planner(tmp_path)
+        wf = _make_workflow(
+            config_data={"_is_gen": True, "request_num_events": 1_000_000},
+            splitting_params={"events_per_job": 100_000},
+            next_first_event=1_000_001,  # Past total → _plan_gen_nodes returns []
+        )
+
+        result = await planner.plan_production_dag(wf, adaptive=True)
+
+        assert result is None
+
+    async def test_plan_production_dag_non_adaptive_empty_raises(self, tmp_path):
+        """GEN workflow past total events + adaptive=False → ValueError."""
+        planner = _make_planner(tmp_path)
+        wf = _make_workflow(
+            config_data={"_is_gen": True, "request_num_events": 1_000_000},
+            splitting_params={"events_per_job": 100_000},
+            next_first_event=1_000_001,
+        )
+
+        with pytest.raises(ValueError, match="No processing nodes"):
+            await planner.plan_production_dag(wf, adaptive=False)
