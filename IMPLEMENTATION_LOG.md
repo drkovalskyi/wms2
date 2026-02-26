@@ -3037,6 +3037,71 @@ The round-completion handler (commit `58ab99b`) advances `next_first_event`, `fi
 
 ### What's Next
 
-- **End-to-end adaptive integration test**: Submit a multi-round adaptive GEN request through the full lifecycle (QUEUED → PILOT → ACTIVE → round complete → QUEUED → ACTIVE → COMPLETED)
-- **File-based completion detection**: The planner returns empty nodes when `file_offset` exceeds available files, but this raises `ValueError` — may need graceful completion path
-- **Fix pre-existing `test_handle_active_processes_work_units`**: Test's work unit dict structure doesn't match current manifest-based processing code
+- ~~**End-to-end adaptive integration test**~~: Done (see below)
+- ~~**File-based completion detection**~~: Done (see below)
+- ~~**Fix pre-existing `test_handle_active_processes_work_units`**~~: Done (see below)
+
+---
+
+## Adaptive Completion Detection, Round Offset Fix, and Integration Test
+
+**Date**: 2026-02-26
+**Commit**: `196aad7`
+
+### Context
+
+Three issues remained after DAG planner offset consumption (`bcee75d`):
+
+1. **File-based completion detection bug**: When all files/events are processed, the planner raises `ValueError` on empty nodes — but for adaptive requests this is the expected "all done" signal, not an error.
+2. **Round offset calculation bug**: `_handle_round_completion()` used `dag.nodes_done` (outer-DAG SUBDAG count) instead of the actual processing job count. With SUBDAG EXTERNAL, 1 merge group = 1 outer node, but may contain N processing jobs — so offsets were under-counted.
+3. **Pre-existing test failure**: `test_handle_active_processes_work_units` used stale dict structure (`node_name` key, no manifest) that didn't match the manifest-based processing code.
+
+### What Was Built
+
+**Adaptive completion in DAG Planner** (`src/wms2/core/dag_planner.py`):
+- `plan_production_dag()` returns `None` when `adaptive=True` and no processing nodes are generated (instead of raising `ValueError`)
+- Non-adaptive requests still raise `ValueError` as before
+
+**Lifecycle Manager completion handling** (`src/wms2/core/lifecycle_manager.py`):
+- `_handle_queued()` round 2+ branch: captures return value, transitions to COMPLETED if `None`
+- `_handle_queued()` urgent branch: same pattern for adaptive + `None`
+- `_handle_round_completion()`: uses `dag.node_counts["processing"]` instead of `dag.nodes_done` for offset calculation. `node_counts` is set at planning time and correctly reflects the number of processing jobs in the round, regardless of the outer DAG's SUBDAG structure.
+
+**Fixed test** (`tests/unit/test_lifecycle.py`):
+- `test_handle_active_processes_work_units`: Updated to use `group_name` key with `manifest` dict structure, mock `get_processing_blocks` returning a block with known `id` and `dataset_name`, assertion matches the constructed dict the code actually passes to `handle_work_unit_completion`
+
+**New unit tests**:
+- `test_plan_production_dag_adaptive_empty_returns_none` — GEN workflow past total events + adaptive → returns `None`
+- `test_plan_production_dag_non_adaptive_empty_raises` — same scenario, non-adaptive → `ValueError`
+- `test_queued_round2_all_done_completes` — round 2+ with `None` DAG → COMPLETED
+- `test_queued_urgent_adaptive_all_done_completes` — urgent adaptive round 0 with `None` → COMPLETED
+- Updated 3 existing round-completion tests with correct `node_counts` matching their intended processing job counts
+
+**Multi-round adaptive integration test** (`tests/integration/test_adaptive_rounds.py`):
+- Modeled on `test_production_pipeline.py`
+- Real PostgreSQL (wms2test), real HTCondor, mock DBS/Rucio/ReqMgr
+- Settings: `work_units_per_round=1`, `jobs_per_work_unit=2`, `events_per_job=10`, `request_num_events=40`
+- Expected flow:
+  - Round 0: 2 jobs (events 1–20), 1 merge group
+  - Round 1: 2 jobs (events 21–40), 1 merge group
+  - Round 2: planner returns `None` → request COMPLETED
+- Verifies: request status, workflow `current_round=2`, `next_first_event=41`, 2+ DAG rows, DBS/Rucio calls
+
+### Design Decisions
+
+- **`None` return vs exception**: Returning `None` from `plan_production_dag()` when adaptive + empty is cleaner than catching `ValueError` in the caller. The caller (lifecycle manager) can handle `None` with a simple `if` check rather than try/except. Non-adaptive empty nodes remain an error since that indicates a misconfigured workflow.
+- **`node_counts["processing"]` over `dag.nodes_done`**: The SUBDAG EXTERNAL structure means the outer DAG has N nodes (one per merge group), not N*M processing nodes. `dag.nodes_done` reflects the outer view. `node_counts` is set at planning time and is authoritative for the actual job count within each round.
+- **300s integration test timeout**: Each round takes ~90s through the full DAGMan lifecycle (submission → negotiation → execution → completion detection). Two rounds + completion check needs ~200s.
+
+### Verification
+
+- `pytest tests/unit/test_dag_planner.py -v` — 7/7 passed (2 new)
+- `pytest tests/unit/test_lifecycle.py -v` — 31/31 passed (2 new + 1 fixed + 3 updated)
+- `pytest tests/unit/ -v` — 293/293 passed (0 failures)
+- `python -m tests.integration.test_adaptive_rounds` — 7/7 checks passed (completed in 207s)
+
+### What's Next
+
+- **File-based adaptive integration test**: Similar to the GEN test but with file-based splitting and offset advancement
+- **Partial round handling**: What happens when a round's DAG completes with PARTIAL status during adaptive execution
+- **Production steps across rounds**: Verify priority demotion triggers correctly when progress crosses step thresholds
