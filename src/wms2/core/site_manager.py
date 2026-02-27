@@ -9,7 +9,9 @@ See docs/error_handling.md Section 6 for the full design.
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
+from wms2.adapters.base import CRICAdapter
 from wms2.config import Settings
 from wms2.db.repository import Repository
 
@@ -17,9 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 class SiteManager:
-    def __init__(self, repository: Repository, settings: Settings):
+    def __init__(
+        self,
+        repository: Repository,
+        settings: Settings,
+        cric_adapter: CRICAdapter | None = None,
+    ):
         self.db = repository
         self.settings = settings
+        self.cric_adapter = cric_adapter
 
     async def ban_site(
         self,
@@ -110,6 +118,43 @@ class SiteManager:
             return await self.db.get_active_bans_for_site(site_name)
         return await self.db.list_all_active_bans()
 
-    async def sync_from_cric(self) -> None:
-        """Sync site information from CRIC. Not yet implemented."""
-        logger.info("CRIC sync not yet implemented")
+    async def sync_from_cric(self) -> dict[str, Any]:
+        """Sync site information from CRIC into the sites table.
+
+        Returns a stats dict: {"added": N, "updated": N, "total": N, "errors": N}.
+        If no cric_adapter is configured, returns zeros and logs a warning.
+        """
+        if self.cric_adapter is None:
+            logger.info("CRIC sync skipped — no cric_adapter configured")
+            return {"added": 0, "updated": 0, "total": 0, "errors": 0}
+
+        try:
+            sites = await self.cric_adapter.get_sites()
+        except Exception:
+            logger.exception("CRIC sync failed — could not fetch sites")
+            return {"added": 0, "updated": 0, "total": 0, "errors": 1}
+
+        added = 0
+        updated = 0
+        errors = 0
+        for site_data in sites:
+            site_name = site_data.get("name")
+            if not site_name:
+                errors += 1
+                continue
+            try:
+                existing = await self.db.get_site(site_name)
+                await self.db.upsert_site(**site_data)
+                if existing is None:
+                    added += 1
+                else:
+                    updated += 1
+            except Exception:
+                logger.exception("Failed to upsert site %s", site_name)
+                errors += 1
+
+        logger.info(
+            "CRIC sync complete: %d added, %d updated, %d total, %d errors",
+            added, updated, len(sites), errors,
+        )
+        return {"added": added, "updated": updated, "total": len(sites), "errors": errors}

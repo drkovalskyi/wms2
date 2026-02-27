@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     timeout_stopping: int = 3600
     timeout_resubmitting: int = 600
 
+    # CRIC
+    cric_url: str = "https://cms-cric.cern.ch/"
+    cric_sync_interval: int = 3600  # seconds between syncs; 0 = disabled
+
     # External services
     reqmgr2_url: str = "https://cmsweb.cern.ch/reqmgr2"
     dbs_url: str = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader"

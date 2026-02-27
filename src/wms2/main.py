@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from wms2 import __version__
 from wms2.adapters.mock import (
     MockCondorAdapter,
+    MockCRICAdapter,
     MockDBSAdapter,
     MockReqMgrAdapter,
     MockRucioAdapter,
@@ -40,6 +41,7 @@ def _build_adapters(settings: Settings):
     condor = _build_condor(settings)
 
     if settings.cert_file and settings.key_file:
+        from wms2.adapters.cric import CRICClient
         from wms2.adapters.dbs import DBSClient
         from wms2.adapters.reqmgr2 import ReqMgr2Client
         from wms2.adapters.rucio import RucioClient
@@ -50,12 +52,14 @@ def _build_adapters(settings: Settings):
             settings.rucio_url, settings.rucio_account,
             settings.cert_file, settings.key_file,
         )
+        cric = CRICClient(settings.cric_url, settings.cert_file, settings.key_file)
     else:
         reqmgr = MockReqMgrAdapter()
         dbs = MockDBSAdapter()
         rucio = MockRucioAdapter()
+        cric = MockCRICAdapter()
 
-    return condor, reqmgr, dbs, rucio
+    return condor, reqmgr, dbs, rucio, cric
 
 
 @asynccontextmanager
@@ -70,13 +74,46 @@ async def lifespan(app: FastAPI):
     app.state.session_factory = session_factory
 
     # Build adapters
-    condor, reqmgr, dbs, rucio = _build_adapters(settings)
+    condor, reqmgr, dbs, rucio, cric = _build_adapters(settings)
+
+    # Initial CRIC sync (populate sites table at startup)
+    try:
+        async with session_factory() as session:
+            repo = Repository(session)
+            sm = SiteManager(repo, settings, cric_adapter=cric)
+            stats = await sm.sync_from_cric()
+            await session.commit()
+            logger.info("Startup CRIC sync: %s", stats)
+    except Exception:
+        logger.exception("Startup CRIC sync failed — continuing without site data")
+
+    # Periodic CRIC sync background task
+    async def run_cric_sync():
+        interval = settings.cric_sync_interval
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with session_factory() as session:
+                    repo = Repository(session)
+                    sm = SiteManager(repo, settings, cric_adapter=cric)
+                    stats = await sm.sync_from_cric()
+                    await session.commit()
+                    logger.info("Periodic CRIC sync: %s", stats)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Periodic CRIC sync failed")
+
+    cric_sync_task = asyncio.create_task(run_cric_sync())
+    app.state.cric_sync_task = cric_sync_task
 
     # Start lifecycle manager
     async def run_lifecycle():
         async with session_factory() as session:
             repo = Repository(session)
-            sm = SiteManager(repo, settings)
+            sm = SiteManager(repo, settings, cric_adapter=cric)
             wm = WorkflowManager(repo, reqmgr)
             dp = DAGPlanner(repo, dbs, rucio, condor, settings, site_manager=sm)
             dm = DAGMonitor(repo, condor)
@@ -101,11 +138,13 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    cric_sync_task.cancel()
     lifecycle_task.cancel()
-    try:
-        await lifecycle_task
-    except asyncio.CancelledError:
-        pass
+    for task in (cric_sync_task, lifecycle_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await engine.dispose()
     logger.info("WMS2 shut down")
 

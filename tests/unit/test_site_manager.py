@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from wms2.adapters.mock import MockCRICAdapter
 from wms2.config import Settings
 from wms2.core.site_manager import SiteManager
 
@@ -250,3 +251,104 @@ async def test_get_active_bans(site_manager, repo):
 
     assert len(result) == 2
     repo.get_active_bans_for_site.assert_called_once_with("T2_US_Test")
+
+
+# ── sync_from_cric ────────────────────────────────────────────
+
+
+async def test_sync_from_cric_no_adapter(repo, settings):
+    """sync_from_cric with no adapter returns zeros."""
+    sm = SiteManager(repo, settings, cric_adapter=None)
+
+    stats = await sm.sync_from_cric()
+
+    assert stats == {"added": 0, "updated": 0, "total": 0, "errors": 0}
+
+
+async def test_sync_from_cric_adds_new_sites(repo, settings):
+    """sync_from_cric upserts sites from CRIC adapter and counts additions."""
+    cric = MockCRICAdapter()
+    repo.get_site.return_value = None  # all sites are new
+    repo.upsert_site = AsyncMock(return_value=_make_site_row())
+
+    sm = SiteManager(repo, settings, cric_adapter=cric)
+    stats = await sm.sync_from_cric()
+
+    assert stats["added"] == 2
+    assert stats["updated"] == 0
+    assert stats["total"] == 2
+    assert stats["errors"] == 0
+    assert repo.upsert_site.call_count == 2
+    assert cric.calls == [("get_sites", (), {})]
+
+
+async def test_sync_from_cric_updates_existing_sites(repo, settings):
+    """sync_from_cric counts updates when sites already exist."""
+    cric = MockCRICAdapter()
+    repo.get_site.return_value = _make_site_row()  # all sites exist
+    repo.upsert_site = AsyncMock(return_value=_make_site_row())
+
+    sm = SiteManager(repo, settings, cric_adapter=cric)
+    stats = await sm.sync_from_cric()
+
+    assert stats["added"] == 0
+    assert stats["updated"] == 2
+    assert stats["total"] == 2
+
+
+async def test_sync_from_cric_mixed_add_update(repo, settings):
+    """sync_from_cric handles a mix of new and existing sites."""
+    cric = MockCRICAdapter()
+    # First site is new, second exists
+    repo.get_site = AsyncMock(side_effect=[None, _make_site_row()])
+    repo.upsert_site = AsyncMock(return_value=_make_site_row())
+
+    sm = SiteManager(repo, settings, cric_adapter=cric)
+    stats = await sm.sync_from_cric()
+
+    assert stats["added"] == 1
+    assert stats["updated"] == 1
+    assert stats["total"] == 2
+
+
+async def test_sync_from_cric_handles_fetch_error(repo, settings):
+    """sync_from_cric returns error count when CRIC fetch fails."""
+    cric = AsyncMock()
+    cric.get_sites = AsyncMock(side_effect=RuntimeError("CRIC down"))
+
+    sm = SiteManager(repo, settings, cric_adapter=cric)
+    stats = await sm.sync_from_cric()
+
+    assert stats["errors"] == 1
+    assert stats["total"] == 0
+
+
+async def test_sync_from_cric_handles_upsert_error(repo, settings):
+    """sync_from_cric counts per-site upsert errors without crashing."""
+    cric = MockCRICAdapter()
+    repo.get_site.return_value = None
+    repo.upsert_site = AsyncMock(side_effect=RuntimeError("DB error"))
+
+    sm = SiteManager(repo, settings, cric_adapter=cric)
+    stats = await sm.sync_from_cric()
+
+    assert stats["errors"] == 2
+    assert stats["added"] == 0
+    assert stats["total"] == 2
+
+
+async def test_sync_from_cric_upsert_kwargs(repo, settings):
+    """sync_from_cric passes correct site data to upsert_site."""
+    cric = MockCRICAdapter()
+    repo.get_site.return_value = None
+    repo.upsert_site = AsyncMock(return_value=_make_site_row())
+
+    sm = SiteManager(repo, settings, cric_adapter=cric)
+    await sm.sync_from_cric()
+
+    # Check the first upsert call has expected fields
+    calls = repo.upsert_site.call_args_list
+    first_kwargs = calls[0][1]
+    assert first_kwargs["name"] == "T1_US_FNAL"
+    assert first_kwargs["total_slots"] == 50000
+    assert first_kwargs["status"] == "enabled"

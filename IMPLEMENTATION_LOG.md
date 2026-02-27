@@ -3415,3 +3415,60 @@ DAGMan's `DAGMAN_USE_STRICT=1` (default) treats the warning *"node log file is i
 | File | Change |
 |------|--------|
 | `tests/integration/test_production_pipeline.py` | Added `pytest` import, `@pytest.mark.level2` marker, `pipeline_work_dir` fixture (uses `/mnt/shared/` not `tmp_path`), `TestProductionPipeline.test_production_pipeline_e2e` async test |
+
+---
+
+## CRIC Sync Implementation
+
+**Date**: 2026-02-27
+
+### What Was Built
+
+Implemented the CRIC (Computing Resource Information Catalogue) sync pipeline so that WMS2's `sites` table is populated from CMS's central site registry. This unblocks site banning (which requires sites to exist in the DB) and provides site metadata for operators and the DAG planner.
+
+### Components
+
+| Component | File | Description |
+|-----------|------|-------------|
+| `CRICClient` | `src/wms2/adapters/cric.py` | HTTP adapter following the `dbs.py` pattern: httpx + X.509 cert auth + exponential backoff retry (3 attempts). Fetches `GET /api/cms/site/query/?json&rcsite_state=ANY`, maps CRIC fields to `SiteRow` columns, stores full CRIC response in `config_data` JSONB. |
+| CRIC settings | `src/wms2/config.py` | Added `cric_url` (default: `https://cms-cric.cern.ch/`) and `cric_sync_interval` (default: 3600s, 0=disabled). |
+| `SiteManager.sync_from_cric()` | `src/wms2/core/site_manager.py` | Replaced stub with full implementation. Accepts optional `cric_adapter` param (backward compatible). Iterates CRIC results, upserts to DB, returns stats dict `{added, updated, total, errors}`. Graceful error handling per-site and for CRIC fetch failures. |
+| Startup + periodic sync | `src/wms2/main.py` | CRIC adapter built alongside other adapters (real if certs configured, mock otherwise). Startup sync runs once during `lifespan()`. Background task re-syncs every `cric_sync_interval` seconds. Both are cancellation-safe. |
+
+### CRIC Field Mapping
+
+| CRIC field | SiteRow column | Notes |
+|------------|---------------|-------|
+| dict key | `name` | Site name (e.g., `T1_US_FNAL`) |
+| `rcsite_state` | `status` | ACTIVE→enabled, STANDBY/WAITING→drain, else→disabled |
+| `total_slots` | `total_slots` | May be absent (None) |
+| `schedd_name` | `schedd_name` | May be absent |
+| `collector_host` | `collector_host` | May be absent |
+| `se` | `storage_element` | Storage element hostname |
+| `storage_path` | `storage_path` | May be absent |
+| (full dict) | `config_data` | Complete CRIC response stored as JSONB for flexibility |
+
+### Design Decisions
+
+- **Full CRIC response in `config_data`**: Rather than mapping every CRIC field to a dedicated column, we store the entire response as JSONB. This means future needs (facility name, tier level, pledged resources) don't require schema changes.
+- **Optional `cric_adapter` param**: Backward compatible — existing code that constructs `SiteManager(repo, settings)` continues to work. CRIC sync simply returns zeros when no adapter is configured.
+- **Tolerant mapping**: Missing CRIC fields produce `None` values rather than errors. Sites with minimal data are still imported.
+- **Startup sync before lifecycle loop**: Sites are populated before the lifecycle manager starts, ensuring banning and DAG planning have site data available from the first cycle.
+
+### Verification
+
+- `pytest tests/unit/test_cric_adapter.py -v` — 14 tests pass (field mapping, HTTP success/error/retry, edge cases)
+- `pytest tests/unit/test_site_manager.py -v` — 19 tests pass (12 existing ban tests + 7 new sync tests)
+- `pytest tests/unit/ -v` — 420 tests pass, no regressions
+- `python -c "from wms2.adapters.cric import CRICClient"` — imports clean
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/wms2/adapters/cric.py` | **New** — `CRICClient` with httpx + cert auth + retry + CRIC→SiteRow field mapping |
+| `src/wms2/config.py` | Added `cric_url`, `cric_sync_interval` settings |
+| `src/wms2/core/site_manager.py` | Added `cric_adapter` param, replaced `sync_from_cric()` stub with full implementation |
+| `src/wms2/main.py` | Built CRIC adapter in `_build_adapters()`, added startup sync + periodic background task in `lifespan()` |
+| `tests/unit/test_cric_adapter.py` | **New** — 14 tests: field mapping (6), HTTP success/edge cases (5), retry behavior (3) |
+| `tests/unit/test_site_manager.py` | Added 7 tests: no-adapter, add/update/mixed, fetch error, upsert error, kwarg verification |
