@@ -3521,3 +3521,52 @@ Also improved existing endpoints:
 | `src/wms2/api/workflows.py` | Added `by-request/{name}`, `{id}/blocks` endpoints, `?request_name=` filter, richer serialization |
 | `src/wms2/api/dags.py` | Added `{id}/history` endpoint, richer list/detail serialization |
 | `tests/unit/test_api_workflows.py` | **New** — 18 tests for workflow and DAG API endpoints |
+
+---
+
+## 2026-02-27 — Simulator Mode End-to-End, CLI Sandbox Mode, Bug Fixes
+
+### Explicit `--sandbox-mode` Flag
+
+Removed the `auto` sandbox mode from the CLI. The `--sandbox-mode` argument is now **required** with explicit choices: `synthetic`, `cmssw`, `simulator`. This eliminates implicit behavior where `auto` would silently pick `cmssw` or `synthetic` based on whether `CMSSWVersion` was present.
+
+**Commits**: `30fb32e`, `43fd405`
+
+### Simulator Mode Bug Fixes
+
+Three bugs prevented `--sandbox-mode=simulator` from completing end-to-end with a real ReqMgr2 request:
+
+1. **Simulator data tier mismatch** (`sandbox.py`): `_build_simulator_steps()` used step names (e.g. `B2G-Run3Summer23BPixwmLHEGS-06000_0`) as data tiers instead of real CMS tiers (`AODSIM`, `MINIAODSIM`, `NANOAODSIM`). The proc script's FJR `ModuleLabel` then didn't match `output_info.json` dataset entries, so stage-out to unmerged storage was skipped entirely. Fixed by mapping kept steps (`KeepOutput=True`) to actual data tiers extracted from the `OutputDatasets` field.
+
+2. **Merge/cleanup absolute path references** (`dag_planner.py`): Merge and cleanup submit files passed `--output-info` with an absolute path to `output_info.json`, but with `should_transfer_files=YES` these jobs run in HTCondor execute directories where that path doesn't exist. Fixed by using `os.path.basename()` for the argument and adding the file to `transfer_input_files`.
+
+3. **`DAGMAN_USE_STRICT=1` blocking `/tmp` node logs** (`dag_planner.py`): DAGMan aborted with a fatal error because the default node log path was in `/tmp`, which `DAGMAN_USE_STRICT=1` treats as an NFS-unsafe location. Set `DAGMAN_USE_STRICT=0` in the generated `dagman.config`.
+
+### End-to-End Verification (Simulator Mode)
+
+Successfully imported a real ReqMgr2 request (`cmsunified_task_B2G-Run3Summer23BPixwmLHEGS-06000__v1_T_250628_211038_1313`) with `--sandbox-mode=simulator`:
+
+- **ReqMgr2 fetch**: 5-step StepChain (wmLHEGS → DRPremix × 2 → MiniAOD → NanoAOD)
+- **Simulator execution**: 5 steps × 25,000 events, ~11 min wall time, 4.2 GB peak RSS, realistic Amdahl's law CPU efficiency (91.25%)
+- **Output**: 3 × 282 MB ROOT files with proper `Events` TTree (25,000 entries)
+- **Stage-out**: Unmerged files correctly staged to tier-specific paths (`/store/unmerged/.../AODSIM/`, etc.)
+- **Merge**: Found 3 ROOT files grouped by tier, copied to merged output paths
+- **DAG completion**: done=1, failed=0, all 3 datasets archived
+
+### CERN CA Certificates
+
+The CERN Grid CA chain (Root CA 2 + Grid CA intermediate) was needed for ReqMgr2 HTTPS. Downloaded from `cafiles.cern.ch` and passed via `--ca-bundle`. Note: Root CA is DER format (must convert to PEM), Grid CA is already PEM.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/wms2/cli.py` | `--sandbox-mode` now required, choices: `synthetic`/`cmssw`/`simulator` (no `auto`) |
+| `src/wms2/core/sandbox.py` | Removed auto-detection logic; `_build_simulator_steps()` maps kept steps to OutputDatasets tiers |
+| `src/wms2/core/dag_planner.py` | Merge/cleanup use basename for output_info + transfer_input_files; `DAGMAN_USE_STRICT=0` |
+| `tests/unit/test_sandbox.py` | Replaced auto-mode tests with explicit mode tests |
+
+### Verification
+
+- `pytest tests/unit/ -v` — 440 tests pass, no regressions
+- Full end-to-end import with simulator mode completes successfully
