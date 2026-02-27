@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.9.0 |
+| **Spec Version** | 2.10.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-02-26 |
+| **Date** | 2026-02-27 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -2639,7 +2639,10 @@ GET    /api/v1/requests/{name}             Get request details
 PATCH  /api/v1/requests/{name}             Update request (priority, status)
 DELETE /api/v1/requests/{name}             Cancel/abort request
 POST   /api/v1/requests/{name}/stop        Initiate clean stop
-POST   /api/v1/requests/{name}/restart     Resubmit with version increment
+POST   /api/v1/requests/{name}/release     Release HELD request to admission queue
+POST   /api/v1/requests/{name}/fail        Manually fail a HELD/PARTIAL request
+POST   /api/v1/requests/{name}/restart     Kill and clone with version increment
+GET    /api/v1/requests/{name}/errors      Get error summary for request
 GET    /api/v1/requests/{name}/versions    Version history
 
 Workflows
@@ -2769,6 +2772,75 @@ Response:
     "previous_status": "active",
     "stop_reason": "Schedd maintenance window",
     "message": "Clean stop initiated. DAG will be stopped and a rescue DAG prepared for re-admission."
+}
+
+# Inspect errors for a HELD request
+GET /api/v1/requests/user_Run2024A_v1_250130_123456/errors
+
+Response:
+{
+    "request_name": "user_Run2024A_v1_250130_123456",
+    "status": "held",
+    "held_since": "2026-01-30T12:00:00Z",
+    "error_summary": {
+        "category_counts": {
+            "site_infrastructure": 3,
+            "data_access": 1
+        },
+        "site_summary": {
+            "T2_US_MIT": {"failures": 3, "categories": ["site_infrastructure"]},
+            "T2_DE_DESY": {"failures": 1, "categories": ["data_access"]}
+        },
+        "bad_input_files": [
+            "/store/data/Run2024A/block0/file42.root"
+        ],
+        "total_failures": 4,
+        "affected_workflows": 1
+    }
+}
+
+# Release a HELD request back to the admission queue
+POST /api/v1/requests/user_Run2024A_v1_250130_123456/release
+{
+    "reason": "Site issue resolved, retrying"
+}
+
+Response:
+{
+    "request_name": "user_Run2024A_v1_250130_123456",
+    "status": "queued",
+    "previous_status": "held",
+    "message": "Request released to admission queue."
+}
+
+# Manually fail a HELD request
+POST /api/v1/requests/user_Run2024A_v1_250130_123456/fail
+{
+    "reason": "Unrecoverable input data corruption"
+}
+
+Response:
+{
+    "request_name": "user_Run2024A_v1_250130_123456",
+    "status": "failed",
+    "previous_status": "held",
+    "message": "Request marked as failed."
+}
+
+# Kill and clone a HELD request with version increment
+POST /api/v1/requests/user_Run2024A_v1_250130_123456/restart
+{
+    "reason": "Bad configuration, need fresh start"
+}
+
+Response:
+{
+    "original_request": "user_Run2024A_v1_250130_123456",
+    "original_status": "draining",
+    "new_request": "user_Run2024A_v2_250130_789012",
+    "new_status": "queued",
+    "processing_version": 2,
+    "message": "Original request being drained. New request queued with incremented processing version."
 }
 
 # Submit with partial production (single step: 10% at full priority, rest at 80k)

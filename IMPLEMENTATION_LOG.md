@@ -3318,3 +3318,43 @@ Added `HELD` as a first-class request state for operator review, replacing the p
 - `pytest tests/unit/test_enums.py -v` — 9/9 passed
 - `pytest tests/unit/test_lifecycle.py -v` — 51/51 passed (40 existing + 11 new)
 - `pytest tests/unit/ -v` — 399/399 passed (zero regressions)
+
+---
+
+## Spec v2.10.0 — HELD State API Documentation
+
+**Date**: 2026-02-27
+**Spec Version**: 2.9.0 → 2.10.0
+
+### What Changed
+
+Updated `docs/spec.md` to document the HELD state operator action endpoints and usage examples that were implemented in the previous commit (e3d1e1c).
+
+#### Section 7.1 — Endpoint Table
+
+Added three new endpoints and updated one:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /api/v1/requests/{name}/release` | Release HELD request to admission queue |
+| `POST /api/v1/requests/{name}/fail` | Manually fail a HELD/PARTIAL request |
+| `GET /api/v1/requests/{name}/errors` | Get error summary for request |
+| `POST /api/v1/requests/{name}/restart` | Updated description: "Kill and clone with version increment" |
+
+#### Section 7.2 — API Examples
+
+Added four new example interactions following existing style (request + response JSON):
+
+1. **GET /errors** — Inspect error summary for a HELD request (category counts, site summary, bad input files)
+2. **POST /release** — Release HELD → QUEUED with reason
+3. **POST /fail** — Fail HELD → FAILED with reason
+4. **POST /restart** — Kill and clone, returns new request name with incremented processing version
+
+#### Version Metadata
+
+Bumped spec version 2.9.0 → 2.10.0 and date to 2026-02-27.
+
+### Verification
+
+- Reviewed all existing HELD references in spec (enum, dispatch table, timeouts, error handler, recovery model, DD-14) — all consistent with new API section
+- No code changes, no tests to run
