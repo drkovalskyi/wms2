@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Any
+
+
+def _normalize_arch(value: Any) -> str:
+    """Normalize ScramArch: ReqMgr2 stores it as a list, we need a string."""
+    if isinstance(value, list):
+        return value[0] if value else ""
+    return value or ""
 
 
 @dataclass
@@ -47,7 +55,7 @@ def parse_stepchain(data: dict) -> StepChainSpec:
             StepSpec(
                 name=step.get("StepName", f"step{i}"),
                 cmssw_version=step.get("CMSSWVersion") or data.get("CMSSWVersion", ""),
-                scram_arch=step.get("ScramArch") or data.get("ScramArch", ""),
+                scram_arch=_normalize_arch(step.get("ScramArch") or data.get("ScramArch", "")),
                 global_tag=step.get("GlobalTag") or data.get("GlobalTag", ""),
                 pset=f"steps/step{i}/cfg.py",
                 multicore=int(step.get("Multicore") or data.get("Multicore", 1)),

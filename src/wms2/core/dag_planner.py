@@ -1547,7 +1547,7 @@ run_all_steps_pipeline() {
         sj=$(python3 -c "import json; s=json.load(open('manifest.json'))['steps'][$step_idx]; print(json.dumps(s))")
         step_names+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")")
         step_cmssw+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['cmssw_version'])")")
-        step_arch+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['scram_arch'])")")
+        step_arch+=("$(echo "$sj" | python3 -c "import sys,json; a=json.load(sys.stdin)['scram_arch']; print(a[0] if isinstance(a,list) else a)")")
         step_pset+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin)['pset'])")")
         step_input_step+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('input_step',''))")")
         step_nthreads+=("$(echo "$sj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('multicore',1))")")
@@ -1896,7 +1896,7 @@ run_cmssw_mode() {
         STEP_JSON=$(python3 -c "import json; s=json.load(open('manifest.json'))['steps'][$step_idx]; print(json.dumps(s))")
         STEP_NAME=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
         CMSSW_VER=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['cmssw_version'])")
-        STEP_ARCH=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['scram_arch'])")
+        STEP_ARCH=$(echo "$STEP_JSON" | python3 -c "import sys,json; a=json.load(sys.stdin)['scram_arch']; print(a[0] if isinstance(a,list) else a)")
         PSET_PATH=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['pset'])")
         INPUT_STEP=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('input_step',''))")
         NTHREADS=$(echo "$STEP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('multicore',1))")
@@ -2719,6 +2719,8 @@ def detect_host_os():
 
 def resolve_container(scram_arch):
     """Find apptainer container for cross-OS execution. Returns path or empty string."""
+    if isinstance(scram_arch, list):
+        scram_arch = scram_arch[0] if scram_arch else ""
     arch_os = scram_arch.split("_")[0]
     host_os = detect_host_os()
     if arch_os == host_os:

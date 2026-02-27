@@ -143,8 +143,10 @@ def _build_manifest(request_data: dict[str, Any], mode: str) -> dict[str, Any]:
         return to_manifest(spec)
 
     # Legacy single-step CMSSW mode
+    from wms2.core.stepchain import _normalize_arch
+
     cmssw_version = request_data.get("CMSSWVersion", "")
-    scram_arch = request_data.get("ScramArch", "")
+    scram_arch = _normalize_arch(request_data.get("ScramArch", ""))
     global_tag = request_data.get("GlobalTag", "")
     multicore = int(request_data.get("Multicore", 1))
     memory_mb = int(request_data.get("Memory", 2048))
@@ -292,12 +294,17 @@ def _create_test_pset(step_name: str, global_tag: str) -> str:
     Reads input, applies global tag, writes output.
     For real production, PSets come from ConfigCache (future).
     """
+    import re
+    # CMSSW Process name must be alphanumeric only (no hyphens, dots, etc.)
+    proc_name = re.sub(r"[^A-Za-z0-9]", "", step_name.upper())
+    if not proc_name:
+        proc_name = "PROCESS"
     return f'''\
 # Auto-generated test PSet for step: {step_name}
 # Global tag: {global_tag}
 import FWCore.ParameterSet.Config as cms
 
-process = cms.Process("{step_name.upper()}")
+process = cms.Process("{proc_name}")
 
 process.source = cms.Source("PoolSource",
     fileNames=cms.untracked.vstring()

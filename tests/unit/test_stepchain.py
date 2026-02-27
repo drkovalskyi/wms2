@@ -2,7 +2,7 @@
 
 import pytest
 
-from wms2.core.stepchain import StepChainSpec, StepSpec, parse_stepchain, to_manifest
+from wms2.core.stepchain import StepChainSpec, StepSpec, _normalize_arch, parse_stepchain, to_manifest
 
 
 class TestParseStepchain:
@@ -342,3 +342,38 @@ class TestParseStepchain:
         assert spec.time_per_event == 1.0
         assert spec.size_per_event == 1.5
         assert spec.filter_efficiency == 1.0
+
+    def test_scram_arch_list_normalized(self):
+        """ReqMgr2 stores ScramArch as a list — must normalize to string."""
+        data = {
+            "RequestName": "list_arch_test",
+            "StepChain": 2,
+            "CMSSWVersion": "CMSSW_13_0_23",
+            "ScramArch": ["el8_amd64_gcc11"],
+            "GlobalTag": "GT",
+            "Step1": {
+                "StepName": "GEN",
+                "ScramArch": ["el8_amd64_gcc11"],
+            },
+            "Step2": {
+                "StepName": "RECO",
+                "InputStep": "GEN",
+                # No step-level ScramArch — inherits top-level list
+            },
+        }
+        spec = parse_stepchain(data)
+        assert spec.steps[0].scram_arch == "el8_amd64_gcc11"
+        assert spec.steps[1].scram_arch == "el8_amd64_gcc11"
+
+        # Manifest should also have strings, not lists
+        manifest = to_manifest(spec)
+        assert manifest["steps"][0]["scram_arch"] == "el8_amd64_gcc11"
+        assert manifest["steps"][1]["scram_arch"] == "el8_amd64_gcc11"
+
+    def test_normalize_arch_helper(self):
+        """_normalize_arch handles all input variants."""
+        assert _normalize_arch(["el8_amd64_gcc11"]) == "el8_amd64_gcc11"
+        assert _normalize_arch("el8_amd64_gcc11") == "el8_amd64_gcc11"
+        assert _normalize_arch([]) == ""
+        assert _normalize_arch("") == ""
+        assert _normalize_arch(None) == ""
