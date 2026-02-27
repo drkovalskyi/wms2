@@ -543,7 +543,7 @@ def _generate_dag_files(
     # Write shared config and scripts
     _write_file(
         str(submit_path / "dagman.config"),
-        "DAGMAN_MAX_RESCUE_NUM = 10\nDAGMAN_USER_LOG_SCAN_INTERVAL = 5\n",
+        "DAGMAN_USE_STRICT = 0\nDAGMAN_MAX_RESCUE_NUM = 10\nDAGMAN_USER_LOG_SCAN_INTERVAL = 5\n",
     )
     _write_elect_site_script(str(submit_path / "elect_site.sh"))
     _write_pin_site_script(str(submit_path / "pin_site.sh"))
@@ -761,8 +761,10 @@ def _generate_group_dag(
 
     # Merge node
     merge_args = f"--sandbox {sandbox_ref}"
+    merge_transfer: list[str] = []
     if output_info_path:
-        merge_args += f" --output-info {output_info_path}"
+        merge_args += f" --output-info {os.path.basename(output_info_path)}"
+        merge_transfer.append(output_info_path)
     _write_submit_file(
         str(group_dir / "merge.sub"),
         executable=merge_exe,
@@ -770,6 +772,7 @@ def _generate_group_dag(
         description="merge node",
         memory_mb=memory_mb,
         disk_kb=disk_kb,
+        transfer_input_files=merge_transfer or None,
     )
     lines.append("JOB merge merge.sub")
     lines.append(
@@ -782,13 +785,16 @@ def _generate_group_dag(
 
     # Cleanup node
     cleanup_args = ""
+    cleanup_transfer: list[str] = []
     if output_info_path:
-        cleanup_args = f"--output-info {output_info_path}"
+        cleanup_args = f"--output-info {os.path.basename(output_info_path)}"
+        cleanup_transfer.append(output_info_path)
     _write_submit_file(
         str(group_dir / "cleanup.sub"),
         executable=cleanup_exe,
         arguments=cleanup_args,
         description="cleanup node",
+        transfer_input_files=cleanup_transfer or None,
     )
     lines.append("JOB cleanup cleanup.sub")
     lines.append(

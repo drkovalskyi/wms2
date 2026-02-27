@@ -248,27 +248,41 @@ def _build_simulator_steps(request_data: dict[str, Any]) -> list[dict[str, Any]]
     """Build per-step simulator config with physics-based resource parameters.
 
     Extracts step names from StepChain request data, assigns default profiles
-    based on step type, and sets output_module to data_tier + "output".
+    based on step type, and maps data tiers from OutputDatasets so that the
+    simulator FJR ModuleLabels match the real data tiers (AODSIM, etc.).
     """
     multicore = int(request_data.get("Multicore", 1))
     n_steps = int(request_data.get("StepChain", 1))
 
-    steps: list[dict[str, Any]] = []
+    # Extract data tiers from OutputDatasets (last path component)
+    # OutputDatasets entries correspond 1:1 with kept steps, in order.
+    output_tiers: list[str] = []
+    for ds in request_data.get("OutputDatasets", []):
+        parts = ds.strip("/").split("/")
+        if len(parts) >= 3:
+            output_tiers.append(parts[-1])  # e.g. "AODSIM"
+
+    # First pass: collect steps and mark which ones keep output
+    raw_steps: list[tuple[str, dict, dict, bool]] = []
     for i in range(1, n_steps + 1):
-        step_key = f"Step{i}"
-        step_data = request_data.get(step_key, {})
+        step_data = request_data.get(f"Step{i}", {})
         step_name = step_data.get("StepName", f"STEP{i}")
-
         profile = _get_simulator_profile(step_name)
+        keep_output = step_data.get("KeepOutput", i == n_steps)
+        raw_steps.append((step_name, step_data, profile, keep_output))
 
-        # Use step name as data tier (e.g. "GEN-SIM", "DIGI", "RECO")
-        data_tier = step_name
+    # Map kept steps to OutputDatasets tiers
+    tier_idx = 0
+    steps: list[dict[str, Any]] = []
+    for step_name, step_data, profile, keep_output in raw_steps:
+        if keep_output and tier_idx < len(output_tiers):
+            data_tier = output_tiers[tier_idx]
+            tier_idx += 1
+        else:
+            # Non-kept step or no OutputDatasets: use step name as fallback
+            data_tier = step_name
 
-        # output_module: data_tier + "output" for direct tier matching
         output_module = data_tier + "output"
-
-        # Last step keeps output by default; intermediate steps don't
-        keep_output = i == n_steps
 
         steps.append({
             "name": step_name,
