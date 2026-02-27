@@ -262,6 +262,9 @@ class DAGPlanner:
         ncpus = config.get("multicore", 0)
         if ncpus:
             resource_params["ncpus"] = int(ncpus)
+        test_fraction = config.get("test_fraction")
+        if test_fraction:
+            resource_params["test_fraction"] = float(test_fraction)
 
         # Query banned sites for this workflow
         banned_sites: list[str] = []
@@ -737,6 +740,8 @@ def _generate_group_dag(
             proc_args += f" --events-per-job {node.events_per_job}"
         if ncpus > 0:
             proc_args += f" --ncpus {ncpus}"
+        if rp.get("test_fraction"):
+            proc_args += f" --test-fraction {rp['test_fraction']}"
 
         _write_submit_file(
             str(group_dir / f"{node_name}.sub"),
@@ -1044,6 +1049,7 @@ NODE_INDEX=0
 PILOT_MODE=false
 OUTPUT_INFO=""
 OVERRIDE_NCPUS=0
+TEST_FRACTION=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1056,9 +1062,17 @@ while [[ $# -gt 0 ]]; do
         --output-info) OUTPUT_INFO="$2";   shift 2 ;;
         --pilot)      PILOT_MODE=true;     shift   ;;
         --ncpus)      OVERRIDE_NCPUS="$2"; shift 2 ;;
+        --test-fraction) TEST_FRACTION="$2"; shift 2 ;;
         *)            echo "Unknown arg: $1" >&2; shift ;;
     esac
 done
+
+# ── Test fraction: reduce events per job for fast testing ─────
+if [[ "$TEST_FRACTION" != "0" && "$EVENTS_PER_JOB" -gt 0 ]]; then
+    ORIG_EVENTS=$EVENTS_PER_JOB
+    EVENTS_PER_JOB=$(python3 -c "print(max(1, int($EVENTS_PER_JOB * $TEST_FRACTION)))")
+    echo "TEST MODE: events_per_job reduced from $ORIG_EVENTS to $EVENTS_PER_JOB (fraction=$TEST_FRACTION)"
+fi
 
 START_TIME=$(date +%s)
 echo "=== WMS2 Processing Wrapper ==="

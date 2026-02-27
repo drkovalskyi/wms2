@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--ca-bundle", default=None, help="CA bundle file for CERN Grid verification")
     imp.add_argument("--db-url", default=None, help="Override database URL")
     imp.add_argument("--poll-interval", type=int, default=10, help="Monitoring poll interval (seconds)")
+    imp.add_argument("--test-fraction", type=float, default=None,
+                     help="Process only this fraction of events per job (e.g. 0.01 = 1%%). "
+                          "DAG structure unchanged; jobs finish faster. Not for production.")
     imp.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
     return parser
@@ -230,6 +233,10 @@ async def run_import(args: argparse.Namespace) -> None:
     print(f"  max_files:     {settings.max_input_files or 'all'}")
     print(f"  sandbox_mode:  {sandbox_mode}")
     print(f"  dry_run:       {dry_run}")
+    if args.test_fraction is not None:
+        print(f"  test_fraction: {args.test_fraction}")
+        print("  *** TEST MODE: each job will process only "
+              f"{args.test_fraction*100:.1f}% of nominal events ***")
     print()
 
     # SSL context for CERN Grid services
@@ -292,6 +299,8 @@ async def run_import(args: argparse.Namespace) -> None:
             if reqdata.get("_is_gen"):
                 config_data["_is_gen"] = True
                 config_data["request_num_events"] = reqdata.get("RequestNumEvents", 0)
+            if args.test_fraction is not None:
+                config_data["test_fraction"] = args.test_fraction
 
             # Create sandbox
             submit_dir = os.path.join(settings.submit_base_dir, request_name)
