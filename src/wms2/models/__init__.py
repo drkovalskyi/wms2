@@ -13,6 +13,7 @@ from .enums import (
 from .processing_block import ProcessingBlock
 from .request import ProductionStep, Request, RequestCreate, RequestUpdate
 from .site import Site
+from .site_ban import SiteBan, SiteBanCreate
 from .workflow import PilotMetrics, StepProfile, Workflow
 
 __all__ = [
@@ -33,6 +34,8 @@ __all__ = [
     "RequestStatus",
     "RequestUpdate",
     "Site",
+    "SiteBan",
+    "SiteBanCreate",
     "SiteStatus",
     "SplittingAlgo",
     "StatusTransition",

@@ -18,6 +18,7 @@ from wms2.core.dag_planner import DAGPlanner
 from wms2.core.error_handler import ErrorHandler
 from wms2.core.lifecycle_manager import RequestLifecycleManager
 from wms2.core.output_manager import OutputManager
+from wms2.core.site_manager import SiteManager
 from wms2.core.workflow_manager import WorkflowManager
 from wms2.db.engine import create_engine, create_session_factory
 from wms2.db.repository import Repository
@@ -75,11 +76,12 @@ async def lifespan(app: FastAPI):
     async def run_lifecycle():
         async with session_factory() as session:
             repo = Repository(session)
+            sm = SiteManager(repo, settings)
             wm = WorkflowManager(repo, reqmgr)
-            dp = DAGPlanner(repo, dbs, rucio, condor, settings)
+            dp = DAGPlanner(repo, dbs, rucio, condor, settings, site_manager=sm)
             dm = DAGMonitor(repo, condor)
             om = OutputManager(repo, dbs, rucio, settings)
-            eh = ErrorHandler(repo, condor, settings)
+            eh = ErrorHandler(repo, condor, settings, site_manager=sm)
             lm = RequestLifecycleManager(
                 repo, condor, settings,
                 workflow_manager=wm,

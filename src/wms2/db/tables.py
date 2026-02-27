@@ -166,3 +166,17 @@ class SiteRow(Base):
     storage_path: Mapped[str | None] = mapped_column(Text)
     config_data: Mapped[dict] = mapped_column(JSONB, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SiteBanRow(Base):
+    __tablename__ = "site_bans"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    site_name: Mapped[str] = mapped_column(String(100), ForeignKey("sites.name"), nullable=False)
+    workflow_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("workflows.id"))
+    reason: Mapped[str | None] = mapped_column(Text)
+    failure_data: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_by: Mapped[str | None] = mapped_column(String(100))

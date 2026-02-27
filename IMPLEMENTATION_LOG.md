@@ -3228,3 +3228,53 @@ Implemented the full POST script error classification and data collection pipeli
 - Generated `wms2_post_collect.py` compiles as valid Python
 - Generated `post_script.sh` handles all classification categories
 - Collector integration test: writes correct post.json from mock FJR XML
+
+## Site Manager & Site Banning (2026-02-27)
+
+Implemented the full site banning flow per `docs/error_handling.md` Section 6. The Error Handler now persists bans when it detects problem sites, the DAG Planner excludes banned sites from future DAGs via HTCondor Requirements, and operators can manage bans through the API.
+
+### What Was Built
+
+#### New Files
+
+| File | Purpose |
+|------|---------|
+| `src/wms2/core/site_manager.py` | Core component: ban creation, promotion, querying, removal |
+| `src/wms2/models/site_ban.py` | Pydantic models for API (SiteBan, SiteBanCreate) |
+| `tests/unit/test_site_manager.py` | 12 unit tests for SiteManager |
+
+#### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/wms2/db/tables.py` | Added `SiteBanRow` table (FK to sites, workflows; expiry, removal tracking) |
+| `src/wms2/db/repository.py` | 7 new methods: create/query/remove site bans, count for promotion |
+| `src/wms2/config.py` | 4 new settings: `site_ban_duration_days`, `site_ban_promotion_threshold`, `site_ban_min_failures`, `site_ban_failure_ratio` |
+| `src/wms2/models/__init__.py` | Export SiteBan, SiteBanCreate |
+| `src/wms2/core/error_handler.py` | Accepts `site_manager`, calls `ban_site()` for problem sites, added `_build_failure_data()` |
+| `src/wms2/core/dag_planner.py` | `banned_sites` threaded through `_generate_dag_files` → `_generate_group_dag` → landing node's `_write_submit_file`; DAGPlanner queries SiteManager before DAG generation |
+| `src/wms2/api/sites.py` | 4 new endpoints: GET `/bans/active`, GET `/{site}/bans`, POST `/{site}/ban`, DELETE `/{site}/ban` |
+| `src/wms2/main.py` | Creates SiteManager, passes to ErrorHandler and DAGPlanner |
+| `tests/unit/conftest.py` | Added mock methods for all 7 new repository methods |
+| `tests/unit/test_error_handler.py` | 3 new tests: ban integration, no-site-manager fallback, failure data builder |
+| `tests/unit/test_dag_generator.py` | 4 new tests: banned sites on landing node, not on proc nodes, no-ban no-Requirements, multiple bans |
+
+### Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Only landing node gets ban Requirements | Processing/merge/cleanup nodes are pinned to the elected site by `pin_site.sh`. Banning at the landing node prevents HTCondor from matching the work unit to a banned site during initial negotiation. |
+| Per-workflow bans promote to system-wide | When N workflows independently ban the same site (threshold=3), the site has a systemic problem. System-wide ban prevents all workflows from trying it. |
+| `workflow_id IS NULL` = system-wide | Simple schema design: NULL FK means the ban applies globally. |
+| `removed_at IS NULL` = active | Soft-delete pattern: bans aren't deleted, they're marked as removed with timestamp and operator identity. |
+| `=!=` (ClassAd IS NOT) for Requirements | ClassAd `=!=` is "is not identical to" — works correctly even when `GLIDEIN_CMSSite` is undefined (evaluates to TRUE, unlike `!=`). |
+| SiteManager instantiated inline in API | API endpoints create a short-lived SiteManager with the request's repository session. Avoids needing app-level state for the site manager in API context. |
+
+### Verification
+
+- `pytest tests/unit/test_site_manager.py -v` — 12/12 passed
+- `pytest tests/unit/test_error_handler.py -v` — 20/20 passed
+- `pytest tests/unit/test_dag_generator.py -v` — 52/52 passed
+- `pytest tests/unit/ -v` — 388/388 passed (zero regressions)
+- `python -c "from wms2.core.site_manager import SiteManager; print('OK')"` — import check passed
+- Landing node submit file verified: `Requirements = (TARGET.GLIDEIN_CMSSite =!= "T2_US_Bad")`

@@ -86,12 +86,14 @@ class DAGPlanner:
         rucio_adapter: RucioAdapter,
         condor_adapter: CondorAdapter,
         settings: Settings,
+        site_manager=None,
     ):
         self.db = repository
         self.dbs = dbs_adapter
         self.rucio = rucio_adapter
         self.condor = condor_adapter
         self.settings = settings
+        self.site_manager = site_manager
 
     # ── Pilot Phase ──────────────────────────────────────────
 
@@ -261,6 +263,13 @@ class DAGPlanner:
         if ncpus:
             resource_params["ncpus"] = int(ncpus)
 
+        # Query banned sites for this workflow
+        banned_sites: list[str] = []
+        if self.site_manager:
+            banned_sites = await self.site_manager.get_banned_sites(
+                workflow_id=workflow.id
+            )
+
         dag_file_path = _generate_dag_files(
             submit_dir=submit_dir,
             workflow_id=str(workflow.id),
@@ -274,6 +283,7 @@ class DAGPlanner:
             local_pfn_prefix=self.settings.local_pfn_prefix,
             sandbox_path=sandbox_path,
             resource_params=resource_params or None,
+            banned_sites=banned_sites or None,
         )
 
         # 8. Count totals
@@ -525,6 +535,7 @@ def _generate_dag_files(
     local_pfn_prefix: str = "",
     sandbox_path: str | None = None,
     resource_params: dict[str, int] | None = None,
+    banned_sites: list[str] | None = None,
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -569,6 +580,7 @@ def _generate_dag_files(
             local_pfn_prefix=local_pfn_prefix,
             sandbox_path=sandbox_path,
             resource_params=resource_params,
+            banned_sites=banned_sites,
         )
 
     # Category throttling for merge groups
@@ -594,6 +606,7 @@ def _generate_group_dag(
     local_pfn_prefix: str = "",
     sandbox_path: str | None = None,
     resource_params: dict[str, int] | None = None,
+    banned_sites: list[str] | None = None,
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
     exe = executables or {}
@@ -697,6 +710,7 @@ def _generate_group_dag(
         executable="/bin/true",
         arguments="",
         description="landing node",
+        banned_sites=banned_sites,
     )
     lines.append("JOB landing landing.sub")
     lines.append(
@@ -830,6 +844,7 @@ def _write_submit_file(
     ncpus: int = 0,
     transfer_input_files: list[str] | None = None,
     environment: dict[str, str] | None = None,
+    banned_sites: list[str] | None = None,
 ) -> None:
     lines = [
         f"# {description}",
@@ -855,6 +870,11 @@ def _write_submit_file(
         lines.append(f"transfer_input_files = {','.join(transfer_input_files)}")
     if desired_sites:
         lines.append(f'+DESIRED_Sites = "{desired_sites}"')
+    if banned_sites:
+        neg = " && ".join(
+            f'(TARGET.GLIDEIN_CMSSite =!= "{s}")' for s in banned_sites
+        )
+        lines.append(f"Requirements = {neg}")
     lines.append("queue 1")
     _write_file(path, "\n".join(lines) + "\n")
 

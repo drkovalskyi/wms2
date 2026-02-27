@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     error_hold_threshold: float = 0.20
     error_max_rescue_attempts: int = 3
 
+    # Site Banning
+    site_ban_duration_days: int = 7
+    site_ban_promotion_threshold: int = 3
+    site_ban_min_failures: int = 3
+    site_ban_failure_ratio: float = 0.50
+
     # API
     api_prefix: str = "/api/v1"
 

@@ -353,3 +353,77 @@ async def test_analyze_site_failures_ignores_low_ratio(handler):
     ]
     problem = handler.analyze_site_failures(post_data)
     assert problem == []
+
+
+# ── Site Banning Integration ─────────────────────────────────
+
+
+async def test_handle_dag_completion_bans_problem_sites(repo, condor):
+    """site_manager.ban_site called for each problem site."""
+    settings = _make_settings()
+    site_manager = AsyncMock()
+    site_manager.ban_site = AsyncMock(return_value=MagicMock())
+    handler = ErrorHandler(repo, condor, settings, site_manager=site_manager)
+
+    dag = _make_dag(nodes_done=16, nodes_failed=4, total_nodes=20)
+    request = make_request_row(status="active")
+    workflow = _make_workflow(dag_id=dag.id)
+
+    # Create post data with a problem site (>50% failure, >=3 failures)
+    post_data = [
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "infrastructure"}},
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "infrastructure"}},
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "infrastructure"}},
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "data"}},
+        {"final": True, "job": {"site": "T1_US_Good"}, "classification": {"category": "success"}},
+    ]
+
+    with patch.object(handler, "read_post_data", return_value=post_data):
+        await handler.handle_dag_completion(dag, request, workflow)
+
+    # ban_site called for the problem site
+    site_manager.ban_site.assert_called()
+    ban_calls = site_manager.ban_site.call_args_list
+    banned_sites = [c[1]["site_name"] for c in ban_calls]
+    assert "T2_US_Bad" in banned_sites
+
+
+async def test_handle_dag_completion_no_site_manager(repo, condor):
+    """Graceful skip when site_manager is None (existing behavior)."""
+    settings = _make_settings()
+    handler = ErrorHandler(repo, condor, settings)  # no site_manager
+
+    dag = _make_dag(nodes_done=16, nodes_failed=4, total_nodes=20)
+    request = make_request_row(status="active")
+    workflow = _make_workflow(dag_id=dag.id)
+
+    post_data = [
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "infrastructure"}},
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "infrastructure"}},
+        {"final": True, "job": {"site": "T2_US_Bad"}, "classification": {"category": "infrastructure"}},
+    ]
+
+    with patch.object(handler, "read_post_data", return_value=post_data):
+        # Should not raise — just logs warning
+        action = await handler.handle_dag_completion(dag, request, workflow)
+
+    assert action == "hold"
+
+
+# ── Failure Data Builder ─────────────────────────────────────
+
+
+async def test_build_failure_data(handler):
+    """_build_failure_data summarizes failures for a specific site."""
+    post_data = [
+        {"job": {"site": "T2_US_Test"}, "classification": {"category": "infrastructure"}},
+        {"job": {"site": "T2_US_Test"}, "classification": {"category": "data"}},
+        {"job": {"site": "T2_US_Test"}, "classification": {"category": "success"}},
+        {"job": {"site": "T1_US_Other"}, "classification": {"category": "infrastructure"}},
+    ]
+    result = handler._build_failure_data(post_data, "T2_US_Test")
+    assert result["site"] == "T2_US_Test"
+    assert result["total_jobs"] == 3
+    assert result["failed_jobs"] == 2
+    assert result["categories"]["infrastructure"] == 1
+    assert result["categories"]["data"] == 1

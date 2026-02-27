@@ -25,10 +25,12 @@ logger = logging.getLogger(__name__)
 
 
 class ErrorHandler:
-    def __init__(self, repository: Repository, condor_adapter: CondorAdapter, settings: Settings):
+    def __init__(self, repository: Repository, condor_adapter: CondorAdapter, settings: Settings,
+                 site_manager=None):
         self.db = repository
         self.condor = condor_adapter
         self.settings = settings
+        self.site_manager = site_manager
 
     async def handle_dag_completion(self, dag, request, workflow) -> str:
         """Handle DAG that completed with failures. Returns 'rescue' or 'hold'."""
@@ -50,6 +52,14 @@ class ErrorHandler:
                     "Problem sites for %s: %s",
                     request.request_name, ", ".join(problem_sites),
                 )
+                if self.site_manager:
+                    for site in problem_sites:
+                        await self.site_manager.ban_site(
+                            site_name=site,
+                            workflow_id=workflow.id,
+                            reason=f"High failure rate for {request.request_name}",
+                            failure_data=self._build_failure_data(post_data, site),
+                        )
 
         # Check rescue attempt count
         rescue_count = await self._count_rescue_chain(dag)
@@ -107,6 +117,28 @@ class ErrorHandler:
             if total > 0 and failures / total > 0.5 and failures >= 3:
                 problem_sites.append(site)
         return problem_sites
+
+    def _build_failure_data(self, post_data: list[dict], site_name: str) -> dict:
+        """Build failure summary for a specific site from POST data."""
+        total = 0
+        failed = 0
+        categories: dict[str, int] = defaultdict(int)
+        for entry in post_data:
+            site = entry.get("job", {}).get("site", "unknown")
+            if site != site_name:
+                continue
+            total += 1
+            cat = entry.get("classification", {}).get("category", "unknown")
+            if cat in ("infrastructure", "infrastructure_memory", "data"):
+                failed += 1
+                categories[cat] += 1
+        return {
+            "site": site_name,
+            "total_jobs": total,
+            "failed_jobs": failed,
+            "failure_ratio": failed / max(total, 1),
+            "categories": dict(categories),
+        }
 
     def _log_failure_summary(self, post_data: list[dict], request_name: str):
         """Log aggregated failure summary from POST data."""

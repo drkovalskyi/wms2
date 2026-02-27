@@ -744,6 +744,72 @@ class TestEventRangeArgs:
         assert "--node-index 0" in content
 
 
+class TestBannedSites:
+    """Tests for site ban Requirements in submit files."""
+
+    def test_banned_sites_on_landing_node(self, tmp_path):
+        """Landing node submit file has negative Requirements for banned sites."""
+        groups = _make_merge_groups(1, 2)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            banned_sites=["T2_US_Bad"],
+        )
+        content = (tmp_path / "mg_000000" / "landing.sub").read_text()
+        assert 'Requirements = (TARGET.GLIDEIN_CMSSite =!= "T2_US_Bad")' in content
+
+    def test_banned_sites_not_on_processing_nodes(self, tmp_path):
+        """Processing node submit files do NOT have ban Requirements (pinned by pin_site.sh)."""
+        groups = _make_merge_groups(1, 2)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            banned_sites=["T2_US_Bad"],
+        )
+        proc_content = (tmp_path / "mg_000000" / "proc_000000.sub").read_text()
+        assert "Requirements" not in proc_content
+        merge_content = (tmp_path / "mg_000000" / "merge.sub").read_text()
+        assert "Requirements" not in merge_content
+
+    def test_no_banned_sites_no_requirements(self, tmp_path):
+        """No Requirements line when banned_sites is None or empty."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+        )
+        content = (tmp_path / "mg_000000" / "landing.sub").read_text()
+        assert "Requirements" not in content
+
+    def test_multiple_banned_sites(self, tmp_path):
+        """Multiple banned sites joined with && in Requirements."""
+        groups = _make_merge_groups(1, 1)
+        _generate_dag_files(
+            submit_dir=str(tmp_path),
+            workflow_id="test-wf-001",
+            merge_groups=groups,
+            sandbox_url="https://example.com/sandbox.tar.gz",
+            category_throttles={"Processing": 5000, "Merge": 100, "Cleanup": 50},
+            banned_sites=["T2_US_Bad", "T2_DE_Bad"],
+        )
+        content = (tmp_path / "mg_000000" / "landing.sub").read_text()
+        assert 'TARGET.GLIDEIN_CMSSite =!= "T2_US_Bad"' in content
+        assert 'TARGET.GLIDEIN_CMSSite =!= "T2_DE_Bad"' in content
+        assert "&&" in content
+        # Should be a single Requirements line
+        req_lines = [l for l in content.splitlines() if l.startswith("Requirements")]
+        assert len(req_lines) == 1
+
+
 class TestMetrics:
     """Tests for per-step resource utilization metrics."""
 

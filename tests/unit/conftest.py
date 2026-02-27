@@ -40,6 +40,14 @@ def mock_repository():
     repo.count_processing_blocks_by_status = AsyncMock(return_value=0)
     repo.count_requests_by_status = AsyncMock(return_value={})
     repo.create_dag_history = AsyncMock()
+    # Site ban methods
+    repo.create_site_ban = AsyncMock()
+    repo.get_active_bans_for_site = AsyncMock(return_value=[])
+    repo.get_active_system_bans = AsyncMock(return_value=[])
+    repo.get_active_workflow_bans = AsyncMock(return_value=[])
+    repo.count_active_workflow_bans_for_site = AsyncMock(return_value=0)
+    repo.remove_active_bans_for_site = AsyncMock(return_value=0)
+    repo.list_all_active_bans = AsyncMock(return_value=[])
     return repo
 
 

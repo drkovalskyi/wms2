@@ -11,6 +11,7 @@ from .tables import (
     DAGRow,
     ProcessingBlockRow,
     RequestRow,
+    SiteBanRow,
     SiteRow,
     WorkflowRow,
 )
@@ -258,4 +259,83 @@ class Repository:
 
     async def list_sites(self) -> list[SiteRow]:
         result = await self.session.execute(select(SiteRow).order_by(SiteRow.name))
+        return list(result.scalars().all())
+
+    # ── Site Bans ────────────────────────────────────────────────
+
+    async def create_site_ban(self, **kwargs: Any) -> SiteBanRow:
+        row = SiteBanRow(**kwargs)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_active_bans_for_site(self, site_name: str) -> list[SiteBanRow]:
+        stmt = select(SiteBanRow).where(
+            SiteBanRow.site_name == site_name,
+            SiteBanRow.removed_at.is_(None),
+            SiteBanRow.expires_at > func.now(),
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_active_system_bans(self) -> list[SiteBanRow]:
+        stmt = select(SiteBanRow).where(
+            SiteBanRow.workflow_id.is_(None),
+            SiteBanRow.removed_at.is_(None),
+            SiteBanRow.expires_at > func.now(),
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_active_workflow_bans(self, workflow_id: UUID) -> list[SiteBanRow]:
+        stmt = select(SiteBanRow).where(
+            SiteBanRow.workflow_id == workflow_id,
+            SiteBanRow.removed_at.is_(None),
+            SiteBanRow.expires_at > func.now(),
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_active_workflow_bans_for_site(self, site_name: str) -> int:
+        stmt = (
+            select(func.count(SiteBanRow.workflow_id.distinct()))
+            .where(
+                SiteBanRow.site_name == site_name,
+                SiteBanRow.workflow_id.is_not(None),
+                SiteBanRow.removed_at.is_(None),
+                SiteBanRow.expires_at > func.now(),
+            )
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one()
+
+    async def remove_active_bans_for_site(
+        self, site_name: str, removed_by: str, workflow_id: UUID | None = None,
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(SiteBanRow)
+            .where(
+                SiteBanRow.site_name == site_name,
+                SiteBanRow.removed_at.is_(None),
+                SiteBanRow.expires_at > func.now(),
+            )
+            .values(removed_at=now, removed_by=removed_by)
+        )
+        if workflow_id is not None:
+            stmt = stmt.where(SiteBanRow.workflow_id == workflow_id)
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount
+
+    async def list_all_active_bans(self) -> list[SiteBanRow]:
+        stmt = (
+            select(SiteBanRow)
+            .where(
+                SiteBanRow.removed_at.is_(None),
+                SiteBanRow.expires_at > func.now(),
+            )
+            .order_by(SiteBanRow.created_at.desc())
+        )
+        result = await self.session.execute(stmt)
         return list(result.scalars().all())
