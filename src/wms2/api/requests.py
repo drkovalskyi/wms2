@@ -159,15 +159,118 @@ async def stop_request(
     }
 
 
-@router.post("/{request_name}/restart", response_model=dict)
-async def restart_request(
+@router.post("/{request_name}/release", response_model=dict)
+async def release_request(
     request_name: str,
+    raw_request: FastAPIRequest = None,
     repo: Repository = Depends(get_repository),
 ):
+    """Release a HELD request back to the admission queue."""
     existing = await repo.get_request(request_name)
     if not existing:
         raise HTTPException(status_code=404, detail="Request not found")
-    return {"message": "Restart requested", "request_name": request_name}
+
+    if existing.status != RequestStatus.HELD.value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only release requests in held state, "
+                   f"current status: {existing.status}",
+        )
+
+    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
+    if lm is None:
+        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
+
+    await lm.release_held_request(request_name)
+    return {
+        "request_name": request_name,
+        "status": "queued",
+        "previous_status": "held",
+        "message": f"Request {request_name} released to admission queue",
+    }
+
+
+@router.post("/{request_name}/fail", response_model=dict)
+async def fail_request(
+    request_name: str,
+    raw_request: FastAPIRequest = None,
+    repo: Repository = Depends(get_repository),
+):
+    """Fail a HELD or PARTIAL request: kill DAG, mark resources failed."""
+    existing = await repo.get_request(request_name)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    allowed = (RequestStatus.HELD.value, RequestStatus.PARTIAL.value)
+    if existing.status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only fail requests in held or partial state, "
+                   f"current status: {existing.status}",
+        )
+
+    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
+    if lm is None:
+        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
+
+    previous_status = existing.status
+    await lm.fail_request(request_name)
+    return {
+        "request_name": request_name,
+        "status": "failed",
+        "previous_status": previous_status,
+        "message": f"Request {request_name} marked as failed",
+    }
+
+
+@router.post("/{request_name}/restart", response_model=dict)
+async def restart_request(
+    request_name: str,
+    raw_request: FastAPIRequest = None,
+    repo: Repository = Depends(get_repository),
+):
+    """Kill+clone: create new request with incremented version, fail old."""
+    existing = await repo.get_request(request_name)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    allowed = (RequestStatus.HELD.value, RequestStatus.PARTIAL.value)
+    if existing.status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only restart requests in held or partial state, "
+                   f"current status: {existing.status}",
+        )
+
+    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
+    if lm is None:
+        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
+
+    new_name = await lm.restart_request(request_name)
+    return {
+        "request_name": request_name,
+        "new_request_name": new_name,
+        "status": "failed",
+        "message": f"Request {request_name} restarted as {new_name}",
+    }
+
+
+@router.get("/{request_name}/errors", response_model=dict)
+async def get_request_errors(
+    request_name: str,
+    raw_request: FastAPIRequest = None,
+    repo: Repository = Depends(get_repository),
+):
+    """Get error summary for a request (any state)."""
+    existing = await repo.get_request(request_name)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
+    if lm is None:
+        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
+
+    return await lm.get_error_summary(request_name)
 
 
 @router.get("/{request_name}/versions", response_model=list[Request])

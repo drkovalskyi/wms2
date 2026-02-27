@@ -404,7 +404,7 @@ async def test_active_partial_with_rescue(mock_repository, mock_condor, settings
 
 
 async def test_active_partial_without_error_handler(mock_repository, mock_condor, settings):
-    """PARTIAL without error_handler → request PARTIAL (backward compat)."""
+    """PARTIAL without error_handler → request HELD."""
     from wms2.core.dag_monitor import DAGPollResult
 
     dag = _make_dag(status="submitted", nodes_done=19, nodes_failed=1)
@@ -429,11 +429,11 @@ async def test_active_partial_without_error_handler(mock_repository, mock_condor
     await lm.evaluate_request(request)
 
     req_update = mock_repository.update_request.call_args
-    assert req_update[1]["status"] == RequestStatus.PARTIAL.value
+    assert req_update[1]["status"] == RequestStatus.HELD.value
 
 
 async def test_active_failed_with_error_handler(mock_repository, mock_condor, settings):
-    """FAILED + error_handler returns 'hold' → request PARTIAL (held for operator)."""
+    """FAILED + error_handler returns 'hold' → request HELD (held for operator)."""
     from wms2.core.dag_monitor import DAGPollResult
 
     mock_error_handler = AsyncMock()
@@ -464,7 +464,7 @@ async def test_active_failed_with_error_handler(mock_repository, mock_condor, se
         dag, request, workflow
     )
     req_update = mock_repository.update_request.call_args
-    assert req_update[1]["status"] == RequestStatus.PARTIAL.value
+    assert req_update[1]["status"] == RequestStatus.HELD.value
 
 
 async def test_handle_queued_rescue_dag_submits(lifecycle_manager, mock_repository, mock_condor):
@@ -881,3 +881,248 @@ async def test_aggregate_round_metrics():
     assert result2["cumulative_nodes_failed"] == 3  # 2 + 1
     assert result2["last_round_nodes_done"] == 8
     assert result2["last_round_work_units"] == 2
+
+
+# ── HELD State and Operator Action Tests ─────────────────────
+
+
+async def test_held_no_automatic_transition(lifecycle_manager, mock_repository):
+    """HELD handler is a no-op — no state transition."""
+    request = make_request_row(status="held")
+    await lifecycle_manager.evaluate_request(request)
+    mock_repository.update_request.assert_not_called()
+
+
+async def test_held_no_timeout(lifecycle_manager, settings):
+    """Request HELD for a long time is NOT considered stuck (no timeout)."""
+    old_time = datetime.now(timezone.utc) - timedelta(days=365)
+    request = make_request_row(status="held", updated_at=old_time)
+    assert lifecycle_manager._is_stuck(request) is False
+
+
+async def test_release_held_request(mock_repository, mock_condor, settings):
+    """release_held_request: HELD → QUEUED."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(status="held")
+    mock_repository.get_request.return_value = request
+
+    await lm.release_held_request("test-request-001")
+
+    call_kwargs = mock_repository.update_request.call_args
+    assert call_kwargs[1]["status"] == RequestStatus.QUEUED.value
+
+
+async def test_release_rejects_non_held(mock_repository, mock_condor, settings):
+    """release_held_request rejects non-HELD request."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(status="active")
+    mock_repository.get_request.return_value = request
+
+    with pytest.raises(ValueError, match="must be held"):
+        await lm.release_held_request("test-request-001")
+
+
+async def test_fail_request_cleanup(mock_repository, mock_condor, settings):
+    """fail_request: condor_rm + DAGs→FAILED + blocks→failed + request→FAILED."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(status="held")
+    mock_repository.get_request.return_value = request
+
+    dag = _make_dag(status="running")
+    workflow = _make_workflow(dag_id=dag.id)
+    mock_repository.get_workflow_by_request.return_value = workflow
+    mock_repository.get_dag.return_value = dag
+
+    # list_dags returns the running dag plus one ready dag
+    ready_dag = _make_dag(status="ready")
+    mock_repository.list_dags.return_value = [dag, ready_dag]
+
+    # get_processing_blocks returns one open block
+    block = MagicMock()
+    block.id = uuid.uuid4()
+    block.status = "open"
+    mock_repository.get_processing_blocks.return_value = [block]
+
+    await lm.fail_request("test-request-001")
+
+    # condor_rm called for running DAG
+    assert any(c[0] == "remove_job" for c in mock_condor.calls)
+
+    # Both non-terminal DAGs marked FAILED
+    dag_updates = mock_repository.update_dag.call_args_list
+    assert len(dag_updates) == 2
+    for call in dag_updates:
+        assert call[1]["status"] == "failed"
+
+    # Open block marked failed
+    mock_repository.update_processing_block.assert_called_once()
+    block_update = mock_repository.update_processing_block.call_args
+    assert block_update[1]["status"] == "failed"
+
+    # Request transitioned to FAILED
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.FAILED.value
+
+
+async def test_fail_request_no_workflow(mock_repository, mock_condor, settings):
+    """fail_request with no workflow → just transition to FAILED (no cleanup errors)."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(status="held")
+    mock_repository.get_request.return_value = request
+    mock_repository.get_workflow_by_request.return_value = None
+
+    await lm.fail_request("test-request-001")
+
+    # No condor_rm, no DAG updates, no block updates
+    assert len(mock_condor.calls) == 0
+    mock_repository.update_dag.assert_not_called()
+    mock_repository.update_processing_block.assert_not_called()
+
+    # Request still transitioned to FAILED
+    req_update = mock_repository.update_request.call_args
+    assert req_update[1]["status"] == RequestStatus.FAILED.value
+
+
+async def test_fail_rejects_active(mock_repository, mock_condor, settings):
+    """fail_request rejects ACTIVE request."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(status="active")
+    mock_repository.get_request.return_value = request
+
+    with pytest.raises(ValueError, match="must be held or partial"):
+        await lm.fail_request("test-request-001")
+
+
+async def test_restart_creates_clone(mock_repository, mock_condor, settings):
+    """restart_request: new request with version+1, old linked, old failed."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(
+        status="held",
+        request_data={"processing_version": 1, "some_param": "value"},
+    )
+    # get_request is called multiple times: once for restart, once for fail
+    mock_repository.get_request.return_value = request
+    mock_repository.get_workflow_by_request.return_value = None  # No workflow
+
+    new_name = await lm.restart_request("test-request-001")
+
+    assert new_name == "test-request-001_v2"
+
+    # create_request called with cloned data
+    create_call = mock_repository.create_request.call_args
+    assert create_call[1]["request_name"] == "test-request-001_v2"
+    assert create_call[1]["request_data"]["processing_version"] == 2
+    assert create_call[1]["request_data"]["some_param"] == "value"
+    assert create_call[1]["previous_version_request"] == "test-request-001"
+    assert create_call[1]["status"] == RequestStatus.SUBMITTED.value
+
+    # Old request linked to new
+    link_call = mock_repository.update_request.call_args_list[0]
+    assert link_call[1]["superseded_by_request"] == "test-request-001_v2"
+
+    # Old request transitioned to FAILED (via fail_request)
+    last_update = mock_repository.update_request.call_args
+    assert last_update[1]["status"] == RequestStatus.FAILED.value
+
+
+async def test_restart_preserves_fields(mock_repository, mock_condor, settings):
+    """restart_request clones requestor, campaign, payload_config, etc."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(
+        status="held",
+        request_name="my-req",
+        request_data={},
+        campaign="MyCampaign",
+        priority=50000,
+    )
+    request.payload_config = {"step1": "config"}
+    request.splitting_params = {"files_per_job": 5}
+    request.input_dataset = "/Data/Run/RECO"
+    request.urgent = False
+    request.adaptive = True
+    request.production_steps = [{"fraction": 0.5, "priority": 80000}]
+    request.cleanup_policy = "immediate_cleanup"
+
+    mock_repository.get_request.return_value = request
+    mock_repository.get_workflow_by_request.return_value = None
+
+    await lm.restart_request("my-req")
+
+    create_call = mock_repository.create_request.call_args
+    assert create_call[1]["requestor"] == "testuser"
+    assert create_call[1]["campaign"] == "MyCampaign"
+    assert create_call[1]["priority"] == 50000
+    assert create_call[1]["payload_config"] == {"step1": "config"}
+    assert create_call[1]["splitting_params"] == {"files_per_job": 5}
+    assert create_call[1]["input_dataset"] == "/Data/Run/RECO"
+    assert create_call[1]["adaptive"] is True
+    assert create_call[1]["cleanup_policy"] == "immediate_cleanup"
+
+
+async def test_get_error_summary(mock_repository, mock_condor, settings):
+    """get_error_summary aggregates POST data: categories, sites, bad files."""
+    mock_error_handler = MagicMock()
+    mock_error_handler.read_post_data.return_value = [
+        {
+            "classification": {"category": "infrastructure", "bad_input_file": "/store/bad.root"},
+            "job": {"site": "T2_US_MIT"},
+        },
+        {
+            "classification": {"category": "infrastructure"},
+            "job": {"site": "T2_US_MIT"},
+        },
+        {
+            "classification": {"category": "success"},
+            "job": {"site": "T2_DE_DESY"},
+        },
+    ]
+
+    lm = RequestLifecycleManager(
+        mock_repository, mock_condor, settings,
+        error_handler=mock_error_handler,
+    )
+
+    request = make_request_row(status="held")
+    dag = _make_dag(status="failed", nodes_done=1, nodes_failed=2)
+    workflow = _make_workflow(dag_id=dag.id)
+
+    mock_repository.get_request.return_value = request
+    mock_repository.get_workflow_by_request.return_value = workflow
+    mock_repository.get_dag.return_value = dag
+
+    result = await lm.get_error_summary("test-request-001")
+
+    assert result["request_name"] == "test-request-001"
+    assert result["status"] == "held"
+    assert result["nodes_failed"] == 2
+    assert result["error_summary"]["infrastructure"] == 2
+    assert result["error_summary"]["success"] == 1
+    assert result["site_summary"]["T2_US_MIT"]["total"] == 2
+    assert result["site_summary"]["T2_US_MIT"]["failed"] == 2
+    assert result["site_summary"]["T2_DE_DESY"]["total"] == 1
+    assert result["site_summary"]["T2_DE_DESY"]["failed"] == 0
+    assert result["bad_input_files"] == ["/store/bad.root"]
+
+
+async def test_get_error_summary_no_workflow(mock_repository, mock_condor, settings):
+    """get_error_summary with no workflow returns empty summary."""
+    lm = RequestLifecycleManager(mock_repository, mock_condor, settings)
+
+    request = make_request_row(status="held")
+    mock_repository.get_request.return_value = request
+    mock_repository.get_workflow_by_request.return_value = None
+
+    result = await lm.get_error_summary("test-request-001")
+
+    assert result["request_name"] == "test-request-001"
+    assert result["dag_id"] is None
+    assert result["error_summary"] == {}
+    assert result["site_summary"] == {}
+    assert result["bad_input_files"] == []

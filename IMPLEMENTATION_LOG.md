@@ -3278,3 +3278,43 @@ Implemented the full site banning flow per `docs/error_handling.md` Section 6. T
 - `pytest tests/unit/ -v` — 388/388 passed (zero regressions)
 - `python -c "from wms2.core.site_manager import SiteManager; print('OK')"` — import check passed
 - Landing node submit file verified: `Requirements = (TARGET.GLIDEIN_CMSSite =!= "T2_US_Bad")`
+
+---
+
+## HELD State and Operator Actions (2026-02-27)
+
+### What Was Built
+
+Added `HELD` as a first-class request state for operator review, replacing the previous transition to `PARTIAL` when the Error Handler returns `"hold"`. Implemented four operator action methods on the Lifecycle Manager and corresponding API endpoints.
+
+#### Modified Files
+
+| File | Change |
+|------|--------|
+| `src/wms2/models/enums.py` | Added `HELD = "held"` to RequestStatus (12→13 values) |
+| `src/wms2/core/lifecycle_manager.py` | Added `_handle_held` (no-op), changed PARTIAL→HELD transitions, added `release_held_request`, `fail_request`, `restart_request`, `get_error_summary` |
+| `src/wms2/api/requests.py` | Added 4 endpoints: `POST /release`, `POST /fail`, `POST /restart` (replaced stub), `GET /errors` |
+| `tests/unit/test_enums.py` | Updated count 12→13, added HELD assertion |
+| `tests/unit/test_lifecycle.py` | Updated 2 existing tests (PARTIAL→HELD), added 11 new tests |
+
+#### Operator Actions
+
+- **release** (`POST /{name}/release`): HELD → QUEUED. Returns request to admission queue for rescue DAG resubmission or new round.
+- **fail** (`POST /{name}/fail`): HELD/PARTIAL → FAILED. Runs `condor_rm` on active DAG, marks all non-terminal DAGs and open processing blocks as failed, transitions request.
+- **restart** (`POST /{name}/restart`): HELD/PARTIAL → creates clone with incremented `processing_version`, links old→new via `superseded_by_request`, fails old. Returns new request name.
+- **errors** (`GET /{name}/errors`): Read-only. Aggregates POST script data from current DAG's submit directory into category counts, site summary, and bad input files.
+
+### Design Decisions
+
+- HELD added alongside PARTIAL (not replacing) for backward compatibility with existing DB rows in "partial" status
+- HELD has no timeout in `status_timeouts` — operators take as long as needed
+- `fail_request` accepts both HELD and PARTIAL to avoid breaking legacy rows
+- `restart_request` calls `fail_request` internally to reuse cleanup logic (condor_rm, mark DAGs/blocks)
+- New request name format: `{old}_v{N}` — simple, predictable
+- Error summary reuses `error_handler.read_post_data()` — no new file reading code
+
+### Verification
+
+- `pytest tests/unit/test_enums.py -v` — 9/9 passed
+- `pytest tests/unit/test_lifecycle.py -v` — 51/51 passed (40 existing + 11 new)
+- `pytest tests/unit/ -v` — 399/399 passed (zero regressions)

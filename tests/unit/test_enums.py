@@ -11,7 +11,7 @@ from wms2.models.enums import (
 
 
 def test_request_status_values():
-    assert len(RequestStatus) == 12
+    assert len(RequestStatus) == 13
     assert RequestStatus.NEW == "new"
     assert RequestStatus.SUBMITTED == "submitted"
     assert RequestStatus.QUEUED == "queued"
@@ -20,6 +20,7 @@ def test_request_status_values():
     assert RequestStatus.ACTIVE == "active"
     assert RequestStatus.STOPPING == "stopping"
     assert RequestStatus.RESUBMITTING == "resubmitting"
+    assert RequestStatus.HELD == "held"
     assert RequestStatus.COMPLETED == "completed"
     assert RequestStatus.PARTIAL == "partial"
     assert RequestStatus.FAILED == "failed"

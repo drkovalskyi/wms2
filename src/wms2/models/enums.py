@@ -10,6 +10,7 @@ class RequestStatus(str, Enum):
     ACTIVE = "active"
     STOPPING = "stopping"
     RESUBMITTING = "resubmitting"
+    HELD = "held"
     COMPLETED = "completed"
     PARTIAL = "partial"
     FAILED = "failed"

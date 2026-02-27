@@ -73,6 +73,7 @@ class RequestLifecycleManager:
             RequestStatus.ACTIVE: self._handle_active,
             RequestStatus.STOPPING: self._handle_stopping,
             RequestStatus.RESUBMITTING: self._handle_resubmitting,
+            RequestStatus.HELD: self._handle_held,
             RequestStatus.PARTIAL: self._handle_partial,
         }
 
@@ -264,7 +265,7 @@ class RequestLifecycleManager:
                         await self.transition(request, RequestStatus.RESUBMITTING)
                         return
                 # No error_handler or action == "hold"
-                await self.transition(request, RequestStatus.PARTIAL)
+                await self.transition(request, RequestStatus.HELD)
                 return
             # RUNNING — no transition, will poll again next cycle
             return
@@ -286,7 +287,7 @@ class RequestLifecycleManager:
                     await self.transition(request, RequestStatus.RESUBMITTING)
                     return
             # No error_handler or action == "hold"
-            await self.transition(request, RequestStatus.PARTIAL)
+            await self.transition(request, RequestStatus.HELD)
 
     async def _handle_stopping(self, request):
         """Monitor clean stop progress."""
@@ -310,14 +311,206 @@ class RequestLifecycleManager:
         """Recovery DAG prepared, move back to admission queue."""
         await self.transition(request, RequestStatus.QUEUED)
 
+    async def _handle_held(self, request):
+        """HELD: stable state waiting for operator action. No-op."""
+        pass
+
     async def _handle_partial(self, request):
         """Handle partial DAG completion — re-evaluation on subsequent cycles.
 
-        Currently a stub; can be enhanced with manual retry support later.
-        The initial classification (rescue/review/abort) happens in _handle_active()
-        when the DAG first transitions to PARTIAL.
+        Legacy state kept for backward compatibility with existing DB rows.
+        New transitions use HELD instead. No-op.
         """
         pass
+
+    # ── Operator Actions ─────────────────────────────────────────
+
+    async def release_held_request(self, request_name: str):
+        """Release a HELD request back to the admission queue.
+
+        The next lifecycle cycle will handle it: rescue DAG if one exists,
+        or a new round.
+        """
+        request = await self.db.get_request(request_name)
+        if not request:
+            raise ValueError(f"Request {request_name} not found")
+        if request.status != RequestStatus.HELD.value:
+            raise ValueError(
+                f"Cannot release request in {request.status} state; must be held"
+            )
+        await self.transition(request, RequestStatus.QUEUED)
+
+    async def fail_request(self, request_name: str):
+        """Fail a HELD or PARTIAL request: kill running DAG, mark DAGs/blocks
+        as failed, transition request to FAILED."""
+        request = await self.db.get_request(request_name)
+        if not request:
+            raise ValueError(f"Request {request_name} not found")
+        allowed = (RequestStatus.HELD.value, RequestStatus.PARTIAL.value)
+        if request.status not in allowed:
+            raise ValueError(
+                f"Cannot fail request in {request.status} state; "
+                f"must be held or partial"
+            )
+
+        workflow = await self.db.get_workflow_by_request(request_name)
+        if workflow:
+            # 1. condor_rm on running DAG (swallow errors)
+            if workflow.dag_id:
+                dag = await self.db.get_dag(workflow.dag_id)
+                if dag and dag.status in (
+                    DAGStatus.SUBMITTED.value, DAGStatus.RUNNING.value
+                ):
+                    try:
+                        await self.condor.remove_job(
+                            schedd_name=dag.schedd_name,
+                            cluster_id=dag.dagman_cluster_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to remove DAG %s for %s",
+                            dag.id, request_name,
+                        )
+
+            # 2. Mark all non-terminal DAGs as FAILED
+            for dag in await self.db.list_dags(workflow_id=workflow.id):
+                if dag.status not in (
+                    DAGStatus.FAILED.value, DAGStatus.COMPLETED.value
+                ):
+                    await self.db.update_dag(dag.id, status=DAGStatus.FAILED.value)
+
+            # 3. Mark open processing blocks as "failed"
+            for block in await self.db.get_processing_blocks(workflow.id):
+                if block.status == "open":
+                    await self.db.update_processing_block(
+                        block.id, status="failed"
+                    )
+
+        # 4. Transition to FAILED
+        logger.info(
+            "Operator-initiated fail for %s (output invalidation deferred)",
+            request_name,
+        )
+        await self.transition(request, RequestStatus.FAILED)
+
+    async def restart_request(self, request_name: str) -> str:
+        """Kill+clone: create new request with incremented processing_version,
+        fail the old one. Returns the new request name."""
+        request = await self.db.get_request(request_name)
+        if not request:
+            raise ValueError(f"Request {request_name} not found")
+        allowed = (RequestStatus.HELD.value, RequestStatus.PARTIAL.value)
+        if request.status not in allowed:
+            raise ValueError(
+                f"Cannot restart request in {request.status} state; "
+                f"must be held or partial"
+            )
+
+        # 1. Compute new version
+        request_data = request.request_data or {}
+        current_version = request_data.get("processing_version", 1)
+        new_version = current_version + 1
+        new_name = f"{request_name}_v{new_version}"
+
+        # 2. Clone request with incremented version
+        new_data = {**request_data, "processing_version": new_version}
+        now = datetime.now(timezone.utc)
+        await self.db.create_request(
+            request_name=new_name,
+            requestor=request.requestor,
+            requestor_dn=request.requestor_dn,
+            request_data=new_data,
+            payload_config=request.payload_config,
+            splitting_params=request.splitting_params,
+            input_dataset=request.input_dataset,
+            campaign=request.campaign,
+            priority=request.priority,
+            urgent=request.urgent,
+            adaptive=request.adaptive,
+            production_steps=request.production_steps or [],
+            previous_version_request=request_name,
+            cleanup_policy=request.cleanup_policy,
+            status=RequestStatus.SUBMITTED.value,
+            status_transitions=[],
+            created_at=now,
+            updated_at=now,
+        )
+
+        # 3. Link old → new
+        await self.db.update_request(
+            request_name, superseded_by_request=new_name
+        )
+
+        # 4. Fail old request (condor_rm, mark DAGs/blocks, → FAILED)
+        await self.fail_request(request_name)
+
+        logger.info(
+            "Restarted %s → %s (processing_version=%d)",
+            request_name, new_name, new_version,
+        )
+        return new_name
+
+    async def get_error_summary(self, request_name: str) -> dict:
+        """Read-only error inspection. Aggregates POST data from the
+        current DAG's submit directory."""
+        request = await self.db.get_request(request_name)
+        if not request:
+            raise ValueError(f"Request {request_name} not found")
+
+        result = {
+            "request_name": request_name,
+            "status": request.status,
+            "dag_id": None,
+            "nodes_done": 0,
+            "nodes_failed": 0,
+            "total_nodes": 0,
+            "error_summary": {},
+            "site_summary": {},
+            "bad_input_files": [],
+        }
+
+        workflow = await self.db.get_workflow_by_request(request_name)
+        if not workflow or not workflow.dag_id:
+            return result
+
+        dag = await self.db.get_dag(workflow.dag_id)
+        if not dag:
+            return result
+
+        result["dag_id"] = str(dag.id)
+        result["nodes_done"] = dag.nodes_done or 0
+        result["nodes_failed"] = dag.nodes_failed or 0
+        result["total_nodes"] = dag.total_nodes or 0
+
+        if not self.error_handler or not dag.submit_dir:
+            return result
+
+        post_data = self.error_handler.read_post_data(dag.submit_dir)
+        if not post_data:
+            return result
+
+        # Aggregate by category
+        category_counts = {}
+        site_counts = {}
+        bad_files = set()
+        for entry in post_data:
+            cat = entry.get("classification", {}).get("category", "unknown")
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+
+            site = entry.get("job", {}).get("site", "unknown")
+            sc = site_counts.setdefault(site, {"total": 0, "failed": 0})
+            sc["total"] += 1
+            if cat != "success":
+                sc["failed"] += 1
+
+            bad_file = entry.get("classification", {}).get("bad_input_file")
+            if bad_file:
+                bad_files.add(bad_file)
+
+        result["error_summary"] = category_counts
+        result["site_summary"] = site_counts
+        result["bad_input_files"] = sorted(bad_files)
+        return result
 
     # ── Adaptive Round Completion ──────────────────────────────
 
