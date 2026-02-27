@@ -3472,3 +3472,52 @@ Implemented the CRIC (Computing Resource Information Catalogue) sync pipeline so
 | `src/wms2/main.py` | Built CRIC adapter in `_build_adapters()`, added startup sync + periodic background task in `lifespan()` |
 | `tests/unit/test_cric_adapter.py` | **New** — 14 tests: field mapping (6), HTTP success/edge cases (5), retry behavior (3) |
 | `tests/unit/test_site_manager.py` | Added 7 tests: no-adapter, add/update/mixed, fetch error, upsert error, kwarg verification |
+
+---
+
+## CLI Bug Fixes and Workflow/DAG API Enhancements
+
+**Date**: 2026-02-27
+
+### Bug Fixes (CLI)
+
+Three crash bugs in `src/wms2/cli.py` that would break real request runs:
+
+1. **OutputManager constructor** (line 374): Called with 4 args `(repo, dbs, rucio, settings)` but `OutputManager.__init__` takes 3 `(repository, dbs_adapter, rucio_adapter)`. Fixed: removed `settings` arg.
+
+2. **Method name mismatches** (lines 387-402): CLI called `om.handle_merge_completion()` and `om.process_outputs_for_workflow()` — methods that don't exist. The actual methods are `handle_work_unit_completion()` and `process_blocks_for_workflow()`. Fixed: rewrote the work unit completion loop to match the lifecycle manager's pattern (iterate processing blocks, extract per-dataset file info from manifest).
+
+3. **Missing method** (line 408): CLI called `om.get_output_summary()` which doesn't exist. Replaced with direct block status query via `repo.get_processing_blocks()`.
+
+### API Enhancements
+
+Existing workflow and DAG endpoints were already implemented (not 501 stubs), but lacked features needed for debugging real requests. Enhanced with:
+
+| Endpoint | Method | Change |
+|----------|--------|--------|
+| `GET /workflows` | GET | Added `?request_name=` query param for filtering by request |
+| `GET /workflows/by-request/{name}` | GET | **New** — look up workflow by request name (detail view) |
+| `GET /workflows/{id}/blocks` | GET | **New** — processing blocks for a workflow (DBS/Rucio status) |
+| `GET /dags/{id}/history` | GET | **New** — DAG event history (status transitions, node counts over time) |
+
+Also improved existing endpoints:
+- DAG list now includes `nodes_done`, `nodes_failed`, `nodes_running`, `dagman_cluster_id`
+- DAG detail now includes `stop_requested_at`, `stop_reason`, `completed_work_units`
+- Workflow list now includes `current_round`, `nodes_running`, `nodes_queued`
+- Workflow detail now includes `pilot_output_path`
+- Extracted shared serialization helpers (`_workflow_summary`, `_workflow_detail`, `_dag_summary`, `_dag_detail`, `_block_detail`) to reduce duplication
+
+### Verification
+
+- `pytest tests/unit/test_api_workflows.py -v` — 18 tests pass (11 workflow, 7 DAG)
+- `pytest tests/unit/ -v` — 438 tests pass, no regressions
+- `python -c "from wms2.cli import main"` — CLI imports clean
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/wms2/cli.py` | Fixed OutputManager constructor (3 args not 4), fixed method names (`handle_work_unit_completion`, `process_blocks_for_workflow`), replaced `get_output_summary` with block query |
+| `src/wms2/api/workflows.py` | Added `by-request/{name}`, `{id}/blocks` endpoints, `?request_name=` filter, richer serialization |
+| `src/wms2/api/dags.py` | Added `{id}/history` endpoint, richer list/detail serialization |
+| `tests/unit/test_api_workflows.py` | **New** — 18 tests for workflow and DAG API endpoints |

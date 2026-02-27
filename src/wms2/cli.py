@@ -371,7 +371,7 @@ async def run_import(args: argparse.Namespace) -> None:
             print(f"[3/5] Monitoring DAG (poll every {args.poll_interval}s)...")
             dm = DAGMonitor(repo, condor)
             # OutputManager with mock DBS/Rucio for output lifecycle
-            om = OutputManager(repo, _MockDBS(), _MockRucio(), settings)
+            om = OutputManager(repo, _MockDBS(), _MockRucio())
             terminal = {DAGStatus.COMPLETED, DAGStatus.FAILED, DAGStatus.PARTIAL}
 
             while True:
@@ -382,10 +382,21 @@ async def run_import(args: argparse.Namespace) -> None:
 
                 # Process completed work units through output manager
                 if result.newly_completed_work_units:
+                    blocks = await repo.get_processing_blocks(workflow.id)
                     for wu in result.newly_completed_work_units:
                         print(f"    completed work unit: {wu['group_name']}")
-                        await om.handle_merge_completion(workflow, wu)
-                    await om.process_outputs_for_workflow(workflow.id)
+                        manifest = wu.get("manifest") or {}
+                        datasets_info = manifest.get("datasets", {})
+                        for block in blocks:
+                            ds_info = datasets_info.get(block.dataset_name, {})
+                            await om.handle_work_unit_completion(
+                                workflow.id, block.id, {
+                                    "output_files": ds_info.get("files", []),
+                                    "site": manifest.get("site", "local"),
+                                    "node_name": wu["group_name"],
+                                }
+                            )
+                    await om.process_blocks_for_workflow(workflow.id)
 
                 await session.commit()
 
@@ -399,19 +410,21 @@ async def run_import(args: argparse.Namespace) -> None:
                 if result.status in terminal:
                     # Process any final outputs
                     if result.newly_completed_work_units:
-                        await om.process_outputs_for_workflow(workflow.id)
+                        await om.process_blocks_for_workflow(workflow.id)
                         await session.commit()
                     break
 
             # Print output summary
             print()
-            output_summary = await om.get_output_summary(workflow.id)
-            if output_summary:
-                print("[4/5] Output summary:")
-                for status, count in sorted(output_summary.items()):
-                    print(f"  {status}: {count}")
+            blocks = await repo.get_processing_blocks(workflow.id)
+            if blocks:
+                print(f"[4/5] Output summary ({len(blocks)} blocks):")
+                for block in blocks:
+                    wus = len(block.completed_work_units or [])
+                    print(f"  {block.dataset_name}: {block.status} "
+                          f"({wus}/{block.total_work_units} work units)")
             else:
-                print("[4/5] No output records created")
+                print("[4/5] No processing blocks created")
 
             # List merged output files on disk
             print()
