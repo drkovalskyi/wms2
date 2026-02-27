@@ -3570,3 +3570,60 @@ The CERN Grid CA chain (Root CA 2 + Grid CA intermediate) was needed for ReqMgr2
 
 - `pytest tests/unit/ -v` — 440 tests pass, no regressions
 - Full end-to-end import with simulator mode completes successfully
+
+---
+
+## Delegate Container Execution to `cmssw-env`
+
+**Date**: 2026-02-27
+**Commit**: `a4c821d`
+
+### Problem
+
+The processing wrapper and merge script manually handled container resolution and apptainer invocation — detecting the host OS, mapping SCRAM_ARCH prefixes to container image names, constructing bind mounts, and branching between native and apptainer execution paths. This was fragile:
+
+- Only mapped `slc7`→`cc7` and `slc6`→`cc6`; missed `cs8`, `alma8`, `rocky8`, etc.
+- Hardcoded bind mounts (`/mnt/creds`, `/mnt/shared`) were site-specific
+- Missing important mounts (`/etc/pki/ca-trust`, grid security vomses)
+- No `LC_ALL=C` (causes locale issues in containers)
+- No architecture detection (`x86_64` vs `aarch64`)
+- Tried only 2 image tag variants with no fallback to OSG registry
+- Two execution paths (native + apptainer) to maintain everywhere
+
+### Solution
+
+Delegate to `/cvmfs/cms.cern.ch/common/cmssw-env`, the CMS production wrapper that handles all of this correctly. It performs OS normalization (`slc`/`cc` → `el`), container search across CVMFS + OSG registries, automatic bind mount discovery, locale forcing (`LC_ALL=C`), Kerberos ticket detection, and runtime selection (apptainer/singularity). Every cmsRun now goes through `cmssw-env`, even same-OS — eliminating the native code path entirely for one execution model.
+
+### What Changed
+
+**Bash wrapper (embedded in `dag_planner.py`):**
+- **Added** `cmssw_env_exec()` helper: thin wrapper around `cmssw-env --cmsos <arch_os> -- <command>`
+- **Removed** `detect_host_os()`, `resolve_container()`, `run_step_native()` functions
+- **Renamed** `run_step_apptainer()` → `run_step()` — no container argument, no manual bind paths
+- **Simplified** `run_step0_parallel()` — removed native/container branching for both CMSSW project setup and per-instance execution
+- **Simplified** `run_all_steps_pipeline()` — removed native/container branching for CMSSW version setup and per-step cmsRun
+- **Simplified** main step loop in `run_cmssw_mode()` — single `run_step` call replaces native/container branching
+
+**Python merge script (embedded in `dag_planner.py`):**
+- **Added** `cmssw_env_cmd()` — builds subprocess command list via cmssw-env
+- **Added** `_prepare_siteconf()` — extracted shared siteconf copy logic
+- **Removed** `detect_host_os()`, `resolve_container()` Python functions
+- **Simplified** `run_cmsrun()` — no native/container branching, always uses `cmssw_env_cmd`
+- **Simplified** `merge_root_with_hadd()` — no native/container branching, always uses `cmssw_env_cmd`
+
+### Design Decision
+
+**Always use `cmssw-env`, never native.** Even when the host OS matches the SCRAM_ARCH, we still run through `cmssw-env`. This eliminates an entire code path (native execution) and gives us a single execution model to test and maintain. `cmssw-env` handles same-OS containers correctly (finds the matching container on CVMFS), and the overhead is negligible.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/wms2/core/dag_planner.py` | Replace 6 bash functions + 2 Python functions with cmssw-env delegation (net -150 lines) |
+| `tests/unit/test_dag_generator.py` | Update 3 tests to check for cmssw-env patterns instead of old apptainer patterns |
+
+### Verification
+
+- `pytest tests/unit/test_dag_planner.py -v` — 7 tests pass
+- `pytest tests/unit/ -v` — 440 tests pass, no regressions
+- No remaining references to `resolve_container`, `detect_host_os`, `run_step_native`, `run_step_apptainer`, or `APPTAINER_BINDPATH` in `dag_planner.py`
