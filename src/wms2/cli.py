@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--submit-dir", default="/tmp/wms2", help="DAG file output directory")
     imp.add_argument("--max-files", type=int, default=0, help="Limit DBS file query (0=all)")
     imp.add_argument("--files-per-job", type=int, default=None, help="Override splitting param")
+    imp.add_argument("--events-per-job", type=int, default=None, help="Override events per job (GEN workflows)")
     imp.add_argument("--dry-run", action="store_true", help="Plan DAG but don't submit")
     imp.add_argument("--sandbox-mode", required=True, choices=["synthetic", "cmssw", "simulator"],
                      help="Sandbox mode: synthetic (sized output), cmssw (real cmsRun), simulator (realistic artifacts)")
@@ -321,10 +322,13 @@ async def run_import(args: argparse.Namespace) -> None:
             else:
                 print("      outputs:     (none detected from request)")
 
-            # Override splitting_params if --files-per-job given
-            if args.files_per_job is not None:
+            # Override splitting_params if --files-per-job or --events-per-job given
+            if args.files_per_job is not None or args.events_per_job is not None:
                 params = workflow.splitting_params or {}
-                params["files_per_job"] = args.files_per_job
+                if args.files_per_job is not None:
+                    params["files_per_job"] = args.files_per_job
+                if args.events_per_job is not None:
+                    params["events_per_job"] = args.events_per_job
                 await repo.update_workflow(workflow.id, splitting_params=params)
                 workflow = await repo.get_workflow(workflow.id)
 
