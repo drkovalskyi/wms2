@@ -103,8 +103,22 @@ def extract_info(req: dict[str, Any]) -> dict[str, Any]:
     step1 = req.get("Step1") or req.get("Task1") or {}
     num_events = step1.get("RequestNumEvents") or req.get("RequestNumEvents") or 0
 
-    # CPU-days: TimePerEvent * Multicore * RequestNumEvents / 86400
-    cpu_days = tpe * multicore * num_events / 86400 if (tpe and num_events) else 0
+    # FilterEfficiency from Step1 (top-level is often absent)
+    filter_eff = float(
+        req.get("FilterEfficiency")
+        or step1.get("FilterEfficiency")
+        or 1.0
+    )
+    if filter_eff <= 0:
+        filter_eff = 1.0
+
+    # CPU-days: TimePerEvent is per *generated* event, RequestNumEvents is
+    # desired *output* events.  Total generated = num_events / filter_eff.
+    # CPU time = wall_time * cores = (generated * TPE) * cores.
+    cpu_days = (
+        tpe * multicore * num_events / filter_eff / 86400
+        if (tpe and num_events) else 0
+    )
 
     # Per-step details
     steps = []
@@ -149,6 +163,7 @@ def extract_info(req: dict[str, Any]) -> dict[str, Any]:
         "memory_mb": memory,
         "time_per_event": tpe,
         "size_per_event": spe,
+        "filter_efficiency": filter_eff,
         "request_num_events": num_events,
         "cpu_days": cpu_days,
         "steps": steps,
@@ -198,6 +213,9 @@ def format_markdown(info: dict[str, Any]) -> str:
     lines.append(f"- **Memory**: {info['memory_mb']} MB")
     lines.append(f"- **TimePerEvent**: {info['time_per_event']:.2f} s")
     lines.append(f"- **SizePerEvent**: {info['size_per_event']:.1f} KB")
+    fe = info.get("filter_efficiency", 1.0)
+    if fe < 1.0:
+        lines.append(f"- **FilterEfficiency**: {fe:.6g}")
     if info["request_num_events"]:
         lines.append(f"- **RequestNumEvents**: {info['request_num_events']:,}")
     if info["cpu_days"]:

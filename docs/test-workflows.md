@@ -15,15 +15,19 @@ python scripts/fetch-workflow-info.py \
 
 ## Quick Reference
 
-| Name | Request | Type | Steps | Cores | Memory | CPU-days | Output Tiers |
-|------|---------|------|-------|-------|--------|----------|--------------|
-| NPS | `NPS-Run3Summer22EEGS-00049` | StepChain | 5 | 8 | 16 GB | 363.5 | MINIAODSIM, NANOAODSIM |
-| B2G | `B2G-Run3Summer23BPixwmLHEGS-06000` | StepChain | 5 | 8 | 16 GB | 17.7 | AODSIM, MINIAODSIM, NANOAODSIM |
-| GEN-QCD | `GEN-RunIII2024Summer24GS-00002` | StepChain | 5 | 8 | 16 GB | 307.5 | AODSIM, MINIAODSIM, NANOAODSIM |
-| DY2L | `GEN-Run3Summer22EEwmLHEGS-00600` | StepChain | 5 | 4 | 8 GB | 1,838.6 | AODSIM, MINIAODSIM, NANOAODSIM |
-| BPH | `BPH-RunIISummer20UL18GEN-00292` | StepChain | 7 | 16 | 32 GB | 58.0 | AODSIM, MINIAODSIM, NANOAODSIM |
+| Name | Request | Type | Steps | Cores | Memory | FilterEff | CPU-days | Output Tiers |
+|------|---------|------|-------|-------|--------|-----------|----------|--------------|
+| NPS | `NPS-Run3Summer22EEGS-00049` | StepChain | 5 | 8 | 16 GB | 1.0 | 363.5 | MINIAODSIM, NANOAODSIM |
+| B2G | `B2G-Run3Summer23BPixwmLHEGS-06000` | StepChain | 5 | 8 | 16 GB | 1.0 | 17.7 | AODSIM, MINIAODSIM, NANOAODSIM |
+| GEN-QCD | `GEN-RunIII2024Summer24GS-00002` | StepChain | 5 | 8 | 16 GB | 0.0028 | 110,103.8 | AODSIM, MINIAODSIM, NANOAODSIM |
+| DY2L | `GEN-Run3Summer22EEwmLHEGS-00600` | StepChain | 5 | 4 | 8 GB | 0.1023 | 17,970.5 | AODSIM, MINIAODSIM, NANOAODSIM |
+| BPH | `BPH-RunIISummer20UL18GEN-00292` | StepChain | 7 | 16 | 32 GB | 0.00034 | 171,637.3 | MINIAODSIM, NANOAODSIM, AODSIM |
 
-CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
+CPU-days = TimePerEvent × Multicore × RequestNumEvents / FilterEfficiency / 86400
+
+TimePerEvent is per *generated* event (the full chain cost per one event entering step 1).
+RequestNumEvents is desired *output* events. For GenFilter workflows, the actual number
+of generated events is RequestNumEvents / FilterEfficiency.
 
 ---
 
@@ -88,7 +92,7 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 /WprimetoWZto3LNu_M800_TuneCP5_13p6TeV_madgraph-pythia8/Run3Summer23BPixNanoAODv12-130X_mcRun3_2023_realistic_postBPix_v6-v2/NANOAODSIM
 ```
 
-**What it exercises**: Small GEN workflow (25k events, 17.7 CPU-days). Single CMSSW version (13_0_23) across all steps. Three kept output tiers (AODSIM from step 3). Fast per-event (7.66 s) — good for quick smoke tests.
+**What it exercises**: Small GEN workflow (25k events, 17.7 CPU-days, no filter). Single CMSSW version (13_0_23) across all steps. Three kept output tiers (AODSIM from step 3). Fast per-event (7.66 s) — good for quick smoke tests.
 
 **Tested modes**: simulator (e2e verification during sandbox mode development)
 
@@ -103,8 +107,9 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 - **Memory**: 16,000 MB
 - **TimePerEvent**: 0.11 s
 - **SizePerEvent**: 608.5 KB
+- **FilterEfficiency**: 0.00279287
 - **RequestNumEvents**: 30,000,000
-- **CPU-days**: 307.5
+- **CPU-days**: 110,103.8
 - **Output tiers**: AODSIM, MINIAODSIM, NANOAODSIM
 
 | Step | Name | CMSSW | Arch | Keep | GlobalTag |
@@ -122,7 +127,7 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 /QCD_Bin-PT-15to20_Fil-bcToE_TuneCP5_13p6TeV_pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM
 ```
 
-**What it exercises**: High-event-count GEN workflow (30M events) with very fast per-event time (0.11 s). Three CMSSW versions (14_0_21, 14_0_22, 15_0_18) including Run3 2024 releases. Three kept output tiers. Uses the latest el8_amd64_gcc12 architecture throughout.
+**What it exercises**: High-event-count GEN workflow (30M events) with very fast per-event time (0.11 s) but low filter efficiency (0.28%), making it a large workflow (110k CPU-days). Three CMSSW versions (14_0_21, 14_0_22, 15_0_18) including Run3 2024 releases. Three kept output tiers. Uses the latest el8_amd64_gcc12 architecture throughout.
 
 **Tested modes**: synthetic (production-path e2e), cached (real CMSSW e2e with 5 work units)
 
@@ -137,8 +142,9 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 - **Memory**: 8,000 MB
 - **TimePerEvent**: 11.35 s
 - **SizePerEvent**: 1,570.7 KB
+- **FilterEfficiency**: 0.10231
 - **RequestNumEvents**: 3,500,000
-- **CPU-days**: 1,838.6
+- **CPU-days**: 17,970.5
 - **Output tiers**: AODSIM, MINIAODSIM, NANOAODSIM
 
 | Step | Name | CMSSW | Arch | Keep | GlobalTag |
@@ -156,7 +162,7 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 /DYto2L-4Jets_MLL-4to50_HT-2500_TuneCP5_13p6TeV_madgraphMLM-pythia8/Run3Summer22EENanoAODv12-130X_mcRun3_2022_realistic_postEE_v6-v2/NANOAODSIM
 ```
 
-**What it exercises**: wmLHEGS workflow with LHE input and ~10% filter efficiency. Lower multicore (4 cores, 8 GB) than the other workflows. Largest CPU-days budget (1,839) due to high event count and moderate TimePerEvent. Multiple CMSSW versions (12_4_19, 12_4_16, 13_0_13). Extensively tested for adaptive execution and memory scaling.
+**What it exercises**: wmLHEGS workflow with LHE input and ~10% filter efficiency. Lower multicore (4 cores, 8 GB) than the other workflows. 18k CPU-days due to filter amplification. Multiple CMSSW versions (12_4_19, 12_4_16, 13_0_13). Extensively tested for adaptive execution and memory scaling.
 
 **Tested modes**: cached (WF 301.0), adaptive step-1 split (WF 351.x), adaptive job split (WF 391.x), memory scaling (WF 392.x)
 
@@ -171,9 +177,10 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 - **Memory**: 32,000 MB
 - **TimePerEvent**: 0.06 s
 - **SizePerEvent**: 99.5 KB
+- **FilterEfficiency**: 0.000338198
 - **RequestNumEvents**: 5,000,000
-- **CPU-days**: 58.0
-- **Output tiers**: AODSIM, MINIAODSIM, NANOAODSIM
+- **CPU-days**: 171,637.3
+- **Output tiers**: MINIAODSIM, NANOAODSIM, AODSIM
 
 | Step | Name | CMSSW | Arch | Keep | GlobalTag |
 |------|------|-------|------|------|-----------|
@@ -192,7 +199,7 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 /BdToKstarTauTau_TuneCP5_13TeV_pythia8-evtgen/RunIISummer20UL18NanoAODv9-Custom_RDStarPU_BParking_106X_upgrade2018_realistic_v16_L1v1-v2/NANOAODSIM
 ```
 
-**What it exercises**: Run 2 UltraLegacy reprocessing — 7-step chain with separate GEN, SIM, DIGIPremix, HLT, RECO, MiniAOD, and NanoAOD steps. Uses `slc7_amd64_gcc700` (SLC7) architecture throughout, requiring an older container. Four different CMSSW versions (10_2, 10_6_26, 10_6_47, 10_6_47_patch1). Highest multicore (16 cores, 32 GB) and most steps of any test workflow. Includes an explicit HLT step not present in Run 3 workflows.
+**What it exercises**: Run 2 UltraLegacy reprocessing — 7-step chain with separate GEN, SIM, DIGIPremix, HLT, RECO, MiniAOD, and NanoAOD steps. Very low filter efficiency (0.034%) makes it the largest workflow (172k CPU-days). Uses `slc7_amd64_gcc700` (SLC7) architecture throughout, requiring an older container. Four different CMSSW versions (10_2, 10_6_26, 10_6_47, 10_6_47_patch1). Highest multicore (16 cores, 32 GB) and most steps of any test workflow. Includes an explicit HLT step not present in Run 3 workflows.
 
 **Tested modes**: not yet tested
 
@@ -206,7 +213,7 @@ CPU-days = TimePerEvent x Multicore x RequestNumEvents / 86400
 
 **High-volume / splitting tests**: Use **GEN-QCD** — 30M events with 0.11 s/event means many fast jobs. Good for testing DAG splitting, work unit management, and monitoring at scale.
 
-**Adaptive execution / memory tests**: Use **DY2L** — 10% filter efficiency stresses adaptive splitting. Lower multicore (4 cores) tests non-standard resource profiles. Extensively characterized for memory scaling.
+**Adaptive execution / memory tests**: Use **DY2L** — 10% filter efficiency (18k CPU-days) stresses adaptive splitting. Lower multicore (4 cores) tests non-standard resource profiles. Extensively characterized for memory scaling.
 
 **Latest CMSSW releases**: Use **GEN-QCD** — uses CMSSW 14.x and 15.x (gcc12 arch), exercises the newest software stack.
 
