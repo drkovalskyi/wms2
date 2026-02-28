@@ -3841,3 +3841,50 @@ With the BPH test workflow, all 50 proc nodes (7 WUs) were submitted in round 0.
 
 - All 460 unit tests pass (4 new tests for adaptive round capping)
 - Tests cover: round 0 uses `first_round_work_units`, round 1 uses `work_units_per_round`, non-adaptive has no cap, default produces 1 WU
+
+---
+
+## Fix 0-Event GenFilter Output: filter_efficiency + Key Normalization
+
+**Date**: 2026-02-28
+**Commit**: `b193af0`
+
+### Problem
+
+The BPH workflow (`BdToKstarTauTau`) crashed because step 1 generated 0 output events. Three bugs combined:
+
+1. **Key mismatch**: CLI normalized `EventsPerJob` → `eventsperjob` (via `.lower()`) instead of `events_per_job` (snake_case). The DAG planner reads `events_per_job`/`eventsPerJob` and fell back to 100,000 instead of the request's 689,092.
+
+2. **Missing filter_efficiency**: The StepChain parser only read top-level `FilterEfficiency` (absent for this request, defaulting to 1.0). The actual value `0.00034` was in `Step1.FilterEfficiency`.
+
+3. **maxEvents ignored filter_efficiency**: For GenFilter workflows, `events_per_job` represents the *output* event count (post-filter). `maxEvents` (what CMSSW generates) must be `events_per_job / filter_efficiency` to produce enough output events after the GenFilter. Without this, CMSSW generated only 1,000 events (test_fraction × events_per_job), all rejected by the filter → 0 output.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `src/wms2/cli.py` | Fixed key normalization with explicit snake_case map; store `filter_efficiency` in `config_data`; use parsed StepChain spec's `filter_efficiency` for StepChain requests |
+| `src/wms2/core/stepchain.py` | Fall back to `Step1.FilterEfficiency` when top-level is absent or 0 |
+| `src/wms2/core/dag_planner.py` | Pass `filter_efficiency` in `resource_params` and as `--filter-eff` proc arg; fix PSet injection: `maxEvents = events_per_job / filter_eff` for sequential, parallel, and pipeline modes; add 0-event safety net (exit 80) after step 1 |
+| `src/wms2/core/post_classifier.py` | Classify exit code 80 as permanent (non-retryable) in both module-level and embedded collector script |
+| `tests/unit/test_stepchain.py` | 4 new tests: Step1 fallback, top-level preferred, zero defaults to 1.0, absent defaults to 1.0 |
+| `tests/unit/test_post_classifier.py` | 3 new tests: exit 80 classification (module + collector) |
+| `tests/unit/test_dag_planner.py` | 2 new tests: `--filter-eff` present when < 1.0, absent when 1.0 |
+
+### Design Decisions
+
+- **filter_eff applied only in PSet injection, not to EVENTS_PER_JOB variable**: EVENTS_PER_JOB represents target output events throughout the wrapper (used for parallel partitioning, output counting, logging). Changing its meaning globally would break those uses. Instead, the filter_eff correction is applied only where maxEvents is set in PSet injection code.
+
+- **Exit code 80 for 0-event output**: A dedicated non-retryable exit code rather than letting the workflow proceed with empty outputs and fail later at merge. Makes the failure mode immediately diagnosable.
+
+### Expected Behavior After Fix
+
+With test_fraction=0.01 and the BPH workflow (events_per_job=689,092, filter_eff=0.00034):
+- Target output events: 689,092 × 0.01 = 6,891
+- maxEvents injected: 6,891 / 0.00034 = 20,267,647
+- CMSSW generates ~20M events, ~6,891 pass GenFilter → non-empty output
+
+### Verification
+
+- All 469 unit tests pass (9 new tests)
+- Tests cover: Step1 FilterEfficiency extraction, exit code 80 classification, `--filter-eff` argument propagation to submit files
