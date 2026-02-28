@@ -1697,25 +1697,44 @@ if nthreads > 1:
     lines.append('process.options.numberOfThreads = cms.untracked.uint32(' + str(nthreads) + ')')
     lines.append('process.options.numberOfStreams = cms.untracked.uint32(0)')
 
-# Override pileup file list with Rucio-resolved on-disk files
+# Override pileup file list with Rucio-resolved on-disk files.
+# At planning time we determine which pileup dataset this step needs.
+# We emit PSet code that reads pileup_files.json at cmsRun time and
+# appends LFNs one-by-one (avoids Python's 255-argument call limit).
 import json as _json
+_pu_found = False
 for _pu_candidate in [os.path.join(os.path.dirname(pset), '..', 'pileup_files.json'), 'pileup_files.json']:
     if os.path.isfile(_pu_candidate):
-        _pu = _json.load(open(_pu_candidate))
-        _manifest_path = os.path.join(os.path.dirname(pset), '..', 'manifest.json')
-        if not os.path.isfile(_manifest_path):
-            _manifest_path = 'manifest.json'
-        if os.path.isfile(_manifest_path):
-            _manifest = _json.load(open(_manifest_path))
-            _step = _manifest.get('steps', [{}])[step_idx] if step_idx < len(_manifest.get('steps', [])) else {}
-            _ds = _step.get('mc_pileup') or _step.get('data_pileup', '')
-            if _ds and _ds in _pu and _pu[_ds]:
-                _pu_lfns = ', '.join(repr(f) for f in _pu[_ds])
-                lines.append('for _mixer in [\"mixData\", \"mix\"]:')
-                lines.append('    if hasattr(process, _mixer) and hasattr(getattr(process, _mixer), \"input\"):')
-                lines.append('        getattr(process, _mixer).input.fileNames = cms.untracked.vstring(' + _pu_lfns + ')')
-                lines.append('        print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu[\"' + _ds + '\"])) + \" on-disk pileup files\")')
+        _pu_found = True
         break
+if _pu_found:
+    _manifest_path = os.path.join(os.path.dirname(pset), '..', 'manifest.json')
+    if not os.path.isfile(_manifest_path):
+        _manifest_path = 'manifest.json'
+    if os.path.isfile(_manifest_path):
+        _manifest = _json.load(open(_manifest_path))
+        _step = _manifest.get('steps', [{}])[step_idx] if step_idx < len(_manifest.get('steps', [])) else {}
+        _ds = _step.get('mc_pileup') or _step.get('data_pileup', '')
+        if _ds:
+            lines.append('import json as _pujson, os as _puos, random as _purandom')
+            lines.append('_pu_json = None')
+            lines.append('for _pp in [_puos.path.join(_puos.path.dirname(_puos.path.abspath(\"' + pset + '\")), \"..\", \"pileup_files.json\"), \"pileup_files.json\"]:')
+            lines.append('    if _puos.path.isfile(_pp):')
+            lines.append('        _pu_json = _pp')
+            lines.append('        break')
+            lines.append('if _pu_json:')
+            lines.append('    _pu_data = _pujson.load(open(_pu_json))')
+            lines.append('    _pu_list = _pu_data.get(\"' + _ds + '\", [])')
+            lines.append('    if _pu_list:')
+            lines.append('        _purandom.shuffle(_pu_list)')
+            lines.append('        for _mixer in [\"mixData\", \"mix\"]:')
+            lines.append('            _mobj = getattr(process, _mixer, None)')
+            lines.append('            if _mobj is None: continue')
+            lines.append('            _inp = getattr(_mobj, \"input\", None) or getattr(_mobj, \"secsource\", None)')
+            lines.append('            if _inp is None: continue')
+            lines.append('            _inp.fileNames = cms.untracked.vstring()')
+            lines.append('            for _lfn in _pu_list: _inp.fileNames.append(str(_lfn))')
+            lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_list)) + \" on-disk pileup files\")')
 
 with open(pset, 'a') as f:
     f.write(chr(10).join(lines) + chr(10))
@@ -1989,25 +2008,44 @@ if nthreads > 1:
     lines.append('process.options.numberOfThreads = cms.untracked.uint32(' + str(nthreads) + ')')
     lines.append('process.options.numberOfStreams = cms.untracked.uint32(0)')
 
-# Override pileup file list with Rucio-resolved on-disk files
+# Override pileup file list with Rucio-resolved on-disk files.
+# At planning time we determine which pileup dataset this step needs.
+# We emit PSet code that reads pileup_files.json at cmsRun time and
+# appends LFNs one-by-one (avoids Python's 255-argument call limit).
 import json as _json
+_pu_found = False
 for _pu_candidate in [os.path.join(os.path.dirname(pset), '..', 'pileup_files.json'), 'pileup_files.json']:
     if os.path.isfile(_pu_candidate):
-        _pu = _json.load(open(_pu_candidate))
-        _manifest_path = os.path.join(os.path.dirname(pset), '..', 'manifest.json')
-        if not os.path.isfile(_manifest_path):
-            _manifest_path = 'manifest.json'
-        if os.path.isfile(_manifest_path):
-            _manifest = _json.load(open(_manifest_path))
-            _step = _manifest.get('steps', [{}])[step_idx] if step_idx < len(_manifest.get('steps', [])) else {}
-            _ds = _step.get('mc_pileup') or _step.get('data_pileup', '')
-            if _ds and _ds in _pu and _pu[_ds]:
-                _pu_lfns = ', '.join(repr(f) for f in _pu[_ds])
-                lines.append('for _mixer in [\"mixData\", \"mix\"]:')
-                lines.append('    if hasattr(process, _mixer) and hasattr(getattr(process, _mixer), \"input\"):')
-                lines.append('        getattr(process, _mixer).input.fileNames = cms.untracked.vstring(' + _pu_lfns + ')')
-                lines.append('        print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu[\"' + _ds + '\"])) + \" on-disk pileup files\")')
+        _pu_found = True
         break
+if _pu_found:
+    _manifest_path = os.path.join(os.path.dirname(pset), '..', 'manifest.json')
+    if not os.path.isfile(_manifest_path):
+        _manifest_path = 'manifest.json'
+    if os.path.isfile(_manifest_path):
+        _manifest = _json.load(open(_manifest_path))
+        _step = _manifest.get('steps', [{}])[step_idx] if step_idx < len(_manifest.get('steps', [])) else {}
+        _ds = _step.get('mc_pileup') or _step.get('data_pileup', '')
+        if _ds:
+            lines.append('import json as _pujson, os as _puos, random as _purandom')
+            lines.append('_pu_json = None')
+            lines.append('for _pp in [_puos.path.join(_puos.path.dirname(_puos.path.abspath(\"' + pset + '\")), \"..\", \"pileup_files.json\"), \"pileup_files.json\"]:')
+            lines.append('    if _puos.path.isfile(_pp):')
+            lines.append('        _pu_json = _pp')
+            lines.append('        break')
+            lines.append('if _pu_json:')
+            lines.append('    _pu_data = _pujson.load(open(_pu_json))')
+            lines.append('    _pu_list = _pu_data.get(\"' + _ds + '\", [])')
+            lines.append('    if _pu_list:')
+            lines.append('        _purandom.shuffle(_pu_list)')
+            lines.append('        for _mixer in [\"mixData\", \"mix\"]:')
+            lines.append('            _mobj = getattr(process, _mixer, None)')
+            lines.append('            if _mobj is None: continue')
+            lines.append('            _inp = getattr(_mobj, \"input\", None) or getattr(_mobj, \"secsource\", None)')
+            lines.append('            if _inp is None: continue')
+            lines.append('            _inp.fileNames = cms.untracked.vstring()')
+            lines.append('            for _lfn in _pu_list: _inp.fileNames.append(str(_lfn))')
+            lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_list)) + \" on-disk pileup files\")')
 
 with open(pset, 'a') as f:
     f.write(chr(10).join(lines) + chr(10))
