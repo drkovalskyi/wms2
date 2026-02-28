@@ -995,6 +995,24 @@ if [ "$CLASSIFICATION" = "infrastructure_memory" ]; then
     fi
 fi
 
+# --- Early abort on repeated identical failures ---
+# If 3+ different proc nodes failed with the same exit code, this is systemic.
+# Abort the sub-DAG instead of burning through all retries on remaining nodes.
+IDENTICAL_THRESHOLD=3
+CURRENT_EXIT="$EXIT_CODE"
+match_count=0
+for pj in proc_*.post.json; do
+    [ -f "$pj" ] || continue
+    pj_exit=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('job',{}).get('exit_code',''))" "$pj" 2>/dev/null)
+    if [ "$pj_exit" = "$CURRENT_EXIT" ]; then
+        match_count=$((match_count + 1))
+    fi
+done
+if [ "$match_count" -ge "$IDENTICAL_THRESHOLD" ]; then
+    echo "ABORT: $match_count nodes failed with exit code $CURRENT_EXIT — systemic failure" >&2
+    exit $ABORT_EXIT
+fi
+
 case "$CLASSIFICATION" in
     transient)
         SLEEP_TIME=$((60 * (2 ** RETRY_NUM)))
