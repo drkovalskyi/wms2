@@ -99,6 +99,9 @@ class TestCondorSubmission:
         wf.splitting_params = {"files_per_job": 2}
         wf.sandbox_url = "https://example.com/sandbox.tar.gz"
         wf.category_throttles = {"Processing": 5000, "Merge": 100, "Cleanup": 50}
+        wf.config_data = {}
+        wf.file_offset = 0
+        wf.current_round = 0
 
         dag = await dag_planner_with_condor.plan_production_dag(wf)
 

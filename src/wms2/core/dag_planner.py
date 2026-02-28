@@ -269,9 +269,8 @@ class DAGPlanner:
         test_fraction = config.get("test_fraction")
         if test_fraction:
             resource_params["test_fraction"] = float(test_fraction)
-        filter_eff = config.get("filter_efficiency")
-        if filter_eff and float(filter_eff) != 1.0:
-            resource_params["filter_efficiency"] = float(filter_eff)
+        # filter_efficiency is used at planning time (inflating total_events in
+        # _plan_gen_nodes) but not passed to the processing wrapper.
 
         # Query banned sites for this workflow
         banned_sites: list[str] = []
@@ -437,12 +436,29 @@ class DAGPlanner:
         the number of event-generation jobs needed.  For adaptive rounds,
         ``workflow.next_first_event`` skips already-processed events and
         ``max_jobs`` caps the batch size.
+
+        Convention (matches WMAgent): EventsPerJob and TimePerEvent are in
+        terms of *generated* events.  RequestNumEvents is the desired *output*
+        count, so for GenFilter workflows we inflate it by 1/filter_efficiency
+        to get the total number of generated events needed.
         """
         import math
 
         params = workflow.splitting_params or {}
         events_per_job = params.get("events_per_job") or params.get("eventsPerJob") or 100_000
-        total_events = config.get("request_num_events") or 0
+        total_events = int(config.get("request_num_events") or 0)
+
+        # For GenFilter workflows, RequestNumEvents is desired *output* events
+        # but events_per_job is *generated* events per job.  Inflate total to
+        # match, just like WMAgent's modifyJobSplitting does.
+        filter_eff = float(config.get("filter_efficiency", 1.0))
+        if filter_eff > 0 and filter_eff < 1.0 and total_events > 0:
+            total_events = int(total_events / filter_eff)
+            logger.info(
+                "GenFilter workflow %s: inflated total_events to %d "
+                "(requested_output / filter_eff=%.6f)",
+                workflow.id, total_events, filter_eff,
+            )
 
         if total_events <= 0:
             logger.warning("GEN workflow %s has no RequestNumEvents, using 1 node", workflow.id)
@@ -777,8 +793,8 @@ def _generate_group_dag(
             proc_args += f" --ncpus {ncpus}"
         if rp.get("test_fraction"):
             proc_args += f" --test-fraction {rp['test_fraction']}"
-        if rp.get("filter_efficiency"):
-            proc_args += f" --filter-eff {rp['filter_efficiency']}"
+        # filter_efficiency is handled at planning time (inflating total_events),
+        # not at execution time. No --filter-eff arg needed.
 
         _write_submit_file(
             str(group_dir / f"{node_name}.sub"),
@@ -1115,7 +1131,7 @@ PILOT_MODE=false
 OUTPUT_INFO=""
 OVERRIDE_NCPUS=0
 TEST_FRACTION=0
-FILTER_EFF=1.0
+FILTER_EFF=1.0  # kept for backward compat; no longer used in PSet injection
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1396,22 +1412,15 @@ except Exception:
 # ── PSet injection for parallel step 0 instances ──────────────
 inject_pset_parallel() {
     local pset="$1" first_event="$2" max_events="$3" nthreads="$4"
-    # Apply filter_efficiency correction: max_events is target output,
-    # gen_events is what CMSSW must generate so enough pass the filter.
-    local gen_events
-    gen_events=$(python3 -c "
-fe = $FILTER_EFF
-me = $max_events
-print(int(me / fe) if fe > 0 and fe < 1.0 else me)
-")
+    # max_events is already in terms of generated events (no filter_eff adjustment needed)
     python3 -c "
 pset_path = '$pset'
 lines = ['', '# --- WMS2 parallel instance PSet injection ---']
 lines.append('import FWCore.ParameterSet.Config as cms')
-lines.append('process.maxEvents.input = cms.untracked.int32($gen_events)')
+lines.append('process.maxEvents.input = cms.untracked.int32($max_events)')
 lines.append('process.source.firstEvent = cms.untracked.uint32($first_event)')
 lines.append('if hasattr(process, \"externalLHEProducer\"):')
-lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32($gen_events)')
+lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32($max_events)')
 if $nthreads > 1:
     lines.append('if not hasattr(process, \"options\"):')
     lines.append('    process.options = cms.untracked.PSet()')
@@ -1700,12 +1709,8 @@ if inject_input:
 step_idx = $step_idx
 pipe_events = $pipe_events
 pipe_first = $pipe_first
-filter_eff = $FILTER_EFF
 if step_idx == 0 and pipe_events > 0:
-    if filter_eff > 0 and filter_eff < 1.0:
-        gen_events = int(pipe_events / filter_eff)
-    else:
-        gen_events = pipe_events
+    gen_events = pipe_events
     lines.append('process.maxEvents.input = cms.untracked.int32(' + str(gen_events) + ')')
     lines.append('if hasattr(process, \"externalLHEProducer\"):')
     lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32(' + str(gen_events) + ')')
@@ -2007,21 +2012,16 @@ if inject_input:
     lines.append('process.source.fileNames = cms.untracked.vstring(' + quoted + ')')
     lines.append('process.source.secondaryFileNames = cms.untracked.vstring()')
 
-# maxEvents: step 1 uses EVENTS_PER_JOB (adjusted for filter_efficiency);
-# steps 2+ use -1 (all input).
+# maxEvents: step 1 uses EVENTS_PER_JOB (generated events); steps 2+ use -1 (all input).
 # ConfigCache PSets have hardcoded maxEvents from cmsDriver that must be overridden.
+# Convention: events_per_job is already in terms of *generated* events (matching
+# WMAgent's calcEvtsPerJobLumi = target_job_length / TimePerEvent). No division
+# by filter_efficiency — that inflation is applied to total_events at planning time.
 step_idx = $step_idx
 events_per_job = $EVENTS_PER_JOB
 first_event = $FIRST_EVENT
-filter_eff = $FILTER_EFF
 if step_idx == 0 and events_per_job > 0:
-    # For GenFilter workflows, events_per_job is the *output* count.
-    # We must generate events_per_job / filter_efficiency input events
-    # so that enough pass the filter.
-    if filter_eff > 0 and filter_eff < 1.0:
-        gen_events = int(events_per_job / filter_eff)
-    else:
-        gen_events = events_per_job
+    gen_events = events_per_job
     lines.append('process.maxEvents.input = cms.untracked.int32(' + str(gen_events) + ')')
     # Also update ExternalLHEProducer.nEvents if present (wmLHE workflows)
     # The gridpack must produce exactly as many LHE events as cmsRun will consume,
@@ -2087,12 +2087,7 @@ with open(pset, 'a') as f:
             echo "  input: $INJECT_INPUT (injected into PSet)"
         fi
         if [[ $step_idx -eq 0 && "$EVENTS_PER_JOB" -gt 0 ]]; then
-            if python3 -c "exit(0 if $FILTER_EFF < 1.0 else 1)" 2>/dev/null; then
-                GEN_EVENTS=$(python3 -c "print(int($EVENTS_PER_JOB / $FILTER_EFF))")
-                echo "  maxEvents: $GEN_EVENTS (target_output=$EVENTS_PER_JOB / filter_eff=$FILTER_EFF)"
-            else
-                echo "  maxEvents: $EVENTS_PER_JOB (injected into PSet)"
-            fi
+            echo "  maxEvents: $EVENTS_PER_JOB (generated events, injected into PSet)"
         fi
         if [[ "$NTHREADS" -gt 1 ]]; then
             echo "  nThreads: $NTHREADS (injected into PSet)"
@@ -2168,8 +2163,7 @@ except Exception:
             SAVED_WORK_DIR="$WORK_DIR"
             WORK_DIR="$STEP0_TMPFS"
             echo "  execution: cmssw-env (tmpfs CWD)"
-            run_step "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
-            STEP_RC=$?
+            run_step "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS" && STEP_RC=0 || STEP_RC=$?
             WORK_DIR="$SAVED_WORK_DIR"
             # Measure tmpfs usage before cleanup
             TMPFS_MB=$(du -sm "$STEP0_TMPFS" 2>/dev/null | awk '{print $1}')
@@ -2183,8 +2177,7 @@ except Exception:
             echo "  Cleaned tmpfs: $STEP0_TMPFS"
         else
             echo "  execution: cmssw-env ($STEP_ARCH)"
-            run_step "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS"
-            STEP_RC=$?
+            run_step "$CMSSW_VER" "$STEP_ARCH" "$CMSRUN_ARGS" && STEP_RC=0 || STEP_RC=$?
         fi
 
         STEP_END=$(date +%s)
@@ -2243,7 +2236,7 @@ print(total)
 " 2>/dev/null || echo "0")
             if [[ "$EVENTS_WRITTEN" == "0" ]]; then
                 echo "ERROR: Step 1 produced 0 output events (GenFilter rejected all)." >&2
-                echo "  filter_eff=$FILTER_EFF, EVENTS_PER_JOB=$EVENTS_PER_JOB" >&2
+                echo "  maxEvents=$EVENTS_PER_JOB (generated events)" >&2
                 exit 80
             fi
             echo "  events_written: $EVENTS_WRITTEN"
