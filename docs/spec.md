@@ -1343,7 +1343,12 @@ class DAGPlanner:
             measured_tpe = sm.get("time_per_event", request.time_per_event_sec)
             events_per_job = int(target_wall_time_hours * 3600 / measured_tpe)
         else:
-            # Round 0 / non-adaptive: request defaults
+            # Round 0 / non-adaptive: use the request's EventsPerJob as-is.
+            # WMS2 does not redefine splitting — it trusts the value computed
+            # upstream (by cmsunified / WMAgent's calcEvtsPerJobLumi).  For
+            # GenFilter workflows, EventsPerJob is in terms of *generated*
+            # events (= target_job_length / TimePerEvent, where TimePerEvent
+            # is per generated event).
             events_per_job = request.splitting_params.get("events_per_job", 10000)
             memory_mb = request.memory_mb
 
