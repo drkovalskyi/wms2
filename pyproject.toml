@@ -33,6 +33,9 @@ dev = [
     "matplotlib>=3.8.0",
 ]
 
+[project.scripts]
+wms2 = "wms2.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/wms2"]
 

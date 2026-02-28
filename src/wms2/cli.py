@@ -63,17 +63,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_cert(args: argparse.Namespace) -> tuple[str, str]:
-    """Resolve X.509 cert+key from --proxy or --cert/--key."""
+    """Resolve X.509 cert+key from --proxy or --cert/--key or env vars."""
     if args.proxy:
         return args.proxy, args.proxy
     if args.cert and args.key:
         return args.cert, args.key
-    # Default: grid proxy
+    # Check X509_USER_PROXY env var
+    env_proxy = os.environ.get("X509_USER_PROXY", "")
+    if env_proxy and os.path.exists(env_proxy):
+        return env_proxy, env_proxy
+    # Default: grid proxy at /tmp/x509up_u$UID
     proxy_path = DEFAULT_PROXY.format(uid=os.getuid())
     if os.path.exists(proxy_path):
         return proxy_path, proxy_path
     raise SystemExit(
-        f"No X.509 credential found. Tried: {proxy_path}\n"
+        f"No X.509 credential found. Tried: $X509_USER_PROXY, {proxy_path}\n"
         "Use --proxy /path/to/proxy or --cert/--key."
     )
 
