@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI):
             wm = WorkflowManager(repo, reqmgr)
             dp = DAGPlanner(repo, dbs, rucio, condor, settings, site_manager=sm)
             dm = DAGMonitor(repo, condor)
-            om = OutputManager(repo, dbs, rucio, settings)
+            om = OutputManager(repo, dbs, rucio)
             eh = ErrorHandler(repo, condor, settings, site_manager=sm)
             lm = RequestLifecycleManager(
                 repo, condor, settings,
