@@ -845,6 +845,9 @@ def _generate_group_dag(
     if output_info_path:
         merge_args += f" --output-info {os.path.basename(output_info_path)}"
         merge_transfer.append(output_info_path)
+    manifest_path = str(group_dir / "manifest.json")
+    if os.path.isfile(manifest_path):
+        merge_transfer.append(manifest_path)
     _write_submit_file(
         str(group_dir / "merge.sub"),
         executable=merge_exe,
