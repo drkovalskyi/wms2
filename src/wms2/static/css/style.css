@@ -1,5 +1,14 @@
 /* WMS2 custom styles on top of Pico CSS */
 
+/* Tighten Pico's default font sizing */
+:root {
+    --pico-font-size: 15px;
+    --pico-line-height: 1.4;
+}
+h1 { font-size: 1.5rem; }
+h2 { font-size: 1.25rem; }
+h3 { font-size: 1.1rem; }
+
 /* Layout: sidebar + content */
 .layout {
     display: grid;
