@@ -1,8 +1,30 @@
 # WMS2 — Implementation Log
 
-**Date**: 2026-02-14
+**Date**: 2026-03-01
 **Spec Version**: 2.4.0
 **Phase**: 1 — Project Scaffold and Foundation
+
+---
+
+## 2026-03-01 — Fix: Randomize CMSSW random seeds for GEN jobs
+
+### Problem
+All GEN processing jobs used identical hardcoded seeds from `IOMC.RandomEngine.IOMC_cff`
+(generator=123456789, VtxSmeared=98765432, g4SimHits=11, mix=12345). The `firstEvent`
+parameter only changes event ID numbering, not random engine state. Confirmed by comparing
+`GenEventInfoProduct.qScale_` across round 0 output files — bit-for-bit identical physics.
+
+### Fix
+Added `RandomNumberServiceHelper.populate()` call to PSet injection for step 0, in both:
+- Main processing path (`dag_planner.py` ~line 2069)
+- Parallel instance path (`inject_pset_parallel()` ~line 1449)
+
+This is the same mechanism WMAgent uses (via `AutomaticSeeding`). `populate()` draws from
+`/dev/urandom` to generate unique seeds for every module in `RandomNumberGeneratorService`.
+
+### Impact
+Rounds 0 and 1 of the BPH test workflow have duplicate physics (scientifically invalid).
+Fix takes effect from the next planned round onward.
 
 ---
 

@@ -49,9 +49,11 @@ wms2 import cmsunified_task_BPH-RunIISummer20UL18GEN-00292__v1_T_250801_104414_1
 10. GenFilter events_per_job double-inflation — events_per_job is *generated* events (not output); PSet injection must NOT divide by filter_eff; total_events must be inflated by 1/filter_eff at planning time
 11. Premature completion — offset-based termination used assignment offsets for accounting; GenFilter round 0 offset exceeded request_num_events despite producing only ~90 output events vs 250K target
 12. Merge job not merging — manifest.json missing from merge job's transfer_input_files; merge POST script fell back to file copy instead of cmsRun merge
+13. Duplicate physics events — RandomNumberGeneratorService seeds not randomized; all GEN jobs used identical hardcoded seeds from IOMC_cff, producing bit-for-bit identical events. Fixed by calling RandomNumberServiceHelper.populate() (same as WMAgent's AutomaticSeeding)
 
 ## Potential issues
 
+- **Rounds 0 and 1 have duplicate physics** — all jobs generated identical events due to missing seed randomization (issue #13). Fix takes effect from next round onward. Previous rounds are scientifically invalid.
 - Round 1 (currently running) was planned before the merge fix — will still copy instead of merge
 - NanoAOD Rivet segfault on 0 events (CMSSW_10_6_47 bug, not WMS2) — only affects 0-event case
 - With test_fraction=0.05, each job produces ~10 output events. NanoAOD should work since events > 0.

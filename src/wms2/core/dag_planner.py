@@ -1446,6 +1446,10 @@ lines.append('process.maxEvents.input = cms.untracked.int32($max_events)')
 lines.append('process.source.firstEvent = cms.untracked.uint32($first_event)')
 lines.append('if hasattr(process, \"externalLHEProducer\"):')
 lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32($max_events)')
+# Randomize seeds for parallel GEN instances (same as main path)
+lines.append('from IOMC.RandomEngine.RandomServiceHelper import RandomNumberServiceHelper')
+lines.append('_rng_helper = RandomNumberServiceHelper(process.RandomNumberGeneratorService)')
+lines.append('_rng_helper.populate()')
 if $nthreads > 1:
     lines.append('if not hasattr(process, \"options\"):')
     lines.append('    process.options = cms.untracked.PSet()')
@@ -2057,6 +2061,15 @@ elif step_idx > 0:
     lines.append('process.maxEvents.input = cms.untracked.int32(-1)')
 if step_idx == 0 and first_event > 0:
     lines.append('process.source.firstEvent = cms.untracked.uint32(' + str(first_event) + ')')
+
+# Randomize seeds for GEN step — without this, all jobs use the same hardcoded
+# seeds from IOMC.RandomEngine.IOMC_cff and generate identical physics events.
+# Uses CMSSW's built-in RandomNumberServiceHelper.populate() which draws from
+# /dev/urandom (same mechanism WMAgent uses via AutomaticSeeding).
+if step_idx == 0:
+    lines.append('from IOMC.RandomEngine.RandomServiceHelper import RandomNumberServiceHelper')
+    lines.append('_rng_helper = RandomNumberServiceHelper(process.RandomNumberGeneratorService)')
+    lines.append('_rng_helper.populate()')
 
 # nThreads
 nthreads = $NTHREADS
