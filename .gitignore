@@ -1,7 +1,8 @@
+*~
+
 # Claude Code — commit shared config, ignore per-machine files
 .claude/environment.local.md
 .claude/settings.local.json
-PLANNING.md
 
 # Python
 __pycache__/
