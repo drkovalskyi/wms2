@@ -6,6 +6,87 @@
 
 ---
 
+## 2026-03-01 — Web frontend Phase 2: actions, drill-down pages, import form
+
+### What was done
+
+Built the interactive layer on top of the Phase 1 read-only dashboard. Phase 2 adds
+operator actions, workflow and DAG detail pages, toast notifications, and a request
+import form. The existing API endpoints for request actions (stop, release, fail,
+restart) were already in `src/wms2/api/requests.py` — Phase 2 adds the UI layer and
+one new backend endpoint (`POST /api/v1/import`).
+
+### New files
+
+| File | Purpose |
+|---|---|
+| `src/wms2/api/import_endpoint.py` | `POST /api/v1/import` — imports request from ReqMgr2 |
+| `src/wms2/static/js/components/toast.js` | Toast notification Alpine component (global event-driven) |
+| `src/wms2/static/js/components/workflow-detail.js` | Workflow detail page data/logic |
+| `src/wms2/static/js/components/dag-detail.js` | DAG detail page data/logic |
+| `src/wms2/static/js/components/import-form.js` | Import form data/validation/submission |
+| `src/wms2/templates/workflow_detail.html` | Workflow detail: splitting, metrics, blocks, progress |
+| `src/wms2/templates/dag_detail.html` | DAG detail: node bar, work units, history timeline |
+| `src/wms2/templates/import.html` | Import form: request name, sandbox mode, test fraction, etc. |
+
+### Modified files
+
+- **`src/wms2/static/js/api.js`** — Added `post()` helper, action methods (`stopRequest`,
+  `releaseRequest`, `failRequest`, `restartRequest`), workflow/DAG fetch methods
+  (`getWorkflow`, `getWorkflowBlocks`, `getDAGHistory`), and `importRequest`.
+  Also improved error handling to extract `detail` from JSON error responses.
+- **`src/wms2/static/js/components/request-detail.js`** — Added action state
+  (`actionLoading`, dialog visibility flags), visibility getters (`canStop`, `canRelease`,
+  `canFail`, `canRestart`), and action methods with toast feedback.
+- **`src/wms2/templates/request_detail.html`** — Action buttons row (conditional on
+  status), three `<dialog>` elements for Stop (with reason textarea), Fail, and Restart
+  confirmations. Added cross-links to workflow and DAG detail pages.
+- **`src/wms2/templates/base.html`** — Toast container div, toast.js script include,
+  Import nav link in sidebar.
+- **`src/wms2/static/css/style.css`** — Toast positioning/animation, dialog styles,
+  action button row, node bar (stacked colored segments), timeline table, form page styles.
+- **`src/wms2/ui/routes.py`** — Three new routes: `/ui/workflows/{workflow_id}`,
+  `/ui/dags/{dag_id}`, `/ui/import`.
+- **`src/wms2/api/router.py`** — Included `import_endpoint.router`.
+- **`src/wms2/main.py`** — Stored adapters (`condor`, `reqmgr`, `dbs`, `rucio`) on
+  `app.state` during lifespan so the import endpoint can use them.
+
+### Design decisions
+
+- **Native `<dialog>` element** for confirmations — Pico CSS styles it automatically,
+  no modal library needed. Controlled via Alpine `:open` binding.
+- **Toast as global Alpine component** — Lives in `base.html`, any page component
+  dispatches a `wms2:toast` CustomEvent. Auto-dismisses after 5 seconds, click to close.
+- **Import endpoint reuses app adapters** — Rather than constructing new adapter
+  instances, the import endpoint uses the same ReqMgr2/DBS/Rucio/Condor adapters
+  created during `lifespan()` and stored on `app.state`.
+- **Action buttons are conditional** — Only shown when the request is in a valid state
+  for that action (Stop for active/pilot_running, Release for held, Fail/Restart for
+  held/partial).
+- **Import endpoint normalizes request data** — Same normalization logic as CLI
+  (`_normalize_request`), duplicated in the endpoint to avoid tight coupling with CLI
+  internals. Handles StepChain field extraction, GEN detection, SplittingParams assembly.
+- **Session management** — Import endpoint uses `flush()` for intermediate visibility
+  within the same session; the deps layer `get_session()` handles final `commit()`.
+
+### Verification
+
+- All 6 UI routes return HTTP 200 (dashboard, requests, request detail, workflow detail,
+  DAG detail, import)
+- Page templates render correct Alpine components and HTML structure
+- Import API endpoint returns 502 for unreachable ReqMgr2 (expected behavior)
+- Cross-links verified: request → workflow → DAG → workflow → request
+- Sidebar shows Import nav link
+- Toast container present in all pages via base.html
+- 53/54 existing tests pass (1 pre-existing env issue in test_resource_utilization)
+
+### Known issues
+
+- Import endpoint duplicates `_normalize_request()` from `cli.py` — could be refactored
+  into a shared module if both paths need to stay in sync long-term.
+
+---
+
 ## 2026-03-01 — Refactor CLI/lifecycle shared logic, fix cleanup and matrix tests
 
 ### What was done
