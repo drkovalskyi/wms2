@@ -288,9 +288,17 @@ class DAGPlanner:
                     ds = step.get(field, "")
                     if ds and ds not in pileup_files:
                         try:
-                            files = await self.rucio.get_available_pileup_files(ds)
+                            preferred = [
+                                r.strip()
+                                for r in (self.settings.pileup_preferred_rses or "").split(",")
+                                if r.strip()
+                            ] or None
+                            files = await self.rucio.get_available_pileup_files(ds, preferred_rses=preferred)
                             pileup_files[ds] = files
-                            logger.info("Pileup %s: %d on-disk files", ds, len(files))
+                            if preferred:
+                                logger.info("Pileup %s: %d files at preferred RSEs %s", ds, len(files), preferred)
+                            else:
+                                logger.info("Pileup %s: %d on-disk files", ds, len(files))
                         except Exception:
                             logger.warning(
                                 "Rucio pileup query failed for %s", ds, exc_info=True

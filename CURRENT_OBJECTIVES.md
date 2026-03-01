@@ -9,23 +9,16 @@ which measures optimal parameters for the jobs. Next round should
 optimize. Keep track of all issues starting and running the test - we
 need to fix them.
 
+Verify that each job is using a new seed for event generation.
+
+Make sure that outpus is properly merged in each work unit.
+
 ## Status
 
-Round 1 running (10 work units, 80 proc jobs). Round 0 completed successfully
-with 1 work unit (8 proc jobs). Two issues found and fixed this session:
-
-1. **Premature completion** — offset-based termination declared COMPLETED after
-   round 0 because generated-event offset exceeded request_num_events. Fixed by
-   tracking actual output events (events_produced vs target_events). Backfilled
-   target_events=250000 on the running workflow.
-
-2. **Merge job not merging** — manifest.json was not transferred to the merge job
-   sandbox, so the merge POST script couldn't detect cmssw mode and fell back to
-   copying 8 unmerged files instead of merging into 1. Fixed by adding manifest.json
-   to merge transfer_input_files. Round 1 was planned before this fix, so it will
-   still copy. The fix takes effect from the next planned round onward.
-
-Waiting for round 1 to complete to verify production tracking and merge fix.
+Fresh re-import running (previous rounds had duplicate physics due to issue #13).
+Round 0 in progress: 7 of 8 proc jobs completed, proc_000004 retrying (attempt 1
+of 3) after XRootD pileup file timeout. Seed randomization fix verified — all jobs
+have unique RandomNumberGeneratorService seeds.
 
 ## Command
 
@@ -53,10 +46,23 @@ wms2 import cmsunified_task_BPH-RunIISummer20UL18GEN-00292__v1_T_250801_104414_1
 
 ## Potential issues
 
-- **Rounds 0 and 1 have duplicate physics** — all jobs generated identical events due to missing seed randomization (issue #13). Fix takes effect from next round onward. Previous rounds are scientifically invalid.
-- Round 1 (currently running) was planned before the merge fix — will still copy instead of merge
 - NanoAOD Rivet segfault on 0 events (CMSSW_10_6_47 bug, not WMS2) — only affects 0-event case
 - With test_fraction=0.05, each job produces ~10 output events. NanoAOD should work since events > 0.
+
+## Future improvements (not fixing now)
+
+- **Pileup (secondary input) site selection** — CMSSW reads pileup files via AAA
+  (XRootD federation), which can pick a bad replica at a remote/unreachable site.
+  proc_000004 failed on Step 3 (DIGIPremix) because AAA routed to an unresponsive
+  site. DAGMan retry handled it (restarts from scratch, likely gets a different
+  replica). A future improvement would be to configure CMSSW to prefer local/nearby
+  replicas for secondary input, or to provide a site-filtered pileup file list.
+  Details of the failure:
+  - **File**: `/store/mc/RunIISummer20ULPrePremix/Neutrino_E-10_gun/PREMIX/BParking_106X_upgrade2018_realistic_v16_L1v1-v1/80020/5ADFEA0E-6F73-9645-A309-FA7DDE767EBF.root`
+  - **Site**: `se01.indiacms.res.in:1094`
+  - **Error**: XRootD `kXR_open` timeout (two attempts, ~3 min each), then CMSSW `FileOpenError` exit code 84
+  - **Step**: BPH-RunIISummer20UL18DIGIPremix-00476_0
+  - **Resolution**: DAGMan retry #1 of 3; job restarts from GEN (loses ~2h of work)
 
 ## After every failure
 

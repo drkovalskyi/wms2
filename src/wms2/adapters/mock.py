@@ -141,8 +141,9 @@ class MockRucioAdapter(RucioAdapter):
     async def delete_rule(self, rule_id: str) -> None:
         self.calls.append(("delete_rule", (rule_id,), {}))
 
-    async def get_available_pileup_files(self, dataset: str) -> list[str]:
-        self.calls.append(("get_available_pileup_files", (dataset,), {}))
+    async def get_available_pileup_files(self, dataset: str,
+                                         preferred_rses: list[str] | None = None) -> list[str]:
+        self.calls.append(("get_available_pileup_files", (dataset,), {"preferred_rses": preferred_rses}))
         return getattr(self, "_pileup_files", [])
 
 

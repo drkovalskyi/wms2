@@ -100,22 +100,43 @@ class RucioClient(RucioAdapter):
         resp = await self._client.delete(url)
         resp.raise_for_status()
 
-    async def get_available_pileup_files(self, dataset: str) -> list[str]:
-        """Get LFNs with on-disk replicas using rucio-clients Python API."""
-        return await asyncio.to_thread(self._get_pileup_sync, dataset)
+    async def get_available_pileup_files(self, dataset: str,
+                                         preferred_rses: list[str] | None = None) -> list[str]:
+        """Get LFNs with on-disk replicas using rucio-clients Python API.
 
-    def _get_pileup_sync(self, dataset: str) -> list[str]:
+        If preferred_rses is non-empty, only files with a replica at one of
+        those RSEs are returned.  When empty/None, any disk RSE is accepted.
+        """
+        return await asyncio.to_thread(self._get_pileup_sync, dataset, preferred_rses)
+
+    def _get_pileup_sync(self, dataset: str,
+                         preferred_rses: list[str] | None = None) -> list[str]:
         from rucio.client import Client as RucioNativeClient
 
         rucio_home = os.environ.get("RUCIO_HOME", "/tmp/rucio")
         os.environ.setdefault("RUCIO_HOME", rucio_home)
         c = RucioNativeClient()
+
+        # Build RSE match set: both bare site name and _Disk suffix
+        rse_filter: set[str] | None = None
+        if preferred_rses:
+            rse_filter = set()
+            for rse in preferred_rses:
+                rse_filter.add(rse)
+                if not rse.endswith("_Disk"):
+                    rse_filter.add(rse + "_Disk")
+
         available = []
         for replica in c.list_replicas(
             [{"scope": "cms", "name": dataset}],
             schemes=["root"],
         ):
             states = replica.get("states", {})
-            if any(rse for rse in states if not rse.endswith("_Tape")):
-                available.append(replica["name"])
+            disk_rses = [rse for rse in states if not rse.endswith("_Tape")]
+            if rse_filter:
+                if any(rse in rse_filter for rse in disk_rses):
+                    available.append(replica["name"])
+            else:
+                if disk_rses:
+                    available.append(replica["name"])
         return available

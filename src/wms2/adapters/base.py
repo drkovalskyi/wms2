@@ -97,8 +97,12 @@ class RucioAdapter(ABC):
         """Delete a Rucio rule."""
 
     @abstractmethod
-    async def get_available_pileup_files(self, dataset: str) -> list[str]:
-        """Get LFNs with on-disk replicas for a pileup dataset."""
+    async def get_available_pileup_files(self, dataset: str,
+                                         preferred_rses: list[str] | None = None) -> list[str]:
+        """Get LFNs with on-disk replicas for a pileup dataset.
+
+        If preferred_rses is non-empty, only files at those RSEs are returned.
+        """
 
 
 class CRICAdapter(ABC):

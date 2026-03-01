@@ -647,10 +647,11 @@ async def run_import(args: argparse.Namespace) -> None:
 
             # Final status line
             request = await repo.get_request(request_name)
-            final_status = request.status if request else result.status.value
+            final_status = request.status if request else "unknown"
+            dag = await repo.get_dag(dag.id)
+            dag_status = dag.status if dag else "unknown"
             print()
-            print(f"=== DAG finished: {result.status.value} | request: {final_status} ===")
-            print(f"  done={result.nodes_done} failed={result.nodes_failed}")
+            print(f"=== DAG finished: {dag_status} | request: {final_status} ===")
 
     finally:
         await engine.dispose()

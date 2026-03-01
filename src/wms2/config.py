@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     submit_base_dir: str = "/data/wms2/submit"
     target_merged_size_kb: int = 4 * 1024 * 1024  # 4 GB in KB
 
+    # Pileup site filtering — restrict pileup file list to replicas at these RSEs.
+    # When non-empty, only files with a disk replica at one of these RSEs are included.
+    # When empty (default), any disk RSE is accepted (current behavior).
+    # Example: "T2_CH_CERN,T1_US_FNAL_Disk"
+    pileup_preferred_rses: str = ""
+
     # Work unit sizing
     jobs_per_work_unit: int = 8  # processing jobs per merge group
     first_round_work_units: int = 1  # work units for round 0 (pilot)
