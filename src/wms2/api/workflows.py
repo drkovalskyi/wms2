@@ -1,8 +1,10 @@
+import os
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
 
-from wms2.api.deps import get_repository
+from wms2.api.deps import get_repository, get_settings
+from wms2.core.output_lfn import derive_merged_lfn_bases, lfn_to_pfn
 from wms2.db.repository import Repository
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -154,3 +156,73 @@ async def get_workflow_blocks(
 
     blocks = await repo.get_processing_blocks(wf_uuid)
     return [_block_detail(b) for b in blocks]
+
+
+@router.get("/{workflow_id}/dags")
+async def get_workflow_dags(
+    workflow_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    """Get all DAGs for a workflow, ordered by creation time."""
+    try:
+        wf_uuid = UUID(workflow_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid workflow ID format")
+
+    row = await repo.get_workflow(wf_uuid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    from wms2.api.dags import _dag_summary
+    dags = await repo.list_dags(workflow_id=wf_uuid, limit=1000)
+    return [_dag_summary(d) for d in dags]
+
+
+@router.get("/{workflow_id}/output-datasets")
+async def get_workflow_output_datasets(
+    workflow_id: str,
+    repo: Repository = Depends(get_repository),
+    settings=Depends(get_settings),
+):
+    """Get output dataset info with file counts from disk."""
+    try:
+        wf_uuid = UUID(workflow_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid workflow ID format")
+
+    row = await repo.get_workflow(wf_uuid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    config = row.config_data or {}
+    output_datasets = config.get("output_datasets", [])
+    if not output_datasets:
+        # Derive from request_data if not in config
+        req = await repo.get_request(row.request_name)
+        if req and req.request_data:
+            output_datasets = derive_merged_lfn_bases(req.request_data)
+
+    results = []
+    for ds in output_datasets:
+        merged_base = ds.get("merged_lfn_base", "")
+        pfn_base = lfn_to_pfn(settings.local_pfn_prefix, merged_base) if merged_base else ""
+        file_count = 0
+        total_size_bytes = 0
+        if pfn_base and os.path.isdir(pfn_base):
+            for dirpath, _dirnames, filenames in os.walk(pfn_base):
+                for fn in filenames:
+                    if fn.endswith(".root"):
+                        file_count += 1
+                        try:
+                            total_size_bytes += os.path.getsize(os.path.join(dirpath, fn))
+                        except OSError:
+                            pass
+        results.append({
+            "dataset_name": ds.get("dataset_name", ""),
+            "data_tier": ds.get("data_tier", ""),
+            "merged_lfn_base": merged_base,
+            "output_path": pfn_base,
+            "file_count": file_count,
+            "total_size_mb": round(total_size_bytes / (1024 * 1024), 1) if total_size_bytes else 0,
+        })
+    return results

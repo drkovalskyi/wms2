@@ -7,6 +7,8 @@ document.addEventListener('alpine:init', () => {
         workflow: null,
         blocks: [],
         dag: null,
+        allDags: [],
+        outputDatasets: [],
         loading: true,
         error: null,
 
@@ -21,10 +23,14 @@ document.addEventListener('alpine:init', () => {
                 this.error = null;
                 this.workflow = await WMS2_API.getWorkflow(this.workflowId);
 
-                const [blks] = await Promise.all([
+                const [blks, dags, ods] = await Promise.all([
                     WMS2_API.getWorkflowBlocks(this.workflowId).catch(() => []),
+                    WMS2_API.getWorkflowDags(this.workflowId).catch(() => []),
+                    WMS2_API.getWorkflowOutputDatasets(this.workflowId).catch(() => []),
                 ]);
                 this.blocks = blks;
+                this.allDags = dags;
+                this.outputDatasets = ods;
 
                 if (this.workflow.dag_id) {
                     this.dag = await WMS2_API.getDAG(this.workflow.dag_id).catch(() => null);
@@ -45,14 +51,26 @@ document.addEventListener('alpine:init', () => {
 
         get stepMetrics() {
             if (!this.workflow || !this.workflow.step_metrics) return [];
-            const sm = this.workflow.step_metrics;
-            if (Array.isArray(sm)) return sm;
-            return Object.entries(sm).map(([step, data]) => ({ step, ...data }));
+            return parseStepMetrics(this.workflow.step_metrics);
         },
 
         get splittingDisplay() {
             if (!this.workflow) return {};
-            return this.workflow.splitting_params || {};
+            const params = { ...(this.workflow.splitting_params || {}) };
+            const tf = (this.workflow.config_data || {}).test_fraction;
+            if (tf && tf < 1) {
+                params.test_fraction = tf;
+                // Show effective events per job if events_per_job exists
+                if (params.events_per_job) {
+                    params.effective_events_per_job = Math.round(params.events_per_job * tf);
+                }
+            }
+            return params;
+        },
+
+        get testFraction() {
+            const tf = (this.workflow?.config_data || {}).test_fraction;
+            return (tf && tf < 1) ? tf : null;
         },
 
         get configData() {
@@ -89,6 +107,24 @@ document.addEventListener('alpine:init', () => {
                 global_tag: s.global_tag || '—',
                 scram_arch: s.scram_arch || '—',
             }));
+        },
+
+        get adaptiveInfo() {
+            const sm = this.workflow?.step_metrics;
+            if (!sm || !sm.adaptive_params) return null;
+            const ap = sm.adaptive_params;
+            const cd = this.workflow.config_data || {};
+            const summary = ap.metrics_summary || {};
+            return {
+                original_memory: cd.memory_mb,
+                tuned_memory: ap.tuned_memory_mb,
+                original_nthreads: cd.multicore,
+                tuned_nthreads: ap.tuned_nthreads,
+                memory_source: ap.memory_source,
+                peak_rss: summary.peak_rss_mb ? Math.round(summary.peak_rss_mb) : null,
+                cpu_eff: summary.weighted_cpu_eff,
+                rounds_completed: sm.rounds_completed || 0,
+            };
         },
 
         get reqmgrUrl() {

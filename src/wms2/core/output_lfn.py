@@ -20,6 +20,57 @@ import re
 logger = logging.getLogger(__name__)
 
 
+async def determine_merged_lfn_base(request_data: dict, dbs_adapter=None) -> str:
+    """Determine the correct MergedLFNBase for a request.
+
+    Logic (mirrors WMAgent Unified assignor.py):
+    - StoreResults: use request's explicit MergedLFNBase
+    - GEN workflows (no InputDataset): return /store/mc
+    - Workflows with InputDataset: query DBS for a file, extract LFN base
+      (first 3 path components, e.g. /store/mc or /store/data)
+    - Fallback: /store/mc
+    """
+    request_type = request_data.get("RequestType", "")
+
+    # StoreResults: use explicit value
+    if request_type == "StoreResults":
+        return request_data.get("MergedLFNBase", "/store/mc")
+
+    # Check for input dataset
+    input_dataset = request_data.get("InputDataset", "")
+    if not input_dataset:
+        # GEN workflow — check Step1 for input
+        step1 = request_data.get("Step1", {})
+        input_dataset = step1.get("InputDataset", "")
+
+    if not input_dataset or request_data.get("_is_gen"):
+        return "/store/mc"
+
+    # Query DBS for a file in the input dataset to determine LFN base
+    if dbs_adapter is not None:
+        try:
+            files = await dbs_adapter.list_files(input_dataset, limit=1)
+            if files:
+                lfn = files[0].get("logical_file_name", "")
+                if lfn:
+                    # Extract first 3 path components: /store/mc or /store/data
+                    parts = lfn.split("/")
+                    if len(parts) >= 3:
+                        base = "/" + "/".join(parts[1:3])
+                        logger.info(
+                            "Determined MergedLFNBase=%s from input dataset %s",
+                            base, input_dataset,
+                        )
+                        return base
+        except Exception:
+            logger.warning(
+                "Failed to query DBS for input dataset %s, using default /store/mc",
+                input_dataset, exc_info=True,
+            )
+
+    return "/store/mc"
+
+
 def lfn_to_pfn(local_pfn_prefix: str, lfn: str) -> str:
     """Convert an LFN to a local PFN by prepending the site prefix.
 

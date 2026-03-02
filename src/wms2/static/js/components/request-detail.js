@@ -65,9 +65,7 @@ document.addEventListener('alpine:init', () => {
 
         get stepMetrics() {
             if (!this.workflow || !this.workflow.step_metrics) return [];
-            const sm = this.workflow.step_metrics;
-            if (Array.isArray(sm)) return sm;
-            return Object.entries(sm).map(([step, data]) => ({ step, ...data }));
+            return parseStepMetrics(this.workflow.step_metrics);
         },
 
         get transitions() {
@@ -90,6 +88,12 @@ document.addEventListener('alpine:init', () => {
         },
         get hasActions() {
             return this.canStop || this.canRelease || this.canFail || this.canRestart;
+        },
+
+        get testFraction() {
+            const cd = (this.workflow && this.workflow.config_data) || {};
+            const tf = cd.test_fraction;
+            return (tf && tf < 1) ? tf : null;
         },
 
         // Toast helper

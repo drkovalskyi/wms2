@@ -307,6 +307,23 @@ class DAGPlanner:
 
         # Plan merge groups (after resource_params is fully built)
         jobs_per_wu = resource_params.pop("_jobs_per_wu_override", None)
+
+        # Output-size-based WU sizing for rounds 1+ (when no explicit override)
+        if adaptive and current_round > 0 and jobs_per_wu is None:
+            step_metrics = getattr(workflow, "step_metrics", None)
+            if isinstance(step_metrics, dict):
+                computed = _compute_jobs_per_wu_from_write_mb(
+                    step_metrics,
+                    self.settings.target_merged_size_kb,
+                    self.settings.max_jobs_per_work_unit,
+                )
+                if computed is not None:
+                    jobs_per_wu = computed
+                    logger.info(
+                        "Output-size WU sizing: %d jobs/WU (target %d KB merged)",
+                        computed, self.settings.target_merged_size_kb,
+                    )
+
         merge_groups = _plan_merge_groups(
             nodes,
             jobs_per_group=jobs_per_wu or self.settings.jobs_per_work_unit,
@@ -574,6 +591,50 @@ class DAGPlanner:
             workflow.id, num_jobs, events_per_job, start_event, total_events,
         )
         return nodes
+
+
+# ── Output-Size WU Sizing ─────────────────────────────────────
+
+
+def _compute_jobs_per_wu_from_write_mb(
+    step_metrics: dict,
+    target_merged_size_kb: int,
+    max_jobs: int,
+) -> int | None:
+    """Compute optimal jobs_per_work_unit from measured write_mb in step_metrics.
+
+    Uses the smallest output tier's write_mb.mean to calculate how many jobs
+    produce a target merged file size. Returns None if no write_mb data found.
+    """
+    rounds = step_metrics.get("rounds", {})
+    if not rounds:
+        return None
+
+    # Find the minimum write_mb.mean across all steps from the most recent round
+    min_write_mb = None
+    for round_num in sorted(rounds.keys(), key=int, reverse=True):
+        round_data = rounds[round_num]
+        wu_metrics = round_data.get("wu_metrics", [])
+        for wu in wu_metrics:
+            per_step = wu.get("per_step", {})
+            for step_data in per_step.values():
+                write_info = step_data.get("write_mb", {})
+                mean_write = write_info.get("mean")
+                if mean_write and mean_write > 0:
+                    if min_write_mb is None or mean_write < min_write_mb:
+                        min_write_mb = mean_write
+        if min_write_mb is not None:
+            break  # Use most recent round only
+
+    if min_write_mb is None or min_write_mb <= 0:
+        return None
+
+    # target_merged_size_kb is in KB, write_mb is in MB
+    target_mb = target_merged_size_kb / 1024.0
+    optimal = int(target_mb / min_write_mb)
+
+    # Clamp to [1, max_jobs]
+    return max(1, min(optimal, max_jobs))
 
 
 # ── Merge Group Planning ───────────────────────────────────────

@@ -6,6 +6,72 @@
 
 ---
 
+## 2026-03-02 — UI improvements, settings page, WU sizing, MergedLFNBase auto-determination
+
+### What was done
+
+Six groups of improvements across frontend, backend, and configuration:
+
+1. **Frontend fixes**: Fixed step metrics parsing (was treating nested JSON as flat key-value),
+   fixed work unit count display (handles JSON arrays), added "(Round N)" context labels,
+   added "DAG completed" message for empty HTCondor jobs tables.
+
+2. **Rounds/DAG history**: New `GET /workflows/{id}/dags` endpoint shows all DAGs for a workflow
+   as a rounds table. New `GET /workflows/{id}/output-datasets` endpoint scans merged output
+   directory for file counts and sizes per output dataset.
+
+3. **Settings page**: New `/ui/settings` page with read-only display of all key configuration
+   parameters. `GET /lifecycle/settings` returns masked settings. `POST /lifecycle/restart`
+   cancels and restarts the lifecycle manager task. Nav link added to sidebar.
+
+4. **Output-size WU sizing**: After round 0, uses measured `write_mb` from step_metrics to
+   compute optimal `jobs_per_work_unit` based on target merged file size. New config param
+   `max_jobs_per_work_unit` (default 100) caps the value.
+
+5. **MergedLFNBase auto-determination**: New `determine_merged_lfn_base()` function queries DBS
+   for a file in the input dataset to extract LFN base (/store/mc or /store/data). GEN workflows
+   default to /store/mc. CLI gets `--merged-lfn-base` override flag. Added `list_files()` method
+   to DBS adapter.
+
+6. **HTCondor config**: Added `GLIDEIN_CMSSite = "T2_LOCAL_DEV"` to local HTCondor pool for
+   CMS site identity in landing node scripts.
+
+### Key changes
+
+| File | Change |
+|---|---|
+| `static/js/app.js` | Added `parseStepMetrics()` function for nested step_metrics JSON |
+| `static/js/components/request-detail.js` | Uses shared `parseStepMetrics()` |
+| `static/js/components/workflow-detail.js` | Uses shared `parseStepMetrics()`, fetches allDags + outputDatasets |
+| `templates/request_detail.html` | Work units show round context, handles JSON array |
+| `templates/workflow_detail.html` | Rounds table replaces single DAG section, output datasets cards |
+| `templates/dag_detail.html` | "No active jobs" message for completed DAGs |
+| `api/workflows.py` | New endpoints: `/{id}/dags`, `/{id}/output-datasets` |
+| `api/lifecycle.py` | New endpoints: `/settings`, `/restart` |
+| `static/js/api.js` | API client methods for new endpoints |
+| `static/js/components/settings.js` | New Alpine component for settings page |
+| `templates/settings.html` | New settings page template |
+| `templates/base.html` | Settings nav link in sidebar |
+| `ui/routes.py` | `/ui/settings` route |
+| `config.py` | `max_jobs_per_work_unit` parameter |
+| `core/dag_planner.py` | `_compute_jobs_per_wu_from_write_mb()`, output-size WU sizing in `plan_production_dag()` |
+| `core/output_lfn.py` | `determine_merged_lfn_base()` function |
+| `api/import_endpoint.py` | Calls `determine_merged_lfn_base()` during import |
+| `cli.py` | `--merged-lfn-base` flag, calls `determine_merged_lfn_base()` |
+| `adapters/base.py` | `list_files()` method on DBSAdapter |
+| `adapters/dbs.py` | `list_files()` implementation |
+| `/etc/condor/config.d/50-wms2-dev.conf` | `GLIDEIN_CMSSite = "T2_LOCAL_DEV"` |
+
+### Verification
+
+- All imports verified clean
+- `_compute_jobs_per_wu_from_write_mb()` unit tested: 500 MB/job → 8 jobs/WU, 10 MB/job → capped at 100
+- `determine_merged_lfn_base()` tested: GEN → /store/mc, StoreResults → explicit, mock DBS → /store/data
+- `condor_status -af GLIDEIN_CMSSite` shows T2_LOCAL_DEV on all slots
+- Matrix smoke tests start successfully with new code paths
+
+---
+
 ## 2026-03-02 — Lifecycle manager service mode: per-cycle sessions + CLI --no-monitor
 
 ### What was done

@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     jobs_per_work_unit: int = 8  # processing jobs per merge group
     first_round_work_units: int = 1  # work units for round 0 (pilot)
     work_units_per_round: int = 10  # work units per production round (adaptive, round 1+)
+    max_jobs_per_work_unit: int = 100  # upper cap for output-size-based WU sizing
 
     # Job executables (override to /bin/true for local testing)
     processing_executable: str = "run_payload.sh"

@@ -17,6 +17,13 @@
             </h1>
             <p style="opacity:0.7; font-size:0.85rem; word-break:break-all;" x-text="workflow.id"></p>
 
+            <template x-if="testFraction">
+                <div class="banner-warning" style="background:#fef08a; border:2px solid #eab308; border-radius:4px; padding:0.5rem 0.75rem; margin-bottom:1rem; font-size:0.9rem; color:#713f12;">
+                    <strong>TEST MODE</strong> — test_fraction=<span x-text="testFraction"></span>,
+                    each job processes <span x-text="(testFraction * 100).toFixed(0)"></span>% of nominal events
+                </div>
+            </template>
+
             <div class="section">
                 <h3>Processing Info</h3>
                 <dl class="detail-grid">
@@ -90,9 +97,78 @@
                         <template x-for="[key, val] in Object.entries(splittingDisplay)" :key="key">
                             <div>
                                 <dt x-text="key"></dt>
-                                <dd x-text="val"></dd>
+                                <dd>
+                                    <template x-if="key === 'effective_events_per_job'">
+                                        <span><strong x-text="val"></strong> <span style="opacity:0.6">(nominal &times; test_fraction)</span></span>
+                                    </template>
+                                    <template x-if="key !== 'effective_events_per_job'">
+                                        <span x-text="val"></span>
+                                    </template>
+                                </dd>
                             </div>
                         </template>
+                    </dl>
+                </div>
+            </template>
+
+            <!-- Adaptive optimization -->
+            <template x-if="adaptiveInfo">
+                <div class="section">
+                    <h3>Adaptive Optimization</h3>
+                    <p style="font-size:0.85rem; opacity:0.7; margin-bottom:0.5rem;">
+                        Applied after round 0 based on measured job performance
+                    </p>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Parameter</th>
+                                <th>Original</th>
+                                <th>Optimized</th>
+                                <th>Change</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Memory (MB)</td>
+                                <td x-text="fmtNum(adaptiveInfo.original_memory)"></td>
+                                <td><strong x-text="fmtNum(adaptiveInfo.tuned_memory)"></strong></td>
+                                <td>
+                                    <template x-if="adaptiveInfo.original_memory && adaptiveInfo.tuned_memory">
+                                        <span :style="adaptiveInfo.tuned_memory < adaptiveInfo.original_memory ? 'color:#16a34a' : 'color:#dc2626'"
+                                              x-text="(adaptiveInfo.tuned_memory < adaptiveInfo.original_memory ? '' : '+') + (((adaptiveInfo.tuned_memory - adaptiveInfo.original_memory) / adaptiveInfo.original_memory) * 100).toFixed(0) + '%'"></span>
+                                    </template>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td>Threads</td>
+                                <td x-text="adaptiveInfo.original_nthreads"></td>
+                                <td><strong x-text="adaptiveInfo.tuned_nthreads"></strong></td>
+                                <td>
+                                    <template x-if="adaptiveInfo.original_nthreads !== adaptiveInfo.tuned_nthreads">
+                                        <span x-text="adaptiveInfo.tuned_nthreads - adaptiveInfo.original_nthreads"></span>
+                                    </template>
+                                    <template x-if="adaptiveInfo.original_nthreads === adaptiveInfo.tuned_nthreads">
+                                        <span style="opacity:0.5">unchanged</span>
+                                    </template>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <dl class="detail-grid" style="margin-top:0.5rem;">
+                        <template x-if="adaptiveInfo.peak_rss">
+                            <div style="display:contents;">
+                                <dt>Measured Peak RSS</dt>
+                                <dd><span x-text="fmtNum(adaptiveInfo.peak_rss)"></span> MB</dd>
+                            </div>
+                        </template>
+                        <template x-if="adaptiveInfo.cpu_eff != null">
+                            <div style="display:contents;">
+                                <dt>CPU Efficiency</dt>
+                                <dd x-text="fmtPct(adaptiveInfo.cpu_eff * 100)"></dd>
+                            </div>
+                        </template>
+                        <dt>Memory Source</dt>
+                        <dd x-text="adaptiveInfo.memory_source || '—'"></dd>
                     </dl>
                 </div>
             </template>
@@ -158,6 +234,61 @@
                 </div>
             </template>
 
+            <!-- Rounds / DAG history -->
+            <template x-if="allDags.length > 0">
+                <div class="section">
+                    <h3>Rounds</h3>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Round</th>
+                                <th>Status</th>
+                                <th>Work Units</th>
+                                <th>Nodes Done</th>
+                                <th>Nodes Failed</th>
+                                <th>Created</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="(d, idx) in allDags" :key="d.id">
+                                <tr>
+                                    <td x-text="idx"></td>
+                                    <td x-html="statusBadge(d.status)"></td>
+                                    <td x-text="d.total_work_units || 0"></td>
+                                    <td x-text="d.nodes_done || 0"></td>
+                                    <td x-text="d.nodes_failed || 0"></td>
+                                    <td x-text="fmtDateTime(d.created_at)"></td>
+                                    <td><a :href="'/ui/dags/' + encodeURIComponent(d.id)">Details &rarr;</a></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </template>
+
+            <!-- Output Datasets -->
+            <template x-if="outputDatasets.length > 0">
+                <div class="section">
+                    <h3>Output Datasets</h3>
+                    <template x-for="ds in outputDatasets" :key="ds.dataset_name">
+                        <div style="margin-bottom:1rem; padding:0.75rem; border:1px solid var(--pico-muted-border-color); border-radius:4px;">
+                            <strong x-text="ds.dataset_name" style="word-break:break-all;"></strong>
+                            <dl class="detail-grid" style="margin-top:0.5rem;">
+                                <dt>Data Tier</dt>
+                                <dd x-text="ds.data_tier || '—'"></dd>
+                                <dt>Output Path</dt>
+                                <dd x-text="ds.output_path || '—'" style="word-break:break-all; font-size:0.85rem;"></dd>
+                                <dt>Files</dt>
+                                <dd><span x-text="ds.file_count"></span> .root files</dd>
+                                <dt>Total Size</dt>
+                                <dd x-text="ds.total_size_mb > 0 ? ds.total_size_mb + ' MB' : '—'"></dd>
+                            </dl>
+                        </div>
+                    </template>
+                </div>
+            </template>
+
             <!-- Processing blocks -->
             <template x-if="blocks.length > 0">
                 <div class="section">
@@ -187,27 +318,6 @@
                             </template>
                         </tbody>
                     </table>
-                </div>
-            </template>
-
-            <!-- DAG link -->
-            <template x-if="dag">
-                <div class="section">
-                    <h3>DAG</h3>
-                    <dl class="detail-grid">
-                        <dt>Status</dt>
-                        <dd x-html="statusBadge(dag.status)"></dd>
-                        <dt>DAGMan Cluster</dt>
-                        <dd x-text="dag.dagman_cluster_id || '—'"></dd>
-                        <dt>Work Units</dt>
-                        <dd>
-                            <span x-text="dag.completed_work_units || 0"></span>
-                            / <span x-text="dag.total_work_units || 0"></span> completed
-                        </dd>
-                    </dl>
-                    <p style="margin-top:0.5rem;">
-                        <a :href="'/ui/dags/' + encodeURIComponent(dag.id)">View DAG details &rarr;</a>
-                    </p>
                 </div>
             </template>
 

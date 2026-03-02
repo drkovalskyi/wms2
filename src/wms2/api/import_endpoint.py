@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
 from pydantic import BaseModel
 
 from wms2.core.dag_planner import DAGPlanner
-from wms2.core.output_lfn import derive_merged_lfn_bases
+from wms2.core.output_lfn import derive_merged_lfn_bases, determine_merged_lfn_base
 from wms2.core.sandbox import create_sandbox
 from wms2.db.repository import Repository
 from wms2.models.enums import RequestStatus
@@ -121,7 +121,9 @@ async def import_request(
     session = repo.session
     await session.flush()
 
-    # 3. Build config_data and create workflow
+    # 3. Determine MergedLFNBase and build config_data
+    merged_lfn_base = await determine_merged_lfn_base(reqdata, dbs_adapter=dbs)
+    reqdata["MergedLFNBase"] = merged_lfn_base
     output_datasets_info = derive_merged_lfn_bases(reqdata)
     config_data = {
         "campaign": reqdata.get("Campaign"),
@@ -129,7 +131,7 @@ async def import_request(
         "priority": reqdata.get("RequestPriority"),
         "request_type": reqdata.get("RequestType"),
         "output_datasets": output_datasets_info,
-        "merged_lfn_base": reqdata.get("MergedLFNBase", "/store/mc"),
+        "merged_lfn_base": merged_lfn_base,
         "unmerged_lfn_base": reqdata.get("UnmergedLFNBase", "/store/unmerged"),
         "cmssw_version": reqdata.get("CMSSWVersion"),
         "scram_arch": reqdata.get("ScramArch"),

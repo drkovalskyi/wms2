@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}WMS2 — Settings{% endblock %}
+{% block head_scripts %}
+<script src="/static/js/components/settings.js"></script>
+{% endblock %}
+{% block content %}
+<div x-data="settingsPage">
+
+    <div x-show="error" class="error-banner" x-text="error"></div>
+    <div x-show="loading && !settings" style="opacity:0.6">Loading...</div>
+
+    <template x-if="settings">
+        <div>
+            <h1 style="font-size:1.3rem;">Settings</h1>
+            <p style="opacity:0.6; font-size:0.85rem; margin-bottom:1rem;">
+                Read-only view of current WMS2 configuration (from environment variables).
+            </p>
+
+            <div class="section">
+                <h3>Lifecycle Manager</h3>
+                <dl class="detail-grid">
+                    <dt>Status</dt>
+                    <dd x-html="lifecycleRunning ? statusBadge('running') : statusBadge('idle')"></dd>
+                    <dt>Cycle Interval</dt>
+                    <dd><span x-text="settings.lifecycle_cycle_interval"></span>s</dd>
+                    <dt>Max Active DAGs</dt>
+                    <dd x-text="settings.max_active_dags"></dd>
+                    <dt>Log Level</dt>
+                    <dd x-text="settings.log_level"></dd>
+                </dl>
+                <button class="outline" style="margin-top:0.75rem;"
+                        @click="doRestart()" :disabled="restarting">
+                    <span x-show="!restarting">Restart Lifecycle Manager</span>
+                    <span x-show="restarting">Restarting...</span>
+                </button>
+            </div>
+
+            <div class="section">
+                <h3>Work Unit Sizing</h3>
+                <dl class="detail-grid">
+                    <dt>Jobs per Work Unit</dt>
+                    <dd x-text="settings.jobs_per_work_unit"></dd>
+                    <dt>First Round Work Units</dt>
+                    <dd x-text="settings.first_round_work_units"></dd>
+                    <dt>Work Units per Round</dt>
+                    <dd x-text="settings.work_units_per_round"></dd>
+                    <dt>Target Merged Size</dt>
+                    <dd x-text="(settings.target_merged_size_kb / 1024 / 1024).toFixed(1) + ' GB'"></dd>
+                </dl>
+            </div>
+
+            <div class="section">
+                <h3>Adaptive Execution</h3>
+                <dl class="detail-grid">
+                    <dt>Mode</dt>
+                    <dd x-text="settings.adaptive_mode"></dd>
+                    <dt>Default Memory/Core</dt>
+                    <dd><span x-text="settings.default_memory_per_core"></span> MB</dd>
+                    <dt>Max Memory/Core</dt>
+                    <dd><span x-text="settings.max_memory_per_core"></span> MB</dd>
+                    <dt>Safety Margin</dt>
+                    <dd x-text="(settings.safety_margin * 100) + '%'"></dd>
+                </dl>
+            </div>
+
+            <div class="section">
+                <h3>Error Handling</h3>
+                <dl class="detail-grid">
+                    <dt>Hold Threshold</dt>
+                    <dd x-text="(settings.error_hold_threshold * 100) + '%'"></dd>
+                    <dt>Max Rescue Attempts</dt>
+                    <dd x-text="settings.error_max_rescue_attempts"></dd>
+                    <dt>Site Ban Duration</dt>
+                    <dd><span x-text="settings.site_ban_duration_days"></span> days</dd>
+                    <dt>Site Ban Min Failures</dt>
+                    <dd x-text="settings.site_ban_min_failures"></dd>
+                    <dt>Site Ban Failure Ratio</dt>
+                    <dd x-text="(settings.site_ban_failure_ratio * 100) + '%'"></dd>
+                </dl>
+            </div>
+
+            <div class="section">
+                <h3>Infrastructure</h3>
+                <dl class="detail-grid">
+                    <dt>HTCondor Host</dt>
+                    <dd x-text="settings.condor_host"></dd>
+                    <dt>Schedd</dt>
+                    <dd x-text="settings.schedd_name"></dd>
+                    <dt>Submit Base Dir</dt>
+                    <dd x-text="settings.submit_base_dir" style="word-break:break-all;"></dd>
+                    <dt>Local PFN Prefix</dt>
+                    <dd x-text="settings.local_pfn_prefix" style="word-break:break-all;"></dd>
+                    <dt>Database</dt>
+                    <dd x-text="settings.database_url" style="word-break:break-all; font-size:0.85rem;"></dd>
+                </dl>
+            </div>
+        </div>
+    </template>
+</div>
+{% endblock %}

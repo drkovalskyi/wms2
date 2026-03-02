@@ -18,7 +18,7 @@ from wms2.core.dag_monitor import DAGMonitor
 from wms2.core.dag_planner import DAGPlanner
 from wms2.core.error_handler import ErrorHandler
 from wms2.core.lifecycle_manager import complete_round
-from wms2.core.output_lfn import derive_merged_lfn_bases
+from wms2.core.output_lfn import derive_merged_lfn_bases, determine_merged_lfn_base
 from wms2.core.output_manager import OutputManager
 from wms2.core.sandbox import create_sandbox
 from wms2.core.workflow_manager import WorkflowManager
@@ -60,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "DAG structure unchanged; jobs finish faster. Not for production.")
     imp.add_argument("--no-monitor", action="store_true",
                      help="Import and submit DAG but skip monitoring (for service mode)")
+    imp.add_argument("--merged-lfn-base", default=None,
+                     help="Override MergedLFNBase (e.g. /store/mc or /store/data). "
+                          "Auto-determined from input dataset if not specified.")
     imp.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
     return parser
@@ -350,6 +353,15 @@ async def run_import(args: argparse.Namespace) -> None:
             # But WorkflowManager.import_request calls reqmgr.get_request again,
             # which is fine — it's idempotent. However, it won't have our normalization.
             # So create the workflow row directly instead.
+            # Determine MergedLFNBase: CLI override > auto-determination > default
+            if args.merged_lfn_base:
+                merged_lfn_base = args.merged_lfn_base
+                print(f"      lfn_base:    {merged_lfn_base} (CLI override)")
+            else:
+                merged_lfn_base = await determine_merged_lfn_base(reqdata, dbs_adapter=dbs)
+                print(f"      lfn_base:    {merged_lfn_base} (auto-determined)")
+            reqdata["MergedLFNBase"] = merged_lfn_base
+
             output_datasets_info = derive_merged_lfn_bases(reqdata)
             config_data = {
                 "campaign": reqdata.get("Campaign"),
@@ -357,7 +369,7 @@ async def run_import(args: argparse.Namespace) -> None:
                 "priority": reqdata.get("RequestPriority"),
                 "request_type": reqdata.get("RequestType"),
                 "output_datasets": output_datasets_info,
-                "merged_lfn_base": reqdata.get("MergedLFNBase", "/store/mc"),
+                "merged_lfn_base": merged_lfn_base,
                 "unmerged_lfn_base": reqdata.get("UnmergedLFNBase", "/store/unmerged"),
                 # CMSSW metadata
                 "cmssw_version": reqdata.get("CMSSWVersion"),

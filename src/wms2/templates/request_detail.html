@@ -72,6 +72,13 @@
                 </div>
             </dialog>
 
+            <template x-if="testFraction">
+                <div class="banner-warning" style="background:#fef08a; border:2px solid #eab308; border-radius:4px; padding:0.5rem 0.75rem; margin-bottom:1rem; font-size:0.9rem; color:#713f12;">
+                    <strong>TEST MODE</strong> — test_fraction=<span x-text="testFraction"></span>,
+                    each job processes <span x-text="(testFraction * 100).toFixed(0)"></span>% of nominal events
+                </div>
+            </template>
+
             <!-- Request info -->
             <div class="section">
                 <h3>Request Info</h3>
@@ -150,9 +157,9 @@
                         <dd x-html="statusBadge(dag.status)"></dd>
                         <dt>DAGMan Cluster</dt>
                         <dd x-text="dag.dagman_cluster_id || '—'"></dd>
-                        <dt>Work Units</dt>
+                        <dt>Work Units <span x-show="workflow && workflow.current_round != null" style="opacity:0.6; font-weight:normal;">(Round <span x-text="workflow.current_round"></span>)</span></dt>
                         <dd>
-                            <span x-text="dag.completed_work_units || 0"></span>
+                            <span x-text="Array.isArray(dag.completed_work_units) ? dag.completed_work_units.length : (dag.completed_work_units || 0)"></span>
                             / <span x-text="dag.total_work_units || 0"></span> completed
                         </dd>
                     </dl>

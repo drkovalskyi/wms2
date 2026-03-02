@@ -47,11 +47,17 @@ const WMS2_API = (() => {
         getWorkflowByRequest: (name)    => get('/workflows/by-request/' + encodeURIComponent(name)),
         getWorkflow:       (id)         => get('/workflows/' + encodeURIComponent(id)),
         getWorkflowBlocks: (id)         => get('/workflows/' + encodeURIComponent(id) + '/blocks'),
+        getWorkflowDags:   (id)         => get('/workflows/' + encodeURIComponent(id) + '/dags'),
+        getWorkflowOutputDatasets: (id) => get('/workflows/' + encodeURIComponent(id) + '/output-datasets'),
 
         // DAGs
         getDAG:            (id)         => get('/dags/' + encodeURIComponent(id)),
         getDAGHistory:     (id)         => get('/dags/' + encodeURIComponent(id) + '/history'),
         getDAGJobs:        (id)         => get('/dags/' + encodeURIComponent(id) + '/jobs'),
+
+        // Lifecycle
+        getLifecycleSettings: ()        => get('/lifecycle/settings'),
+        restartLifecycle:  ()           => post('/lifecycle/restart'),
 
         // Import
         importRequest:     (body)       => post('/import', body),

@@ -377,7 +377,20 @@ class RequestLifecycleManager:
         if self.workflow_manager is None:
             logger.debug("Skipping _handle_submitted: workflow_manager not available")
             return
-        await self.workflow_manager.import_request(request.request_name)
+        # Skip if a workflow already exists (CLI may have created one concurrently)
+        existing = await self.db.get_workflow_by_request(request.request_name)
+        if existing:
+            logger.info("Workflow already exists for %s — skipping import",
+                        request.request_name)
+            # If a DAG is already submitted/running, go straight to ACTIVE
+            if existing.dag_id:
+                dag = await self.db.get_dag(existing.dag_id)
+                if dag and dag.status in (DAGStatus.SUBMITTED.value,
+                                          DAGStatus.RUNNING.value):
+                    await self.transition(request, RequestStatus.ACTIVE)
+                    return
+        else:
+            await self.workflow_manager.import_request(request.request_name)
         await self.transition(request, RequestStatus.QUEUED)
 
     async def _handle_queued(self, request):
@@ -398,21 +411,28 @@ class RequestLifecycleManager:
         if not workflow:
             return
 
-        # Check for rescue DAG re-admission
+        # Check existing DAG state before planning a new one
         if workflow.dag_id:
             dag = await self.db.get_dag(workflow.dag_id)
-            if dag and dag.rescue_dag_path and dag.status == DAGStatus.READY.value:
-                cluster_id, schedd = await self.condor.submit_dag(
-                    dag.rescue_dag_path or dag.dag_file_path
-                )
-                await self.db.update_dag(
-                    dag.id,
-                    dagman_cluster_id=cluster_id,
-                    schedd_name=schedd,
-                    status=DAGStatus.SUBMITTED.value,
-                )
-                await self.transition(request, RequestStatus.ACTIVE)
-                return
+            if dag:
+                # DAG already submitted/running (CLI race) — go to ACTIVE
+                if dag.status in (DAGStatus.SUBMITTED.value,
+                                  DAGStatus.RUNNING.value):
+                    await self.transition(request, RequestStatus.ACTIVE)
+                    return
+                # Rescue DAG re-admission
+                if dag.rescue_dag_path and dag.status == DAGStatus.READY.value:
+                    cluster_id, schedd = await self.condor.submit_dag(
+                        dag.rescue_dag_path or dag.dag_file_path
+                    )
+                    await self.db.update_dag(
+                        dag.id,
+                        dagman_cluster_id=cluster_id,
+                        schedd_name=schedd,
+                        status=DAGStatus.SUBMITTED.value,
+                    )
+                    await self.transition(request, RequestStatus.ACTIVE)
+                    return
 
         current_round = getattr(workflow, "current_round", 0) or 0
         is_adaptive = getattr(request, "adaptive", False)

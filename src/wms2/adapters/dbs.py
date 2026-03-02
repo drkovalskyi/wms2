@@ -114,3 +114,12 @@ class DBSClient(DBSAdapter):
         }
         resp = await self._client.put(url, json=payload)
         resp.raise_for_status()
+
+    async def list_files(self, dataset: str, limit: int = 1) -> list[dict[str, Any]]:
+        """List files in a dataset (minimal query for LFN base lookup)."""
+        params: dict[str, Any] = {"dataset": dataset}
+        data = await self._get("/files", params=params)
+        result = data if isinstance(data, list) else []
+        if limit and limit > 0:
+            result = result[:limit]
+        return result

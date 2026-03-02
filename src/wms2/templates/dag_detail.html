@@ -141,6 +141,14 @@
                 </div>
             </template>
 
+            <!-- No jobs message for completed DAGs -->
+            <template x-if="jobs.length === 0 && dag.status === 'completed'">
+                <div class="section">
+                    <h3>HTCondor Jobs</h3>
+                    <p style="opacity:0.6;">DAG completed — no active HTCondor jobs in queue.</p>
+                </div>
+            </template>
+
             <!-- History timeline -->
             <template x-if="history.length > 0">
                 <div class="section">

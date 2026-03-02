@@ -95,6 +95,13 @@ class DBSAdapter(ABC):
     async def invalidate_block(self, block_name: str) -> None:
         """Invalidate a DBS block and its files."""
 
+    async def list_files(self, dataset: str, limit: int = 1) -> list[dict[str, Any]]:
+        """List files in a dataset (minimal detail). Used for LFN base lookup.
+
+        Default implementation delegates to get_files with the given limit.
+        """
+        return await self.get_files(dataset, limit=limit)
+
 
 class RucioAdapter(ABC):
     @abstractmethod

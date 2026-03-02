@@ -58,3 +58,11 @@ async def import_page(request: Request):
         "api_prefix": request.app.state.settings.api_prefix,
         "active_page": "import",
     })
+
+
+@ui_router.get("/settings")
+async def settings_page(request: Request):
+    return templates.TemplateResponse(request, "settings.html", {
+        "api_prefix": request.app.state.settings.api_prefix,
+        "active_page": "settings",
+    })
