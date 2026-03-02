@@ -6,6 +6,7 @@ document.addEventListener('alpine:init', () => {
         dagId: dagId,
         dag: null,
         history: [],
+        jobs: [],
         loading: true,
         error: null,
 
@@ -18,17 +19,26 @@ document.addEventListener('alpine:init', () => {
             try {
                 this.loading = true;
                 this.error = null;
-                const [d, h] = await Promise.all([
+                const [d, h, j] = await Promise.all([
                     WMS2_API.getDAG(this.dagId),
                     WMS2_API.getDAGHistory(this.dagId).catch(() => []),
+                    WMS2_API.getDAGJobs(this.dagId).catch(() => []),
                 ]);
                 this.dag = d;
                 this.history = h;
+                this.jobs = j;
             } catch (e) {
                 this.error = e.message;
             } finally {
                 this.loading = false;
             }
+        },
+
+        fmtWallTime(secs) {
+            if (secs == null) return '—';
+            const h = Math.floor(secs / 3600);
+            const m = Math.floor((secs % 3600) / 60);
+            return h > 0 ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m + 'm';
         },
 
         get totalNodes() {

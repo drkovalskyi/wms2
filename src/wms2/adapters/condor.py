@@ -105,6 +105,80 @@ class HTCondorAdapter(CondorAdapter):
     async def ping_schedd(self, schedd_name: str) -> bool:
         return await asyncio.to_thread(self._ping_schedd_sync)
 
+    _JOB_STATUS_MAP = {
+        1: "idle",
+        2: "running",
+        3: "removed",
+        4: "completed",
+        5: "held",
+    }
+
+    def _query_dag_jobs_sync(self, cluster_id: str) -> list[dict]:
+        """Query per-job details for payload jobs under a DAGMan hierarchy."""
+        # Find sub-DAGMan cluster IDs (inner DAGs)
+        sub_dagman_ads = self._schedd.query(
+            constraint=f"DAGManJobId == {cluster_id} && JobUniverse == 7",
+            projection=["ClusterId"],
+        )
+        if not sub_dagman_ads:
+            return []
+
+        # Build constraint for payload jobs under all inner DAGMans
+        sub_ids = [str(int(ad["ClusterId"])) for ad in sub_dagman_ads]
+        parts = " || ".join(f"DAGManJobId == {sid}" for sid in sub_ids)
+        constraint = f"({parts}) && JobUniverse =!= 7"
+
+        projection = [
+            "DAGNodeName", "JobStatus", "ResidentSetSize_RAW",
+            "CumulativeRemoteUserCpu", "CumulativeRemoteSysCpu",
+            "RequestCpus", "RequestMemory", "JobStartDate", "ServerTime",
+            "MATCH_GLIDEIN_CMSSite",
+        ]
+        ads = self._schedd.query(constraint=constraint, projection=projection)
+
+        jobs = []
+        for ad in ads:
+            status_int = int(ad.get("JobStatus", 0))
+            status = self._JOB_STATUS_MAP.get(status_int, f"unknown({status_int})")
+
+            start = ad.get("JobStartDate")
+            server_time = ad.get("ServerTime")
+            wall_time = None
+            if start is not None and server_time is not None:
+                wall_time = max(0, int(server_time) - int(start))
+
+            rss_kb = ad.get("ResidentSetSize_RAW")
+            memory_mb = int(rss_kb) // 1024 if rss_kb is not None else None
+
+            cpu_user = float(ad.get("CumulativeRemoteUserCpu", 0))
+            cpu_sys = float(ad.get("CumulativeRemoteSysCpu", 0))
+            cpus = int(ad.get("RequestCpus", 1))
+
+            cpu_efficiency = None
+            if wall_time and wall_time > 0 and cpus > 0:
+                cpu_efficiency = round(
+                    100.0 * (cpu_user + cpu_sys) / (wall_time * cpus), 1
+                )
+
+            jobs.append({
+                "name": ad.get("DAGNodeName", "?"),
+                "status": status,
+                "wall_time": wall_time,
+                "memory_mb": memory_mb,
+                "cpu_user": round(cpu_user, 1),
+                "cpu_sys": round(cpu_sys, 1),
+                "cpu_efficiency": cpu_efficiency,
+                "cpus": cpus,
+                "request_memory": int(ad.get("RequestMemory", 0)),
+                "site": ad.get("MATCH_GLIDEIN_CMSSite"),
+            })
+
+        jobs.sort(key=lambda j: j["name"])
+        return jobs
+
+    async def query_dag_jobs(self, cluster_id: str) -> list[dict] | None:
+        return await asyncio.to_thread(self._query_dag_jobs_sync, cluster_id)
+
     def _count_dag_jobs_sync(self, cluster_id: str) -> dict[str, int]:
         """Count nodes by status across all inner sub-DAGMans.
 

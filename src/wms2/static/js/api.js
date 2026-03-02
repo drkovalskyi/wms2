@@ -51,6 +51,7 @@ const WMS2_API = (() => {
         // DAGs
         getDAG:            (id)         => get('/dags/' + encodeURIComponent(id)),
         getDAGHistory:     (id)         => get('/dags/' + encodeURIComponent(id) + '/history'),
+        getDAGJobs:        (id)         => get('/dags/' + encodeURIComponent(id) + '/jobs'),
 
         // Import
         importRequest:     (body)       => post('/import', body),

@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
 
 from wms2.api.deps import get_repository
 from wms2.db.repository import Repository
@@ -122,3 +122,30 @@ async def get_dag_history(
         }
         for h in history
     ]
+
+
+@router.get("/{dag_id}/jobs")
+async def get_dag_jobs(
+    dag_id: str,
+    raw_request: FastAPIRequest,
+    repo: Repository = Depends(get_repository),
+):
+    """Get live HTCondor job details for all payload jobs in this DAG."""
+    try:
+        d_uuid = UUID(dag_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid DAG ID format")
+
+    row = await repo.get_dag(d_uuid)
+    if not row:
+        raise HTTPException(status_code=404, detail="DAG not found")
+
+    if not row.dagman_cluster_id:
+        return []
+
+    condor = getattr(raw_request.app.state, "condor", None)
+    if condor is None:
+        return []
+
+    jobs = await condor.query_dag_jobs(row.dagman_cluster_id)
+    return jobs if jobs is not None else []

@@ -106,6 +106,41 @@
                 </div>
             </div>
 
+            <!-- HTCondor Jobs -->
+            <template x-if="jobs.length > 0">
+                <div class="section">
+                    <h3>HTCondor Jobs <span style="font-size:0.85rem; opacity:0.6;" x-text="'(' + jobs.length + ')'"></span></h3>
+                    <table class="timeline-table">
+                        <thead>
+                            <tr>
+                                <th>Node</th>
+                                <th>Status</th>
+                                <th>Wall Time</th>
+                                <th>Mem (MB)</th>
+                                <th>ReqMem</th>
+                                <th>CPU Eff</th>
+                                <th>CPUs</th>
+                                <th>Site</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="j in jobs" :key="j.name">
+                                <tr>
+                                    <td x-text="j.name" style="font-family:monospace; font-size:0.8rem;"></td>
+                                    <td x-html="statusBadge(j.status)"></td>
+                                    <td x-text="fmtWallTime(j.wall_time)"></td>
+                                    <td x-text="j.memory_mb != null ? j.memory_mb : '—'"></td>
+                                    <td x-text="j.request_memory || '—'"></td>
+                                    <td x-text="j.cpu_efficiency != null ? j.cpu_efficiency + '%' : '—'"></td>
+                                    <td x-text="j.cpus"></td>
+                                    <td x-text="j.site || '—'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </template>
+
             <!-- History timeline -->
             <template x-if="history.length > 0">
                 <div class="section">

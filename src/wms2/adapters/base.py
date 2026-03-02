@@ -32,6 +32,15 @@ class CondorAdapter(ABC):
     async def ping_schedd(self, schedd_name: str) -> bool:
         """Check if a schedd is reachable."""
 
+    async def query_dag_jobs(self, cluster_id: str) -> list[dict] | None:
+        """Query per-job details for all payload jobs under a DAGMan hierarchy.
+
+        Returns list of dicts with keys: name, status, wall_time, memory_mb,
+        cpu_user, cpu_sys, cpu_efficiency, cpus, site.
+        Returns None if not supported by this adapter.
+        """
+        return None
+
     async def count_dag_jobs(self, cluster_id: str) -> dict[str, int] | None:
         """Count jobs by status for all payload jobs under a DAGMan hierarchy.
 

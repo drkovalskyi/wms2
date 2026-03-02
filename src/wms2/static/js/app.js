@@ -15,6 +15,10 @@ const STATUS_COLORS = {
     partial:       'warning',
     failed:        'danger',
     aborted:       'danger',
+    // HTCondor job statuses
+    idle:          'secondary',
+    running:       'primary',
+    removed:       'danger',
 };
 
 function statusBadge(status) {

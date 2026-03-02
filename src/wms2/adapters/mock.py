@@ -36,6 +36,10 @@ class MockCondorAdapter(CondorAdapter):
         self.calls.append(("remove_job", (schedd_name, cluster_id), {}))
         self.removed_jobs.add(cluster_id)
 
+    async def query_dag_jobs(self, cluster_id: str) -> list[dict] | None:
+        self.calls.append(("query_dag_jobs", (cluster_id,), {}))
+        return []
+
     async def ping_schedd(self, schedd_name: str) -> bool:
         self.calls.append(("ping_schedd", (schedd_name,), {}))
         return True
