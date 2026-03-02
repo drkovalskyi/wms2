@@ -182,35 +182,49 @@ class HTCondorAdapter(CondorAdapter):
     def _count_dag_jobs_sync(self, cluster_id: str) -> dict[str, int]:
         """Count nodes by status across all inner sub-DAGMans.
 
-        Queries inner DAGMan job ClassAds for DAG_Nodes* attributes, which
-        include all nodes (done, queued, ready, unready, failed) — not just
-        those currently in the schedd queue.
+        Uses DAGMan ClassAds for done/failed/total (authoritative) and
+        queries actual payload job statuses for the running/idle/held
+        breakdown of in-queue nodes.
         """
         # Find sub-DAGMan jobs (inner DAGs) under the outer DAGMan
         sub_dagman_ads = self._schedd.query(
             constraint=f"DAGManJobId == {cluster_id} && JobUniverse == 7",
             projection=[
-                "DAG_NodesTotal", "DAG_NodesDone", "DAG_NodesFailed",
-                "DAG_NodesQueued", "DAG_NodesReady", "DAG_NodesUnready",
-                "JobProcsHeld",
+                "ClusterId", "DAG_NodesTotal", "DAG_NodesDone",
+                "DAG_NodesFailed", "DAG_NodesReady", "DAG_NodesUnready",
             ],
         )
 
         if not sub_dagman_ads:
             return {"idle": 0, "running": 0, "done": 0, "held": 0, "failed": 0, "total": 0}
 
-        # Aggregate across all inner DAGMans
+        # done/failed/total from DAGMan ClassAds (authoritative for these)
         counts = {"idle": 0, "running": 0, "done": 0, "held": 0, "failed": 0, "total": 0}
         for ad in sub_dagman_ads:
             counts["done"] += int(ad.get("DAG_NodesDone", 0))
             counts["failed"] += int(ad.get("DAG_NodesFailed", 0))
-            counts["running"] += int(ad.get("DAG_NodesQueued", 0))
+            counts["total"] += int(ad.get("DAG_NodesTotal", 0))
+            # Nodes not yet submitted to schedd count as idle
             counts["idle"] += (
                 int(ad.get("DAG_NodesReady", 0))
                 + int(ad.get("DAG_NodesUnready", 0))
             )
-            counts["held"] += int(ad.get("JobProcsHeld", 0))
-            counts["total"] += int(ad.get("DAG_NodesTotal", 0))
+
+        # Query actual payload job statuses for in-queue breakdown
+        sub_ids = [str(int(ad["ClusterId"])) for ad in sub_dagman_ads]
+        parts = " || ".join(f"DAGManJobId == {sid}" for sid in sub_ids)
+        constraint = f"({parts}) && JobUniverse =!= 7"
+        job_ads = self._schedd.query(
+            constraint=constraint, projection=["JobStatus"],
+        )
+        for ad in job_ads:
+            status = int(ad.get("JobStatus", 0))
+            if status == 1:
+                counts["idle"] += 1
+            elif status == 2:
+                counts["running"] += 1
+            elif status == 5:
+                counts["held"] += 1
         return counts
 
     async def count_dag_jobs(self, cluster_id: str) -> dict[str, int] | None:

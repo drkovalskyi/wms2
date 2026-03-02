@@ -77,6 +77,7 @@ async def list_dags(
 @router.get("/{dag_id}")
 async def get_dag(
     dag_id: str,
+    raw_request: FastAPIRequest,
     repo: Repository = Depends(get_repository),
 ):
     try:
@@ -88,7 +89,21 @@ async def get_dag(
     if not row:
         raise HTTPException(status_code=404, detail="DAG not found")
 
-    return _dag_detail(row)
+    result = _dag_detail(row)
+
+    # Override with live counts from condor when available
+    if row.dagman_cluster_id:
+        condor = getattr(raw_request.app.state, "condor", None)
+        if condor:
+            live = await condor.count_dag_jobs(row.dagman_cluster_id)
+            if live:
+                result["nodes_done"] = live["done"]
+                result["nodes_running"] = live["running"]
+                result["nodes_idle"] = live["idle"]
+                result["nodes_failed"] = live["failed"]
+                result["nodes_held"] = live["held"]
+
+    return result
 
 
 @router.get("/{dag_id}/history")
