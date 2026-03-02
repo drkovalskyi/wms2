@@ -316,6 +316,7 @@ class DAGPlanner:
                     step_metrics,
                     self.settings.target_merged_size_kb,
                     self.settings.max_jobs_per_work_unit,
+                    test_fraction=config.get("test_fraction", 1.0),
                 )
                 if computed is not None:
                     jobs_per_wu = computed
@@ -600,11 +601,14 @@ def _compute_jobs_per_wu_from_write_mb(
     step_metrics: dict,
     target_merged_size_kb: int,
     max_jobs: int,
+    test_fraction: float = 1.0,
 ) -> int | None:
     """Compute optimal jobs_per_work_unit from measured write_mb in step_metrics.
 
     Uses the smallest output tier's write_mb.mean to calculate how many jobs
-    produce a target merged file size. Returns None if no write_mb data found.
+    produce a target merged file size. When test_fraction < 1, the target is
+    scaled down proportionally (e.g. 4 GB * 0.01 = 40 MB) so that merged files
+    stay proportional to the test run. Returns None if no write_mb data found.
     """
     rounds = step_metrics.get("rounds", {})
     if not rounds:
@@ -630,7 +634,8 @@ def _compute_jobs_per_wu_from_write_mb(
         return None
 
     # target_merged_size_kb is in KB, write_mb is in MB
-    target_mb = target_merged_size_kb / 1024.0
+    # Scale target by test_fraction so test runs get proportionally smaller merges
+    target_mb = target_merged_size_kb / 1024.0 * test_fraction
     optimal = int(target_mb / min_write_mb)
 
     # Clamp to [1, max_jobs]

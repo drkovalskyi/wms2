@@ -5,7 +5,6 @@ document.addEventListener('alpine:init', () => {
     Alpine.data('workflowDetail', (workflowId) => ({
         workflowId: workflowId,
         workflow: null,
-        blocks: [],
         dag: null,
         allDags: [],
         outputDatasets: [],
@@ -23,12 +22,10 @@ document.addEventListener('alpine:init', () => {
                 this.error = null;
                 this.workflow = await WMS2_API.getWorkflow(this.workflowId);
 
-                const [blks, dags, ods] = await Promise.all([
-                    WMS2_API.getWorkflowBlocks(this.workflowId).catch(() => []),
+                const [dags, ods] = await Promise.all([
                     WMS2_API.getWorkflowDags(this.workflowId).catch(() => []),
                     WMS2_API.getWorkflowOutputDatasets(this.workflowId).catch(() => []),
                 ]);
-                this.blocks = blks;
                 this.allDags = dags;
                 this.outputDatasets = ods;
 

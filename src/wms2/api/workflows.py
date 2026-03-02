@@ -202,6 +202,26 @@ async def get_workflow_output_datasets(
         if req and req.request_data:
             output_datasets = derive_merged_lfn_bases(req.request_data)
 
+    # Build step_num → data_tier mapping and sum events per tier from step_metrics
+    events_by_tier = {}
+    manifest_steps = config.get("manifest_steps", [])
+    step_metrics = row.step_metrics or {}
+    rounds = step_metrics.get("rounds", {})
+    # Map step number (1-indexed) to tier name from manifest_steps (0-indexed)
+    step_to_tier = {}
+    for i, ms in enumerate(manifest_steps):
+        step_to_tier[str(i + 1)] = ms.get("name", "")
+    for round_data in rounds.values():
+        for wu in round_data.get("wu_metrics", []):
+            per_step = wu.get("per_step", {})
+            for step_num, step_data in per_step.items():
+                tier = step_to_tier.get(step_num, "")
+                if not tier:
+                    continue
+                ew = step_data.get("events_written")
+                if ew and isinstance(ew, dict):
+                    events_by_tier[tier] = events_by_tier.get(tier, 0) + ew.get("total", 0)
+
     results = []
     for ds in output_datasets:
         merged_base = ds.get("merged_lfn_base", "")
@@ -217,12 +237,14 @@ async def get_workflow_output_datasets(
                             total_size_bytes += os.path.getsize(os.path.join(dirpath, fn))
                         except OSError:
                             pass
+        data_tier = ds.get("data_tier", "")
         results.append({
             "dataset_name": ds.get("dataset_name", ""),
-            "data_tier": ds.get("data_tier", ""),
+            "data_tier": data_tier,
             "merged_lfn_base": merged_base,
             "output_path": pfn_base,
             "file_count": file_count,
             "total_size_mb": round(total_size_bytes / (1024 * 1024), 1) if total_size_bytes else 0,
+            "event_count": events_by_tier.get(data_tier, 0),
         })
     return results
