@@ -341,6 +341,11 @@ class RequestLifecycleManager:
                         except Exception:
                             logger.exception("Error evaluating %s", req_name)
                             await session.rollback()
+                            # After rollback, ORM objects in the requests list
+                            # are expired. Accessing their attributes would
+                            # trigger a lazy load that fails with
+                            # MissingGreenlet. Break and restart the cycle.
+                            break
 
                     if not requests:
                         logger.debug("No non-terminal requests")
@@ -480,19 +485,25 @@ class RequestLifecycleManager:
 
             # Process completed work units through output manager
             if result.newly_completed_work_units and self.output_manager:
-                blocks = await self.db.get_processing_blocks(workflow.id)
-                for wu in result.newly_completed_work_units:
-                    manifest = wu.get("manifest") or {}
-                    datasets_info = manifest.get("datasets", {})
-                    for block in blocks:
-                        ds_info = datasets_info.get(block.dataset_name, {})
-                        await self.output_manager.handle_work_unit_completion(
-                            workflow.id, block.id, {
-                                "output_files": ds_info.get("files", []),
-                                "site": manifest.get("site", "local"),
-                                "node_name": wu["group_name"],
-                            }
-                        )
+                try:
+                    blocks = await self.db.get_processing_blocks(workflow.id)
+                    for wu in result.newly_completed_work_units:
+                        manifest = wu.get("manifest") or {}
+                        datasets_info = manifest.get("datasets", {})
+                        for block in blocks:
+                            ds_info = datasets_info.get(block.dataset_name, {})
+                            await self.output_manager.handle_work_unit_completion(
+                                workflow.id, block.id, {
+                                    "output_files": ds_info.get("files", []),
+                                    "site": manifest.get("site", "local"),
+                                    "node_name": wu["group_name"],
+                                }
+                            )
+                except Exception:
+                    logger.warning(
+                        "Output registration failed for %s — will retry next cycle",
+                        request.request_name, exc_info=True,
+                    )
 
             # Accumulate production counters from completed work units
             if result.newly_completed_work_units:
@@ -509,14 +520,26 @@ class RequestLifecycleManager:
 
             # Every cycle: retry failed Rucio calls
             if self.output_manager:
-                await self.output_manager.process_blocks_for_workflow(workflow.id)
+                try:
+                    await self.output_manager.process_blocks_for_workflow(workflow.id)
+                except Exception:
+                    logger.warning(
+                        "Output block processing failed for %s — will retry next cycle",
+                        request.request_name, exc_info=True,
+                    )
 
             if result.status == DAGStatus.COMPLETED:
                 # Check blocks before transitioning
                 if self.output_manager:
-                    if not await self.output_manager.all_blocks_archived(workflow.id):
-                        # Stay ACTIVE, retry on next cycle
-                        return
+                    try:
+                        if not await self.output_manager.all_blocks_archived(workflow.id):
+                            # Stay ACTIVE, retry on next cycle
+                            return
+                    except Exception:
+                        logger.warning(
+                            "Block archive check failed for %s — proceeding with completion",
+                            request.request_name, exc_info=True,
+                        )
                 # Check adaptive round completion
                 if getattr(request, "adaptive", False):
                     # Re-fetch dag — poll_dag updated DB but our object is stale
@@ -546,8 +569,14 @@ class RequestLifecycleManager:
 
         if dag.status == DAGStatus.COMPLETED.value:
             if self.output_manager:
-                if not await self.output_manager.all_blocks_archived(workflow.id):
-                    return
+                try:
+                    if not await self.output_manager.all_blocks_archived(workflow.id):
+                        return
+                except Exception:
+                    logger.warning(
+                        "Block archive check failed for %s — proceeding with completion",
+                        request.request_name, exc_info=True,
+                    )
             if getattr(request, "adaptive", False):
                 await self._handle_round_completion(request, workflow, dag)
                 return
