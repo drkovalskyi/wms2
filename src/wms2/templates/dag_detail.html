@@ -151,6 +151,99 @@
                 </div>
             </template>
 
+            <!-- Performance Summary -->
+            <template x-if="hasPerformance">
+                <div class="section">
+                    <h3>Performance Summary
+                        <template x-if="performance.round_number != null">
+                            <span style="font-size:0.85rem; opacity:0.6;">(Round <span x-text="performance.round_number"></span>)</span>
+                        </template>
+                    </h3>
+
+                    <!-- Per-step CMSSW metrics -->
+                    <template x-if="roundStepMetrics.length > 0">
+                        <div style="margin-bottom:1rem;">
+                            <h4 style="font-size:0.9rem; margin-bottom:0.25rem;">Step Metrics (averages across jobs)</h4>
+                            <div style="overflow-x:auto;">
+                                <table class="timeline-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Step</th>
+                                            <th>Jobs</th>
+                                            <th>CPU Eff %</th>
+                                            <th>Peak RSS (MB)</th>
+                                            <th>Peak VSize (MB)</th>
+                                            <th>Wall Time (s)</th>
+                                            <th>Time/Event (s)</th>
+                                            <th>Throughput (ev/s)</th>
+                                            <th>Read (MB)</th>
+                                            <th>Write (MB)</th>
+                                            <th>Events In</th>
+                                            <th>Events Out</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <template x-for="s in roundStepMetrics" :key="s.step">
+                                            <tr>
+                                                <td style="font-weight:600;" x-text="'Step ' + s.step"></td>
+                                                <td x-text="s.num_jobs"></td>
+                                                <td x-text="s.cpu_efficiency"></td>
+                                                <td x-text="s.peak_rss_mb"></td>
+                                                <td x-text="s.peak_vsize_mb"></td>
+                                                <td x-text="s.wall_time"></td>
+                                                <td x-text="s.time_per_event"></td>
+                                                <td x-text="s.throughput"></td>
+                                                <td x-text="s.read_mb"></td>
+                                                <td x-text="s.write_mb"></td>
+                                                <td x-text="s.events_processed"></td>
+                                                <td x-text="s.events_written"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- DAGMan metrics per merge group -->
+                    <template x-if="performance.dag_metrics.length > 0">
+                        <div>
+                            <h4 style="font-size:0.9rem; margin-bottom:0.25rem;">DAGMan Metrics</h4>
+                            <table class="timeline-table">
+                                <thead>
+                                    <tr>
+                                        <th>Merge Group</th>
+                                        <th>Duration</th>
+                                        <th>Nodes</th>
+                                        <th>Succeeded</th>
+                                        <th>Failed</th>
+                                        <th>Exit</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="m in performance.dag_metrics" :key="m.merge_group">
+                                        <tr>
+                                            <td style="font-family:monospace; font-size:0.8rem;" x-text="m.merge_group"></td>
+                                            <td x-text="fmtWallTime(m.duration_sec)"></td>
+                                            <td x-text="m.nodes"></td>
+                                            <td x-text="m.nodes_succeeded"></td>
+                                            <td>
+                                                <span :style="m.nodes_failed > 0 ? 'color:#ef4444; font-weight:600;' : ''"
+                                                      x-text="m.nodes_failed"></span>
+                                            </td>
+                                            <td>
+                                                <span :style="m.exitcode !== 0 ? 'color:#ef4444; font-weight:600;' : ''"
+                                                      x-text="m.exitcode"></span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+            </template>
+
             <!-- Node Event Log (from DAGMan node log files) -->
             <div class="section">
                 <h3 style="display:flex; align-items:center; gap:0.5rem;">

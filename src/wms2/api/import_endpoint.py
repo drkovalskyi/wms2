@@ -29,6 +29,10 @@ class ImportBody(BaseModel):
     files_per_job: int | None = None
     max_files: int | None = None
     dry_run: bool = False
+    high_priority: int = 5
+    nominal_priority: int = 3
+    priority_switch_fraction: float = 0.5
+    replace: bool = False
 
 
 def _normalize_request(reqdata: dict) -> dict:
@@ -98,7 +102,37 @@ async def import_request(
     # Check if request already exists
     existing = await repo.get_request(body.request_name)
     if existing:
-        raise HTTPException(status_code=409, detail="Request already exists in WMS2")
+        if not body.replace:
+            if existing.status == "failed":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Request already exists in WMS2 (status: {existing.status})",
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Request already exists in WMS2 (status: {existing.status}). "
+                           f"Only failed requests can be re-imported. "
+                           f"Use the Fail action on the request page first.",
+                )
+        if existing.status != "failed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot replace request in {existing.status} state. "
+                       f"Only failed requests can be re-imported.",
+            )
+        # Clean up old request and all related rows
+        workflow = await repo.get_workflow_by_request(body.request_name)
+        if workflow:
+            for dag in await repo.list_dags(workflow_id=workflow.id):
+                await repo.delete_dag_history(dag.id)
+                await repo.delete_dag(dag.id)
+            for block in await repo.get_processing_blocks(workflow.id):
+                await repo.delete_processing_block(block.id)
+            await repo.delete_workflow(workflow.id)
+        await repo.delete_request(body.request_name)
+        await repo.session.flush()
+        logger.info("Replaced existing request %s (was %s)", body.request_name, existing.status)
 
     # 1. Fetch from ReqMgr2
     try:
@@ -107,6 +141,14 @@ async def import_request(
         raise HTTPException(status_code=502, detail=f"Failed to fetch from ReqMgr2: {exc}")
 
     reqdata = _normalize_request(reqdata)
+
+    # Store priority profile in request_data for UI display
+    reqdata["_priority_profile"] = {
+        "pilot": settings.default_pilot_priority,
+        "high": body.high_priority,
+        "nominal": body.nominal_priority,
+        "switch_fraction": body.priority_switch_fraction,
+    }
 
     # 2. Create request row
     await repo.create_request(
@@ -147,6 +189,14 @@ async def import_request(
         config_data["request_num_events"] = reqdata.get("RequestNumEvents", 0)
     if body.test_fraction is not None:
         config_data["test_fraction"] = body.test_fraction
+
+    # Priority profile
+    config_data["priority_profile"] = {
+        "pilot": settings.default_pilot_priority,
+        "high": body.high_priority,
+        "nominal": body.nominal_priority,
+        "switch_fraction": body.priority_switch_fraction,
+    }
 
     # Create sandbox
     submit_dir = os.path.join(settings.submit_base_dir, body.request_name)

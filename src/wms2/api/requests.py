@@ -1,17 +1,26 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
 from pydantic import BaseModel
 
 from wms2.db.repository import Repository
-from wms2.models.enums import RequestStatus
+from wms2.models.enums import DAGStatus, RequestStatus
 from wms2.models.request import Request, RequestCreate, RequestUpdate
 
 from .deps import get_repository
 
+logger = logging.getLogger(__name__)
+
 
 class StopRequest(BaseModel):
     reason: str = "Operator-initiated clean stop"
+
+
+class PriorityProfileUpdate(BaseModel):
+    high: int
+    nominal: int
+    switch_fraction: float
 
 router = APIRouter(prefix="/requests", tags=["requests"])
 
@@ -144,12 +153,34 @@ async def stop_request(
                    f"current status: {existing.status}",
         )
 
-    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
-    if lm is None:
-        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
-
     previous_status = existing.status
-    await lm.initiate_clean_stop(request_name, body.reason)
+
+    # Mark current DAG as stop-requested
+    workflow = await repo.get_workflow_by_request(request_name)
+    if workflow and workflow.dag_id:
+        now = datetime.now(timezone.utc)
+        await repo.update_dag(
+            workflow.dag_id,
+            stop_requested_at=now,
+            stop_reason=body.reason,
+        )
+
+    # Transition to STOPPING
+    now = datetime.now(timezone.utc)
+    old_transitions = existing.status_transitions or []
+    new_transition = {
+        "from": previous_status,
+        "to": RequestStatus.STOPPING.value,
+        "timestamp": now.isoformat(),
+    }
+    await repo.update_request(
+        request_name,
+        status=RequestStatus.STOPPING.value,
+        status_transitions=old_transitions + [new_transition],
+        updated_at=now,
+    )
+    logger.info("Request %s: %s -> stopping (reason: %s)", request_name, previous_status, body.reason)
+
     return {
         "request_name": request_name,
         "status": "stopping",
@@ -165,28 +196,46 @@ async def release_request(
     raw_request: FastAPIRequest = None,
     repo: Repository = Depends(get_repository),
 ):
-    """Release a HELD request back to the admission queue."""
+    """Release a HELD request back to queue, or resume a PAUSED request."""
     existing = await repo.get_request(request_name)
     if not existing:
         raise HTTPException(status_code=404, detail="Request not found")
 
-    if existing.status != RequestStatus.HELD.value:
+    releasable = (RequestStatus.HELD.value, RequestStatus.PAUSED.value)
+    if existing.status not in releasable:
         raise HTTPException(
             status_code=400,
-            detail=f"Can only release requests in held state, "
+            detail=f"Can only release requests in held or paused state, "
                    f"current status: {existing.status}",
         )
 
-    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
-    if lm is None:
-        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
+    previous_status = existing.status
+    # PAUSED needs recovery prep → RESUBMITTING; HELD goes straight to QUEUED
+    if previous_status == RequestStatus.PAUSED.value:
+        target_status = RequestStatus.RESUBMITTING.value
+    else:
+        target_status = RequestStatus.QUEUED.value
 
-    await lm.release_held_request(request_name)
+    now = datetime.now(timezone.utc)
+    old_transitions = existing.status_transitions or []
+    new_transition = {
+        "from": previous_status,
+        "to": target_status,
+        "timestamp": now.isoformat(),
+    }
+    await repo.update_request(
+        request_name,
+        status=target_status,
+        status_transitions=old_transitions + [new_transition],
+        updated_at=now,
+    )
+    logger.info("Request %s: %s -> %s (operator release)", request_name, previous_status, target_status)
+
     return {
         "request_name": request_name,
-        "status": "queued",
-        "previous_status": "held",
-        "message": f"Request {request_name} released to admission queue",
+        "status": target_status,
+        "previous_status": previous_status,
+        "message": f"Request {request_name} {'resumed' if previous_status == 'paused' else 'released to admission queue'}",
     }
 
 
@@ -196,7 +245,11 @@ async def fail_request(
     raw_request: FastAPIRequest = None,
     repo: Repository = Depends(get_repository),
 ):
-    """Fail a HELD or PARTIAL request: kill DAG, mark resources failed."""
+    """Fail a HELD or PARTIAL request: kill DAG, mark resources failed.
+
+    Performs all DB work in the API session (auto-committed by get_session)
+    rather than delegating to the lifecycle manager's session.
+    """
     existing = await repo.get_request(request_name)
     if not existing:
         raise HTTPException(status_code=404, detail="Request not found")
@@ -209,12 +262,53 @@ async def fail_request(
                    f"current status: {existing.status}",
         )
 
-    lm = getattr(raw_request.app.state, "lifecycle_manager", None)
-    if lm is None:
-        raise HTTPException(status_code=503, detail="Lifecycle manager not available")
-
     previous_status = existing.status
-    await lm.fail_request(request_name)
+
+    # Kill running DAG via condor_rm
+    workflow = await repo.get_workflow_by_request(request_name)
+    if workflow:
+        if workflow.dag_id:
+            dag = await repo.get_dag(workflow.dag_id)
+            if dag and dag.status in (DAGStatus.SUBMITTED.value, DAGStatus.RUNNING.value):
+                condor = getattr(raw_request.app.state, "condor", None)
+                if condor:
+                    try:
+                        await condor.remove_job(
+                            schedd_name=dag.schedd_name,
+                            cluster_id=dag.dagman_cluster_id,
+                        )
+                    except Exception:
+                        logger.warning("Failed to remove DAG %s", dag.id)
+
+        # Mark non-terminal DAGs as failed
+        for dag in await repo.list_dags(workflow_id=workflow.id):
+            if dag.status not in (DAGStatus.FAILED.value, DAGStatus.COMPLETED.value):
+                await repo.update_dag(dag.id, status=DAGStatus.FAILED.value)
+
+        # Mark open processing blocks as failed
+        for block in await repo.get_processing_blocks(workflow.id):
+            if block.status == "open":
+                await repo.update_processing_block(block.id, status="failed")
+
+        # Mark workflow as failed
+        await repo.update_workflow(workflow.id, status="failed")
+
+    # Transition to FAILED
+    now = datetime.now(timezone.utc)
+    old_transitions = existing.status_transitions or []
+    new_transition = {
+        "from": previous_status,
+        "to": RequestStatus.FAILED.value,
+        "timestamp": now.isoformat(),
+    }
+    await repo.update_request(
+        request_name,
+        status=RequestStatus.FAILED.value,
+        status_transitions=old_transitions + [new_transition],
+        updated_at=now,
+    )
+    logger.info("Request %s: %s -> failed (operator-initiated)", request_name, previous_status)
+
     return {
         "request_name": request_name,
         "status": "failed",
@@ -301,3 +395,38 @@ async def get_request_versions(
         current = nxt
 
     return versions
+
+
+@router.patch("/{request_name}/priority-profile", response_model=dict)
+async def update_priority_profile(
+    request_name: str,
+    body: PriorityProfileUpdate,
+    repo: Repository = Depends(get_repository),
+):
+    """Update the priority profile for a request (high, nominal, switch_fraction)."""
+    existing = await repo.get_request(request_name)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    if body.switch_fraction < 0 or body.switch_fraction > 1:
+        raise HTTPException(status_code=422, detail="switch_fraction must be between 0 and 1")
+
+    profile = {"high": body.high, "nominal": body.nominal, "switch_fraction": body.switch_fraction}
+
+    # Update request_data._priority_profile
+    rd = dict(existing.request_data or {})
+    # Preserve pilot from existing profile if present
+    old_profile = rd.get("_priority_profile", {})
+    profile["pilot"] = old_profile.get("pilot", body.high)
+    rd["_priority_profile"] = profile
+    await repo.update_request(request_name, request_data=rd)
+
+    # Update workflow config_data.priority_profile
+    workflow = await repo.get_workflow_by_request(request_name)
+    if workflow:
+        cd = dict(workflow.config_data or {})
+        cd["priority_profile"] = profile
+        await repo.update_workflow(workflow.id, config_data=cd)
+
+    logger.info("Priority profile updated for %s: %s", request_name, profile)
+    return {"request_name": request_name, "priority_profile": profile}

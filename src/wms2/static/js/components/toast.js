@@ -22,7 +22,10 @@ document.addEventListener('alpine:init', () => {
         add(type, message) {
             const id = this._nextId++;
             this.toasts.push({ id, type, message });
-            setTimeout(() => this.remove(id), 5000);
+            // Errors stay until manually dismissed; others auto-dismiss
+            if (type !== 'error') {
+                setTimeout(() => this.remove(id), 5000);
+            }
         },
 
         remove(id) {

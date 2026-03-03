@@ -71,6 +71,7 @@ const WMS2_API = (() => {
         getDAGHistory:     (id)         => get('/dags/' + encodeURIComponent(id) + '/history'),
         getDAGJobs:        (id)         => get('/dags/' + encodeURIComponent(id) + '/jobs'),
         getDAGNodeLog:     (id)         => get('/dags/' + encodeURIComponent(id) + '/node-log'),
+        getDAGPerformance: (id)         => get('/dags/' + encodeURIComponent(id) + '/performance'),
 
         // Lifecycle
         getLifecycleSettings: ()        => get('/lifecycle/settings'),

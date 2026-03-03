@@ -46,8 +46,9 @@
     <div x-data="toastManager" class="toast-container">
         <template x-for="t in toasts" :key="t.id">
             <div class="toast" :class="'toast--' + t.type"
-                 @click="remove(t.id)">
-                <span x-text="t.message"></span>
+                 @click="remove(t.id)" style="cursor:pointer;">
+                <span x-text="t.message" style="flex:1;"></span>
+                <span x-show="t.type === 'error'" style="margin-left:0.5rem; opacity:0.7; font-size:0.85em;">[click to dismiss]</span>
             </div>
         </template>
     </div>

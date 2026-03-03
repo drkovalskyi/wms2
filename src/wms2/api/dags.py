@@ -1,6 +1,8 @@
 import asyncio
 import glob
+import json
 import logging
+import os
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -341,3 +343,94 @@ async def get_dag_node_log(
 
     all_events.sort(key=lambda e: e["timestamp"])
     return all_events
+
+
+    # ---------------------------------------------------------------------------
+    # Performance Summary — DAGMan metrics + step_metrics from workflow
+    # ---------------------------------------------------------------------------
+
+
+def _read_json(path: str) -> dict | None:
+    """Read a JSON file, return None on any error."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _collect_dag_metrics(submit_dir: str) -> list[dict]:
+    """Read group.dag.metrics files from merge-group subdirs (blocking I/O)."""
+    mg_dirs = sorted(glob.glob(os.path.join(submit_dir, "mg_*")))
+    result = []
+    for mg_dir in mg_dirs:
+        m = _read_json(os.path.join(mg_dir, "group.dag.metrics"))
+        if m:
+            result.append({
+                "merge_group": os.path.basename(mg_dir),
+                "duration_sec": m.get("duration"),
+                "nodes": m.get("total_nodes"),
+                "nodes_succeeded": m.get("nodes_succeeded"),
+                "nodes_failed": m.get("nodes_failed"),
+                "jobs_submitted": m.get("jobs_submitted"),
+                "jobs_succeeded": m.get("jobs_succeeded"),
+                "jobs_failed": m.get("jobs_failed"),
+                "exitcode": m.get("exitcode"),
+            })
+    return result
+
+
+@router.get("/{dag_id}/performance")
+async def get_dag_performance(
+    dag_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    """Get DAGMan metrics and per-step performance for this DAG's round."""
+    try:
+        d_uuid = UUID(dag_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid DAG ID format")
+
+    row = await repo.get_dag(d_uuid)
+    if not row:
+        raise HTTPException(status_code=404, detail="DAG not found")
+
+    # DAGMan metrics from disk
+    dag_metrics = []
+    if row.submit_dir:
+        loop = asyncio.get_running_loop()
+        dag_metrics = await loop.run_in_executor(
+            None, _collect_dag_metrics, row.submit_dir
+        )
+
+    # Step metrics from workflow DB — determine this DAG's round number
+    step_data = {}
+    round_number = None
+    if row.workflow_id:
+        workflow = await repo.get_workflow(row.workflow_id)
+        if workflow and workflow.step_metrics:
+            sm = workflow.step_metrics
+            if isinstance(sm, str):
+                sm = json.loads(sm)
+
+            # Find round number: DAGs ordered by created_at
+            all_dags = await repo.list_dags(
+                workflow_id=row.workflow_id, limit=1000
+            )
+            dag_ids_ordered = [
+                str(d.id) for d in sorted(all_dags, key=lambda d: d.created_at)
+            ]
+            try:
+                round_number = dag_ids_ordered.index(str(row.id))
+            except ValueError:
+                round_number = None
+
+            rounds = sm.get("rounds", {})
+            if round_number is not None and str(round_number) in rounds:
+                step_data = rounds[str(round_number)]
+
+    return {
+        "dag_metrics": dag_metrics,
+        "round_number": round_number,
+        "step_data": step_data,
+    }

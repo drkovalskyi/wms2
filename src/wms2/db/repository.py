@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -339,3 +339,30 @@ class Repository:
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    # ── Deletion (for request replacement) ───────────────────────
+
+    async def delete_request(self, request_name: str) -> None:
+        await self.session.execute(
+            delete(RequestRow).where(RequestRow.request_name == request_name)
+        )
+
+    async def delete_workflow(self, workflow_id: UUID) -> None:
+        await self.session.execute(
+            delete(WorkflowRow).where(WorkflowRow.id == workflow_id)
+        )
+
+    async def delete_dag(self, dag_id: UUID) -> None:
+        await self.session.execute(
+            delete(DAGRow).where(DAGRow.id == dag_id)
+        )
+
+    async def delete_dag_history(self, dag_id: UUID) -> None:
+        await self.session.execute(
+            delete(DAGHistoryRow).where(DAGHistoryRow.dag_id == dag_id)
+        )
+
+    async def delete_processing_block(self, block_id: UUID) -> None:
+        await self.session.execute(
+            delete(ProcessingBlockRow).where(ProcessingBlockRow.id == block_id)
+        )

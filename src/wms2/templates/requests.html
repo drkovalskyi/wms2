@@ -51,9 +51,7 @@
                 <th class="sortable" @click="sort('campaign')">
                     Campaign<span x-text="sortIcon('campaign')"></span>
                 </th>
-                <th class="sortable" @click="sort('priority')">
-                    Priority<span x-text="sortIcon('priority')"></span>
-                </th>
+                <th>Job Priority</th>
                 <th class="sortable" @click="sort('created_at')">
                     Age<span x-text="sortIcon('created_at')"></span>
                 </th>
@@ -71,7 +69,7 @@
                     </td>
                     <td x-html="statusBadge(r.status)"></td>
                     <td x-text="r.campaign || '—'"></td>
-                    <td x-text="r.priority"></td>
+                    <td x-text="(r.request_data && r.request_data._current_job_priority != null) ? r.request_data._current_job_priority : '—'"></td>
                     <td x-text="fmtAge(r.created_at)"></td>
                     <td x-text="fmtAge(r.updated_at)"></td>
                 </tr>

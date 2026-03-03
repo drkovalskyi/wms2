@@ -39,18 +39,31 @@ def _build_adapters(settings: Settings):
     condor = _build_condor(settings)
 
     if settings.cert_file and settings.key_file:
+        import os
+        import ssl
+
         from wms2.adapters.cric import CRICClient
         from wms2.adapters.dbs import DBSClient
         from wms2.adapters.reqmgr2 import ReqMgr2Client
         from wms2.adapters.rucio import RucioClient
 
-        reqmgr = ReqMgr2Client(settings.reqmgr2_url, settings.cert_file, settings.key_file)
-        dbs = DBSClient(settings.dbs_url, settings.cert_file, settings.key_file)
+        # Build SSL context with Grid CA certificates
+        ca_path = settings.ssl_ca_path
+        if os.path.isdir(ca_path):
+            ssl_ctx = ssl.create_default_context(capath=ca_path)
+        elif os.path.isfile(ca_path):
+            ssl_ctx = ssl.create_default_context(cafile=ca_path)
+        else:
+            ssl_ctx = ssl.create_default_context()
+        ssl_ctx.load_cert_chain(settings.cert_file, settings.key_file)
+
+        reqmgr = ReqMgr2Client(settings.reqmgr2_url, settings.cert_file, settings.key_file, verify=ssl_ctx)
+        dbs = DBSClient(settings.dbs_url, settings.cert_file, settings.key_file, verify=ssl_ctx)
         rucio = RucioClient(
             settings.rucio_url, settings.rucio_account,
-            settings.cert_file, settings.key_file,
+            settings.cert_file, settings.key_file, verify=ssl_ctx,
         )
-        cric = CRICClient(settings.cric_url, settings.cert_file, settings.key_file)
+        cric = CRICClient(settings.cric_url, settings.cert_file, settings.key_file, verify=ssl_ctx)
     else:
         reqmgr = MockReqMgrAdapter()
         dbs = MockDBSAdapter()

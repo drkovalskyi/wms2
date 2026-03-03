@@ -53,34 +53,34 @@ def create_sandbox(
             else:
                 logger.warning("simulator.py not found at %s", sim_src)
 
-        # For CMSSW mode, fetch real PSets from ConfigCache or generate test stubs
+        # For CMSSW mode, fetch real PSets from ConfigCache (required)
         if mode == "cmssw":
-            # For StepChain manifests (new format), get global_tag from first step
-            if "steps" in manifest and manifest["steps"]:
-                first_step = manifest["steps"][0]
-                global_tag = first_step.get("global_tag", manifest.get("global_tag", ""))
-            else:
-                global_tag = manifest.get("global_tag", "")
+            if not ssl_context or not configcache_url:
+                raise RuntimeError(
+                    "CMSSW sandbox mode requires SSL credentials and ConfigCache URL. "
+                    "Set WMS2_CERT_FILE/WMS2_KEY_FILE environment variables or use "
+                    "--sandbox-mode simulator for testing without credentials."
+                )
             for step in manifest.get("steps", []):
                 pset_rel = step["pset"]
                 pset_path = tmp / pset_rel
                 pset_path.parent.mkdir(parents=True, exist_ok=True)
 
                 cc_id = step.get("config_cache_id", "")
-                pset_content = None
-
-                # Try fetching from ConfigCache if credentials are available
-                if cc_id and ssl_context and configcache_url:
-                    pset_content = _fetch_configcache_pset(
-                        configcache_url, cc_id, ssl_context, step["name"]
+                if not cc_id:
+                    raise RuntimeError(
+                        f"Step {step['name']} has no config_cache_id — "
+                        f"cannot fetch PSet from ConfigCache"
                     )
-
-                if pset_content is not None:
-                    pset_path.write_text(pset_content)
-                else:
-                    step_gt = step.get("global_tag", global_tag)
-                    has_input = bool(step.get("input_step"))
-                    pset_path.write_text(_create_test_pset(step["name"], step_gt, has_input=has_input))
+                pset_content = _fetch_configcache_pset(
+                    configcache_url, cc_id, ssl_context, step["name"]
+                )
+                if pset_content is None:
+                    raise RuntimeError(
+                        f"Failed to fetch PSet from ConfigCache for step "
+                        f"{step['name']} (config_cache_id={cc_id})"
+                    )
+                pset_path.write_text(pset_content)
 
         # Create tar.gz
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -334,7 +334,7 @@ def _fetch_configcache_pset(
 ) -> str | None:
     """Fetch a PSet from CMS ConfigCache (CouchDB).
 
-    Returns the PSet source text, or None on failure (caller falls back to stub).
+    Returns the PSet source text, or None on failure.
     """
     url = f"{configcache_url}/{config_cache_id}/configFile"
     try:
@@ -344,19 +344,20 @@ def _fetch_configcache_pset(
         logger.info("Fetched PSet from ConfigCache for step %s (%s)", step_name, config_cache_id)
         return content
     except Exception as exc:
-        logger.warning(
-            "Failed to fetch PSet from ConfigCache for step %s (%s): %s — falling back to stub",
+        logger.error(
+            "Failed to fetch PSet from ConfigCache for step %s (%s): %s",
             step_name, config_cache_id, exc,
         )
         return None
 
 
 def _create_test_pset(step_name: str, global_tag: str, has_input: bool = True) -> str:
-    """Generate a minimal working PSet.py for testing.
+    """Generate a minimal working PSet.py for testing (simulator/unit tests only).
 
     For GEN steps (has_input=False): uses EmptySource so cmsRun generates events.
     For later steps (has_input=True): uses PoolSource; fileNames injected at runtime.
-    For real production, PSets come from ConfigCache (future).
+
+    NOT used for real CMSSW production — those PSets come from ConfigCache.
     """
     import re
     # CMSSW Process name must be alphanumeric only (no hyphens, dots, etc.)

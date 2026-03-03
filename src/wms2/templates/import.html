@@ -2,6 +2,9 @@
 {% block title %}WMS2 — Import Request{% endblock %}
 {% block head_scripts %}
 <script src="/static/js/components/import-form.js"></script>
+<style>
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
 {% endblock %}
 {% block content %}
 <div x-data="importForm">
@@ -58,6 +61,29 @@
                 <div class="form-help">Limit DBS file query (0 or empty = all files).</div>
             </div>
 
+            <h3 style="margin-top:1.5rem; font-size:1rem;">Priority Profile</h3>
+
+            <div class="form-group">
+                <label for="high-priority">High Priority</label>
+                <input id="high-priority" type="number" x-model="highPriority"
+                       placeholder="5">
+                <div class="form-help">HTCondor job priority for early production rounds.</div>
+            </div>
+
+            <div class="form-group">
+                <label for="nominal-priority">Nominal Priority</label>
+                <input id="nominal-priority" type="number" x-model="nominalPriority"
+                       placeholder="3">
+                <div class="form-help">HTCondor job priority after switch fraction is reached.</div>
+            </div>
+
+            <div class="form-group">
+                <label for="priority-switch-fraction">Priority Switch Fraction</label>
+                <input id="priority-switch-fraction" type="number" x-model="prioritySwitchFraction"
+                       step="0.05" min="0" max="1" placeholder="0.5">
+                <div class="form-help">Progress fraction at which to switch from high to nominal priority.</div>
+            </div>
+
             <div class="form-group">
                 <label>
                     <input type="checkbox" x-model="dryRun">
@@ -68,7 +94,23 @@
 
             <button type="submit" :disabled="!isValid || submitting"
                     x-text="submitting ? 'Importing...' : 'Import Request'"></button>
+            <div x-show="submitting && progressStep" x-cloak
+                 style="margin-top:0.75rem; padding:0.5rem 0.75rem; background:#1a1a2e; border-radius:4px; font-size:0.9rem;">
+                <span style="display:inline-block; animation: spin 1s linear infinite; margin-right:0.5rem;">&#9696;</span>
+                <span x-text="progressStep"></span>
+            </div>
         </form>
+
+        <!-- Replace confirmation dialog -->
+        <dialog :open="showReplaceDialog || undefined">
+            <h3>Request Already Exists</h3>
+            <p>This request already exists in WMS2 with status: <strong x-text="existingStatus"></strong>.</p>
+            <p>Clear the existing request and all its data (workflow, DAGs, history) and re-import?</p>
+            <div class="dialog-actions">
+                <button class="outline" @click="showReplaceDialog = false">Cancel</button>
+                <button @click="doReplace()">Clear &amp; Re-import</button>
+            </div>
+        </dialog>
     </div>
 </div>
 {% endblock %}

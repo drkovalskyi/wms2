@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Override MergedLFNBase (e.g. /store/mc or /store/data). "
                           "Auto-determined from input dataset if not specified.")
     imp.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    imp.add_argument("--high-priority", type=int, default=5,
+                     help="HTCondor job priority for early production rounds (default: 5)")
+    imp.add_argument("--nominal-priority", type=int, default=3,
+                     help="HTCondor job priority after switch fraction (default: 3)")
+    imp.add_argument("--priority-switch-fraction", type=float, default=0.5,
+                     help="Progress fraction at which to switch from high to nominal priority (default: 0.5)")
 
     return parser
 
@@ -386,6 +392,14 @@ async def run_import(args: argparse.Namespace) -> None:
                 config_data["request_num_events"] = reqdata.get("RequestNumEvents", 0)
             if args.test_fraction is not None:
                 config_data["test_fraction"] = args.test_fraction
+
+            # Priority profile
+            config_data["priority_profile"] = {
+                "pilot": settings.default_pilot_priority,
+                "high": args.high_priority,
+                "nominal": args.nominal_priority,
+                "switch_fraction": args.priority_switch_fraction,
+            }
 
             # Create sandbox
             submit_dir = os.path.join(settings.submit_base_dir, request_name)

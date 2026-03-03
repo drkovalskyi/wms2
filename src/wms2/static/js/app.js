@@ -10,6 +10,7 @@ const STATUS_COLORS = {
     active:        'primary',
     stopping:      'warning',
     resubmitting:  'warning',
+    paused:        'warning',
     held:          'danger',
     completed:     'success',
     partial:       'warning',

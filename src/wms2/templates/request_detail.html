@@ -24,7 +24,8 @@
                         <button class="outline" @click="showStopDialog = true" :disabled="actionLoading">Stop</button>
                     </template>
                     <template x-if="canRelease">
-                        <button class="outline" @click="doRelease()" :disabled="actionLoading">Release</button>
+                        <button class="outline" @click="doRelease()" :disabled="actionLoading"
+                                x-text="request.status === 'paused' ? 'Resume' : 'Release'"></button>
                     </template>
                     <template x-if="canFail">
                         <button class="outline" style="--pico-color: #ef4444; --pico-border-color: #ef4444;"
@@ -45,8 +46,11 @@
                     <textarea id="stop-reason" x-model="stopReason" rows="2" style="width:100%;"></textarea>
                 </div>
                 <div class="dialog-actions">
-                    <button class="outline" @click="showStopDialog = false">Cancel</button>
-                    <button @click="doStop()" :disabled="actionLoading">Confirm Stop</button>
+                    <button class="outline" @click="showStopDialog = false" :disabled="actionLoading">Cancel</button>
+                    <button @click="doStop()" :disabled="actionLoading">
+                        <span x-show="!actionLoading">Confirm Stop</span>
+                        <span x-show="actionLoading">Stopping...</span>
+                    </button>
                 </div>
             </dialog>
 
@@ -55,9 +59,12 @@
                 <h3>Fail Request</h3>
                 <p>This will kill the running DAG and mark the request as failed. This cannot be undone.</p>
                 <div class="dialog-actions">
-                    <button class="outline" @click="showFailDialog = false">Cancel</button>
+                    <button class="outline" @click="showFailDialog = false" :disabled="actionLoading">Cancel</button>
                     <button style="--pico-background-color: #ef4444; --pico-border-color: #ef4444;"
-                            @click="doFail()" :disabled="actionLoading">Confirm Fail</button>
+                            @click="doFail()" :disabled="actionLoading">
+                        <span x-show="!actionLoading">Confirm Fail</span>
+                        <span x-show="actionLoading">Failing...</span>
+                    </button>
                 </div>
             </dialog>
 
@@ -67,8 +74,11 @@
                 <p>This will fail the current request and create a new one with an incremented version.
                    You will be redirected to the new request.</p>
                 <div class="dialog-actions">
-                    <button class="outline" @click="showRestartDialog = false">Cancel</button>
-                    <button @click="doRestart()" :disabled="actionLoading">Confirm Restart</button>
+                    <button class="outline" @click="showRestartDialog = false" :disabled="actionLoading">Cancel</button>
+                    <button @click="doRestart()" :disabled="actionLoading">
+                        <span x-show="!actionLoading">Confirm Restart</span>
+                        <span x-show="actionLoading">Restarting...</span>
+                    </button>
                 </div>
             </dialog>
 
@@ -85,8 +95,8 @@
                 <dl class="detail-grid">
                     <dt>Campaign</dt>
                     <dd x-text="request.campaign || '—'"></dd>
-                    <dt>Priority</dt>
-                    <dd x-text="request.priority"></dd>
+                    <dt>Job Priority</dt>
+                    <dd x-text="currentJobPriority != null ? currentJobPriority : '—'"></dd>
                     <dt>Requestor</dt>
                     <dd x-text="request.requestor || '—'"></dd>
                     <dt>Urgent</dt>
@@ -108,6 +118,49 @@
                     <dt>Cleanup Policy</dt>
                     <dd x-text="request.cleanup_policy || '—'"></dd>
                 </dl>
+            </div>
+
+            <!-- Priority profile -->
+            <div class="section">
+                <h3 style="display:flex; align-items:center; gap:0.5rem;">
+                    Priority Profile
+                    <template x-if="!editingPriority">
+                        <button class="outline" style="font-size:0.75rem; padding:0.15rem 0.5rem;"
+                                @click="startEditPriority()">Edit</button>
+                    </template>
+                </h3>
+                <template x-if="!editingPriority">
+                    <dl class="detail-grid">
+                        <dt>High Priority</dt>
+                        <dd x-text="priorityProfile ? priorityProfile.high : '—'"></dd>
+                        <dt>Nominal Priority</dt>
+                        <dd x-text="priorityProfile ? priorityProfile.nominal : '—'"></dd>
+                        <dt>Switch Fraction</dt>
+                        <dd x-text="priorityProfile ? (priorityProfile.switch_fraction * 100) + '%' : '—'"></dd>
+                    </dl>
+                </template>
+                <template x-if="editingPriority">
+                    <div>
+                        <dl class="detail-grid">
+                            <dt><label for="prio-high">High Priority</label></dt>
+                            <dd><input id="prio-high" type="number" x-model="prioHigh" style="width:80px;"></dd>
+                            <dt><label for="prio-nominal">Nominal Priority</label></dt>
+                            <dd><input id="prio-nominal" type="number" x-model="prioNominal" style="width:80px;"></dd>
+                            <dt><label for="prio-switch">Switch Fraction</label></dt>
+                            <dd><input id="prio-switch" type="number" x-model="prioSwitchFraction"
+                                       step="0.05" min="0" max="1" style="width:80px;"></dd>
+                        </dl>
+                        <div style="margin-top:0.5rem; display:flex; gap:0.5rem;">
+                            <button @click="savePriority()" :disabled="actionLoading"
+                                    style="font-size:0.85rem; padding:0.25rem 0.75rem;">Save</button>
+                            <button class="outline" @click="editingPriority = false" :disabled="actionLoading"
+                                    style="font-size:0.85rem; padding:0.25rem 0.75rem;">Cancel</button>
+                        </div>
+                        <p style="font-size:0.8rem; opacity:0.6; margin-top:0.25rem;">
+                            Changes take effect on the next DAG submission (next round).
+                        </p>
+                    </div>
+                </template>
             </div>
 
             <!-- Processing progress -->

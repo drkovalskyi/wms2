@@ -362,6 +362,30 @@ class DAGPlanner:
                                 "Rucio pileup query failed for %s", ds, exc_info=True
                             )
 
+        # Determine job priority from priority profile
+        priority_profile = config.get("priority_profile", {})
+        if current_round == 0:
+            job_priority = priority_profile.get("pilot", self.settings.default_pilot_priority)
+        else:
+            progress = (workflow.events_produced or 0) / max(workflow.target_events or 1, 1)
+            switch_at = priority_profile.get("switch_fraction", 0.5)
+            if progress < switch_at:
+                job_priority = priority_profile.get("high", 5)
+            else:
+                job_priority = priority_profile.get("nominal", 3)
+        if job_priority:
+            logger.info("Round %d: job priority = %d", current_round, job_priority)
+
+        # Store current priority on request row for UI display
+        try:
+            req_row = await self.repo.get_request(workflow.request_name)
+            if req_row:
+                rd = dict(req_row.request_data or {})
+                rd["_current_job_priority"] = job_priority
+                await self.repo.update_request(workflow.request_name, request_data=rd)
+        except Exception:
+            logger.debug("Could not store job priority on request row", exc_info=True)
+
         dag_file_path = _generate_dag_files(
             submit_dir=submit_dir,
             workflow_id=str(workflow.id),
@@ -377,6 +401,7 @@ class DAGPlanner:
             resource_params=resource_params or None,
             banned_sites=banned_sites or None,
             pileup_files=pileup_files or None,
+            job_priority=job_priority,
         )
 
         # 8. Count totals
@@ -712,6 +737,7 @@ def _generate_dag_files(
     resource_params: dict[str, int] | None = None,
     banned_sites: list[str] | None = None,
     pileup_files: dict[str, list[str]] | None = None,
+    job_priority: int = 0,
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -765,6 +791,7 @@ def _generate_dag_files(
             resource_params=resource_params,
             banned_sites=banned_sites,
             pileup_files=pileup_files,
+            job_priority=job_priority,
         )
 
     # Category throttling for merge groups
@@ -792,6 +819,7 @@ def _generate_group_dag(
     resource_params: dict[str, int] | None = None,
     banned_sites: list[str] | None = None,
     pileup_files: dict[str, list[str]] | None = None,
+    job_priority: int = 0,
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
     exe = executables or {}
@@ -894,13 +922,17 @@ def _generate_group_dag(
         "",
     ]
 
-    # Landing node
+    # Landing node — marked as quick job so it can use overflow slots
+    # even when the pool is fully loaded with proc jobs.
+    landing_priority = max(job_priority, 5) + 10
     _write_submit_file(
         str(group_dir / "landing.sub"),
         executable="/bin/true",
         arguments="",
         description="landing node",
         banned_sites=banned_sites,
+        priority=landing_priority,
+        extra_classads={"WMS2_QuickJob": "True"},
     )
     lines.append("JOB landing landing.sub")
     lines.append(
@@ -943,6 +975,7 @@ def _generate_group_dag(
             ncpus=ncpus,
             transfer_input_files=proc_transfer_files or None,
             environment=proc_env or None,
+            priority=job_priority,
         )
         lines.append(f"JOB {node_name} {node_name}.sub")
         lines.append(
@@ -970,6 +1003,7 @@ def _generate_group_dag(
         memory_mb=memory_mb,
         disk_kb=disk_kb,
         transfer_input_files=merge_transfer or None,
+        priority=job_priority,
     )
     lines.append("JOB merge merge.sub")
     lines.append(
@@ -996,6 +1030,7 @@ def _generate_group_dag(
         arguments=cleanup_args,
         description="cleanup node",
         transfer_input_files=cleanup_transfer or None,
+        priority=job_priority,
     )
     lines.append("JOB cleanup cleanup.sub")
     lines.append(
@@ -1052,6 +1087,8 @@ def _write_submit_file(
     transfer_input_files: list[str] | None = None,
     environment: dict[str, str] | None = None,
     banned_sites: list[str] | None = None,
+    priority: int = 0,
+    extra_classads: dict[str, str] | None = None,
 ) -> None:
     lines = [
         f"# {description}",
@@ -1082,6 +1119,11 @@ def _write_submit_file(
             f'(TARGET.GLIDEIN_CMSSite =!= "{s}")' for s in banned_sites
         )
         lines.append(f"Requirements = {neg}")
+    if priority:
+        lines.append(f"priority = {priority}")
+    if extra_classads:
+        for key, value in extra_classads.items():
+            lines.append(f"+{key} = {value}")
     lines.append("queue 1")
     _write_file(path, "\n".join(lines) + "\n")
 
@@ -1580,9 +1622,10 @@ lines.append('process.source.firstEvent = cms.untracked.uint32($first_event)')
 lines.append('if hasattr(process, \"externalLHEProducer\"):')
 lines.append('    process.externalLHEProducer.nEvents = cms.untracked.uint32($max_events)')
 # Randomize seeds for parallel GEN instances (same as main path)
-lines.append('from IOMC.RandomEngine.RandomServiceHelper import RandomNumberServiceHelper')
-lines.append('_rng_helper = RandomNumberServiceHelper(process.RandomNumberGeneratorService)')
-lines.append('_rng_helper.populate()')
+lines.append('if hasattr(process, \"RandomNumberGeneratorService\"):')
+lines.append('    from IOMC.RandomEngine.RandomServiceHelper import RandomNumberServiceHelper')
+lines.append('    _rng_helper = RandomNumberServiceHelper(process.RandomNumberGeneratorService)')
+lines.append('    _rng_helper.populate()')
 if $nthreads > 1:
     lines.append('if not hasattr(process, \"options\"):')
     lines.append('    process.options = cms.untracked.PSet()')
@@ -2200,9 +2243,10 @@ if step_idx == 0 and first_event > 0:
 # Uses CMSSW's built-in RandomNumberServiceHelper.populate() which draws from
 # /dev/urandom (same mechanism WMAgent uses via AutomaticSeeding).
 if step_idx == 0:
-    lines.append('from IOMC.RandomEngine.RandomServiceHelper import RandomNumberServiceHelper')
-    lines.append('_rng_helper = RandomNumberServiceHelper(process.RandomNumberGeneratorService)')
-    lines.append('_rng_helper.populate()')
+    lines.append('if hasattr(process, \"RandomNumberGeneratorService\"):')
+    lines.append('    from IOMC.RandomEngine.RandomServiceHelper import RandomNumberServiceHelper')
+    lines.append('    _rng_helper = RandomNumberServiceHelper(process.RandomNumberGeneratorService)')
+    lines.append('    _rng_helper.populate()')
 
 # nThreads
 nthreads = $NTHREADS
@@ -3497,13 +3541,13 @@ if root_files:
             unmerged_pfn_dir = lfn_to_pfn(local_pfn_prefix, f"{unmerged_base}/{group_index:06d}")
             cleanup_dirs.add(unmerged_pfn_dir)
 
-    # Write cleanup_manifest.json for the cleanup job
-    if cleanup_dirs:
-        cleanup_manifest = {"unmerged_dirs": sorted(cleanup_dirs)}
-        cleanup_path = os.path.join(group_dir, "cleanup_manifest.json")
-        with open(cleanup_path, "w") as f:
-            json.dump(cleanup_manifest, f, indent=2)
-        print(f"Wrote cleanup manifest: {cleanup_path} ({len(cleanup_dirs)} dirs)")
+    # Write cleanup_manifest.json for the cleanup job (always, even if empty,
+    # because cleanup.sub references it in transfer_input_files)
+    cleanup_manifest = {"unmerged_dirs": sorted(cleanup_dirs)}
+    cleanup_path = os.path.join(group_dir, "cleanup_manifest.json")
+    with open(cleanup_path, "w") as f:
+        json.dump(cleanup_manifest, f, indent=2)
+    print(f"Wrote cleanup manifest: {cleanup_path} ({len(cleanup_dirs)} dirs)")
 
     # Aggregate per-step resource metrics from proc jobs
     if unmerged_metrics:

@@ -290,6 +290,7 @@ class RequestLifecycleManager:
             RequestStatus.ACTIVE: settings.timeout_active,
             RequestStatus.STOPPING: settings.timeout_stopping,
             RequestStatus.RESUBMITTING: settings.timeout_resubmitting,
+            RequestStatus.PAUSED: settings.timeout_active,
         }
 
         self._dispatch = {
@@ -299,6 +300,7 @@ class RequestLifecycleManager:
             RequestStatus.ACTIVE: self._handle_active,
             RequestStatus.STOPPING: self._handle_stopping,
             RequestStatus.RESUBMITTING: self._handle_resubmitting,
+            RequestStatus.PAUSED: self._handle_paused,
             RequestStatus.HELD: self._handle_held,
             RequestStatus.PARTIAL: self._handle_partial,
         }
@@ -631,13 +633,31 @@ class RequestLifecycleManager:
             schedd_name=dag.schedd_name, cluster_id=dag.dagman_cluster_id
         )
         if dagman_status is None:
-            # DAGMan process gone — stop complete
+            # DAGMan process gone — stop complete, park in PAUSED
             await self.db.update_dag(dag.id, status=DAGStatus.STOPPED.value)
-            await self._prepare_recovery(request, workflow, dag)
+            await self.transition(request, RequestStatus.PAUSED)
 
     async def _handle_resubmitting(self, request):
-        """Recovery DAG prepared, move back to admission queue."""
+        """Prepare recovery DAG if needed, then move to admission queue.
+
+        Two paths reach RESUBMITTING:
+        1. Error handler rescue — rescue DAG record already created (READY).
+        2. Clean stop resume (PAUSED → RESUBMITTING) — DAG is STOPPED,
+           needs _prepare_recovery to create rescue DAG record.
+        """
+        workflow = await self.db.get_workflow_by_request(request.request_name)
+        if workflow and workflow.dag_id:
+            dag = await self.db.get_dag(workflow.dag_id)
+            if dag and dag.status == DAGStatus.STOPPED.value:
+                # Clean stop resume — create rescue DAG record
+                await self._prepare_recovery(request, workflow, dag)
+                return
+        # Error handler path or fallback — rescue DAG already exists
         await self.transition(request, RequestStatus.QUEUED)
+
+    async def _handle_paused(self, request):
+        """PAUSED: operator-initiated clean stop. Waiting for Resume. No-op."""
+        pass
 
     async def _handle_held(self, request):
         """HELD: stable state waiting for operator action. No-op."""
@@ -1000,7 +1020,7 @@ class RequestLifecycleManager:
                 ],
             )
 
-        await self.transition(request, RequestStatus.RESUBMITTING)
+        await self.transition(request, RequestStatus.QUEUED)
 
     # ── Timeout Detection ───────────────────────────────────────
 

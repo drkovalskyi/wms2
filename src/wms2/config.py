@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     site_ban_min_failures: int = 3
     site_ban_failure_ratio: float = 0.50
 
+    # Priority
+    default_pilot_priority: int = 5  # HTCondor job priority for round 0 (pilot)
+
     # Adaptive execution
     default_memory_per_core: int = 2000    # MB, floor for request_memory
     max_memory_per_core: int = 3000        # MB, ceiling for request_memory

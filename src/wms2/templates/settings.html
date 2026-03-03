@@ -2,6 +2,27 @@
 {% block title %}WMS2 — Settings{% endblock %}
 {% block head_scripts %}
 <script src="/static/js/components/settings.js"></script>
+<style>
+    .settings-input {
+        font-family: inherit;
+        font-size: 0.9rem;
+        padding: 2px 6px;
+        border: 1px solid #666;
+        border-radius: 3px;
+        background: #1a1a2e;
+        color: #e0e0e0;
+        width: 10em;
+    }
+    .settings-input:focus {
+        outline: none;
+        border-color: #4fc3f7;
+    }
+    .settings-actions {
+        display: flex;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+    }
+</style>
 {% endblock %}
 {% block content %}
 <div x-data="settingsPage">
@@ -12,9 +33,22 @@
     <template x-if="settings">
         <div>
             <h1 style="font-size:1.3rem;">Settings</h1>
-            <p style="opacity:0.6; font-size:0.85rem; margin-bottom:1rem;">
-                Read-only view of current WMS2 configuration (from environment variables).
+            <p x-show="!editing" style="opacity:0.6; font-size:0.85rem; margin-bottom:1rem;">
+                Current WMS2 configuration. Click Edit to modify operational parameters.
             </p>
+            <p x-show="editing" style="color:#4fc3f7; font-size:0.85rem; margin-bottom:1rem;">
+                Editing mode — change values below, then Save &amp; Restart to apply.
+            </p>
+
+            <div class="settings-actions">
+                <button x-show="!editing" class="outline" @click="toggleEdit()">Edit</button>
+                <button x-show="editing" @click="doSave()" :disabled="saving"
+                        style="background:#4fc3f7; color:#000; border:none; padding:4px 12px; border-radius:3px; cursor:pointer;">
+                    <span x-show="!saving">Save &amp; Restart</span>
+                    <span x-show="saving">Saving...</span>
+                </button>
+                <button x-show="editing" class="outline" @click="toggleEdit()" :disabled="saving">Cancel</button>
+            </div>
 
             <div class="section">
                 <h3>Lifecycle Manager</h3>
@@ -22,13 +56,37 @@
                     <dt>Status</dt>
                     <dd x-html="lifecycleRunning ? statusBadge('running') : statusBadge('idle')"></dd>
                     <dt>Cycle Interval</dt>
-                    <dd><span x-text="settings.lifecycle_cycle_interval"></span>s</dd>
+                    <dd>
+                        <template x-if="editing">
+                            <span><input type="number" class="settings-input" x-model.number="editValues.lifecycle_cycle_interval" min="1">s</span>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.lifecycle_cycle_interval + 's'"></span>
+                        </template>
+                    </dd>
                     <dt>Max Active DAGs</dt>
-                    <dd x-text="settings.max_active_dags"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.max_active_dags" min="1">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.max_active_dags"></span>
+                        </template>
+                    </dd>
                     <dt>Log Level</dt>
-                    <dd x-text="settings.log_level"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <select class="settings-input" x-model="editValues.log_level">
+                                <option>DEBUG</option><option>INFO</option>
+                                <option>WARNING</option><option>ERROR</option>
+                            </select>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.log_level"></span>
+                        </template>
+                    </dd>
                 </dl>
-                <button class="outline" style="margin-top:0.75rem;"
+                <button x-show="!editing" class="outline" style="margin-top:0.75rem;"
                         @click="doRestart()" :disabled="restarting">
                     <span x-show="!restarting">Restart Lifecycle Manager</span>
                     <span x-show="restarting">Restarting...</span>
@@ -39,13 +97,56 @@
                 <h3>Work Unit Sizing</h3>
                 <dl class="detail-grid">
                     <dt>Jobs per Work Unit</dt>
-                    <dd x-text="settings.jobs_per_work_unit"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.jobs_per_work_unit" min="1">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.jobs_per_work_unit"></span>
+                        </template>
+                    </dd>
                     <dt>First Round Work Units</dt>
-                    <dd x-text="settings.first_round_work_units"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.first_round_work_units" min="1">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.first_round_work_units"></span>
+                        </template>
+                    </dd>
                     <dt>Work Units per Round</dt>
-                    <dd x-text="settings.work_units_per_round"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.work_units_per_round" min="1">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.work_units_per_round"></span>
+                        </template>
+                    </dd>
                     <dt>Target Merged Size</dt>
-                    <dd x-text="(settings.target_merged_size_kb / 1024 / 1024).toFixed(1) + ' GB'"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <span><input type="number" class="settings-input" x-model.number="editValues.target_merged_size_kb" min="1"> KB</span>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="(settings.target_merged_size_kb / 1024 / 1024).toFixed(1) + ' GB'"></span>
+                        </template>
+                    </dd>
+                </dl>
+            </div>
+
+            <div class="section">
+                <h3>Priority</h3>
+                <dl class="detail-grid">
+                    <dt>Default Pilot Priority</dt>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.default_pilot_priority">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.default_pilot_priority"></span>
+                        </template>
+                    </dd>
                 </dl>
             </div>
 
@@ -55,11 +156,32 @@
                     <dt>Mode</dt>
                     <dd x-text="settings.adaptive_mode"></dd>
                     <dt>Default Memory/Core</dt>
-                    <dd><span x-text="settings.default_memory_per_core"></span> MB</dd>
+                    <dd>
+                        <template x-if="editing">
+                            <span><input type="number" class="settings-input" x-model.number="editValues.default_memory_per_core" min="1"> MB</span>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.default_memory_per_core + ' MB'"></span>
+                        </template>
+                    </dd>
                     <dt>Max Memory/Core</dt>
-                    <dd><span x-text="settings.max_memory_per_core"></span> MB</dd>
+                    <dd>
+                        <template x-if="editing">
+                            <span><input type="number" class="settings-input" x-model.number="editValues.max_memory_per_core" min="1"> MB</span>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.max_memory_per_core + ' MB'"></span>
+                        </template>
+                    </dd>
                     <dt>Safety Margin</dt>
-                    <dd x-text="(settings.safety_margin * 100) + '%'"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.safety_margin" min="0" max="1" step="0.05">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="(settings.safety_margin * 100) + '%'"></span>
+                        </template>
+                    </dd>
                 </dl>
             </div>
 
@@ -67,15 +189,50 @@
                 <h3>Error Handling</h3>
                 <dl class="detail-grid">
                     <dt>Hold Threshold</dt>
-                    <dd x-text="(settings.error_hold_threshold * 100) + '%'"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.error_hold_threshold" min="0" max="1" step="0.05">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="(settings.error_hold_threshold * 100) + '%'"></span>
+                        </template>
+                    </dd>
                     <dt>Max Rescue Attempts</dt>
-                    <dd x-text="settings.error_max_rescue_attempts"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.error_max_rescue_attempts" min="0">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.error_max_rescue_attempts"></span>
+                        </template>
+                    </dd>
                     <dt>Site Ban Duration</dt>
-                    <dd><span x-text="settings.site_ban_duration_days"></span> days</dd>
+                    <dd>
+                        <template x-if="editing">
+                            <span><input type="number" class="settings-input" x-model.number="editValues.site_ban_duration_days" min="0"> days</span>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.site_ban_duration_days + ' days'"></span>
+                        </template>
+                    </dd>
                     <dt>Site Ban Min Failures</dt>
-                    <dd x-text="settings.site_ban_min_failures"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.site_ban_min_failures" min="1">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.site_ban_min_failures"></span>
+                        </template>
+                    </dd>
                     <dt>Site Ban Failure Ratio</dt>
-                    <dd x-text="(settings.site_ban_failure_ratio * 100) + '%'"></dd>
+                    <dd>
+                        <template x-if="editing">
+                            <input type="number" class="settings-input" x-model.number="editValues.site_ban_failure_ratio" min="0" max="1" step="0.05">
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="(settings.site_ban_failure_ratio * 100) + '%'"></span>
+                        </template>
+                    </dd>
                 </dl>
             </div>
 

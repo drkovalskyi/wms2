@@ -1,13 +1,33 @@
 import asyncio
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from wms2.core.lifecycle_manager import RequestLifecycleManager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/lifecycle", tags=["lifecycle"])
+
+# Fields that can be modified via PATCH /lifecycle/settings
+EDITABLE_FIELDS = {
+    "lifecycle_cycle_interval": (int, lambda v: v > 0),
+    "max_active_dags": (int, lambda v: v > 0),
+    "jobs_per_work_unit": (int, lambda v: v > 0),
+    "first_round_work_units": (int, lambda v: v > 0),
+    "work_units_per_round": (int, lambda v: v > 0),
+    "target_merged_size_kb": (int, lambda v: v > 0),
+    "error_hold_threshold": (float, lambda v: 0 < v <= 1),
+    "error_max_rescue_attempts": (int, lambda v: v >= 0),
+    "default_memory_per_core": (int, lambda v: v > 0),
+    "max_memory_per_core": (int, lambda v: v > 0),
+    "safety_margin": (float, lambda v: 0 <= v <= 1),
+    "site_ban_duration_days": (int, lambda v: v >= 0),
+    "site_ban_min_failures": (int, lambda v: v >= 1),
+    "site_ban_failure_ratio": (float, lambda v: 0 < v <= 1),
+    "log_level": (str, lambda v: v.upper() in ("DEBUG", "INFO", "WARNING", "ERROR")),
+    "default_pilot_priority": (int, lambda v: True),
+}
 
 
 @router.get("/status")
@@ -44,8 +64,37 @@ async def lifecycle_settings(request: Request):
         "site_ban_min_failures": s.site_ban_min_failures,
         "site_ban_failure_ratio": s.site_ban_failure_ratio,
         "log_level": s.log_level,
+        "default_pilot_priority": s.default_pilot_priority,
         "database_url": _mask_password(s.database_url),
     }
+
+
+@router.patch("/settings")
+async def update_settings(request: Request):
+    """Update editable configuration settings in memory."""
+    body = await request.json()
+    s = request.app.state.settings
+    errors = []
+    updated = {}
+    for key, value in body.items():
+        if key not in EDITABLE_FIELDS:
+            errors.append(f"{key}: not an editable field")
+            continue
+        expected_type, validator = EDITABLE_FIELDS[key]
+        try:
+            cast_value = expected_type(value)
+        except (TypeError, ValueError):
+            errors.append(f"{key}: expected {expected_type.__name__}")
+            continue
+        if not validator(cast_value):
+            errors.append(f"{key}: value {cast_value!r} out of range")
+            continue
+        setattr(s, key, cast_value)
+        updated[key] = cast_value
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+    logger.info("Settings updated: %s", updated)
+    return updated
 
 
 @router.post("/restart")

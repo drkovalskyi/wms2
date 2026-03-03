@@ -132,7 +132,7 @@ class HTCondorAdapter(CondorAdapter):
             "DAGNodeName", "JobStatus", "ResidentSetSize_RAW",
             "CumulativeRemoteUserCpu", "CumulativeRemoteSysCpu",
             "RequestCpus", "RequestMemory", "JobStartDate", "ServerTime",
-            "MATCH_GLIDEIN_CMSSite",
+            "MATCH_GLIDEIN_CMSSite", "JobPrio",
         ]
         ads = self._schedd.query(constraint=constraint, projection=projection)
 
@@ -171,6 +171,7 @@ class HTCondorAdapter(CondorAdapter):
                 "cpus": cpus,
                 "request_memory": int(ad.get("RequestMemory", 0)),
                 "site": ad.get("MATCH_GLIDEIN_CMSSite"),
+                "priority": int(ad.get("JobPrio", 0)),
             })
 
         jobs.sort(key=lambda j: j["name"])
