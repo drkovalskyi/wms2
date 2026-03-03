@@ -9,6 +9,7 @@ document.addEventListener('alpine:init', () => {
         eventsPerJob: '',
         filesPerJob: '',
         maxFiles: '',
+        processingVersion: '',
         highPriority: 5,
         nominalPriority: 3,
         prioritySwitchFraction: 0.5,
@@ -60,6 +61,7 @@ document.addEventListener('alpine:init', () => {
             if (this.eventsPerJob) body.events_per_job = parseInt(this.eventsPerJob);
             if (this.filesPerJob) body.files_per_job = parseInt(this.filesPerJob);
             if (this.maxFiles) body.max_files = parseInt(this.maxFiles);
+            if (this.processingVersion) body.processing_version = parseInt(this.processingVersion);
             body.high_priority = parseInt(this.highPriority);
             body.nominal_priority = parseInt(this.nominalPriority);
             body.priority_switch_fraction = parseFloat(this.prioritySwitchFraction);

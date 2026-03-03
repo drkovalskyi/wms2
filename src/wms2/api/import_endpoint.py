@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
 from pydantic import BaseModel
@@ -28,6 +29,7 @@ class ImportBody(BaseModel):
     events_per_job: int | None = None
     files_per_job: int | None = None
     max_files: int | None = None
+    processing_version: int | None = None
     dry_run: bool = False
     high_priority: int = 5
     nominal_priority: int = 3
@@ -81,6 +83,32 @@ def _normalize_request(reqdata: dict) -> dict:
             reqdata["SplittingParams"] = params
 
     return reqdata
+
+
+def _apply_processing_version(reqdata: dict, version: int):
+    """Rewrite ProcessingVersion in request data and OutputDatasets paths."""
+    reqdata["ProcessingVersion"] = version
+
+    # Rewrite per-step ProcessingVersion (Step1, Step2, ...)
+    for key in list(reqdata):
+        if re.match(r"^Step\d+$", key) and isinstance(reqdata[key], dict):
+            reqdata[key]["ProcessingVersion"] = version
+
+    # Rewrite OutputDatasets: /Primary/Era-ProcString-vOLD/Tier → -vNEW
+    new_datasets = []
+    for ds in reqdata.get("OutputDatasets", []):
+        new_ds = re.sub(r"-v\d+/", f"-v{version}/", ds)
+        new_datasets.append(new_ds)
+    if new_datasets:
+        reqdata["OutputDatasets"] = new_datasets
+
+    # Rewrite OutputModulesLFNBases paths similarly
+    new_bases = []
+    for base in reqdata.get("OutputModulesLFNBases", []):
+        new_base = re.sub(r"-v\d+$", f"-v{version}", base)
+        new_bases.append(new_base)
+    if new_bases:
+        reqdata["OutputModulesLFNBases"] = new_bases
 
 
 @router.post("/import")
@@ -142,6 +170,12 @@ async def import_request(
         raise HTTPException(status_code=502, detail=f"Failed to fetch from ReqMgr2: {exc}")
 
     reqdata = _normalize_request(reqdata)
+
+    # Override processing version if requested
+    if body.processing_version is not None:
+        _apply_processing_version(reqdata, body.processing_version)
+        logger.info("Overriding ProcessingVersion to %d for %s",
+                     body.processing_version, body.request_name)
 
     # Store priority profile in request_data for UI display
     reqdata["_priority_profile"] = {
