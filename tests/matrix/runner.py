@@ -261,6 +261,7 @@ def _make_workflow_mock(wf: WorkflowDef, sandbox_path: str) -> MagicMock:
         "request_num_events": total_events,
         "_is_gen": True,
         "output_datasets": wf.output_datasets,
+        "extra_classads": {"WMS2_QuickJob": "True"},
     }
     # Adaptive round fields — must be real values, not MagicMock
     mock.next_first_event = 1

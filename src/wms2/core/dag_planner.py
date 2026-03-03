@@ -402,6 +402,7 @@ class DAGPlanner:
             banned_sites=banned_sites or None,
             pileup_files=pileup_files or None,
             job_priority=job_priority,
+            extra_classads=config.get("extra_classads"),
         )
 
         # 8. Count totals
@@ -738,6 +739,7 @@ def _generate_dag_files(
     banned_sites: list[str] | None = None,
     pileup_files: dict[str, list[str]] | None = None,
     job_priority: int = 0,
+    extra_classads: dict[str, str] | None = None,
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -792,6 +794,7 @@ def _generate_dag_files(
             banned_sites=banned_sites,
             pileup_files=pileup_files,
             job_priority=job_priority,
+            extra_classads=extra_classads,
         )
 
     # Category throttling for merge groups
@@ -820,6 +823,7 @@ def _generate_group_dag(
     banned_sites: list[str] | None = None,
     pileup_files: dict[str, list[str]] | None = None,
     job_priority: int = 0,
+    extra_classads: dict[str, str] | None = None,
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
     exe = executables or {}
@@ -922,9 +926,11 @@ def _generate_group_dag(
         "",
     ]
 
-    # Landing node — marked as quick job so it can use overflow slots
+    # Landing node — always marked as quick job so it can use overflow slots
     # even when the pool is fully loaded with proc jobs.
     landing_priority = max(job_priority, 5) + 10
+    landing_classads = dict(extra_classads or {})
+    landing_classads["WMS2_QuickJob"] = "True"
     _write_submit_file(
         str(group_dir / "landing.sub"),
         executable="/bin/true",
@@ -932,7 +938,7 @@ def _generate_group_dag(
         description="landing node",
         banned_sites=banned_sites,
         priority=landing_priority,
-        extra_classads={"WMS2_QuickJob": "True"},
+        extra_classads=landing_classads,
     )
     lines.append("JOB landing landing.sub")
     lines.append(
@@ -976,6 +982,7 @@ def _generate_group_dag(
             transfer_input_files=proc_transfer_files or None,
             environment=proc_env or None,
             priority=job_priority,
+            extra_classads=extra_classads,
         )
         lines.append(f"JOB {node_name} {node_name}.sub")
         lines.append(
@@ -1004,6 +1011,7 @@ def _generate_group_dag(
         disk_kb=disk_kb,
         transfer_input_files=merge_transfer or None,
         priority=job_priority,
+        extra_classads=extra_classads,
     )
     lines.append("JOB merge merge.sub")
     lines.append(
@@ -1031,6 +1039,7 @@ def _generate_group_dag(
         description="cleanup node",
         transfer_input_files=cleanup_transfer or None,
         priority=job_priority,
+        extra_classads=extra_classads,
     )
     lines.append("JOB cleanup cleanup.sub")
     lines.append(
