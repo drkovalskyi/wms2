@@ -103,13 +103,16 @@ async def get_dag(
     if row.dagman_cluster_id:
         condor = getattr(raw_request.app.state, "condor", None)
         if condor:
-            live = await condor.count_dag_jobs(row.dagman_cluster_id)
-            if live and live.get("total", 0) > 0:
-                result["nodes_done"] = live["done"]
-                result["nodes_running"] = live["running"]
-                result["nodes_idle"] = live["idle"]
-                result["nodes_failed"] = live["failed"]
-                result["nodes_held"] = live["held"]
+            try:
+                live = await condor.count_dag_jobs(row.dagman_cluster_id)
+                if live and live.get("total", 0) > 0:
+                    result["nodes_done"] = live["done"]
+                    result["nodes_running"] = live["running"]
+                    result["nodes_idle"] = live["idle"]
+                    result["nodes_failed"] = live["failed"]
+                    result["nodes_held"] = live["held"]
+            except Exception:
+                log.debug("HTCondor query failed for DAG %s, using DB counts", dag_id)
 
     return result
 
@@ -170,8 +173,12 @@ async def get_dag_jobs(
     if condor is None:
         return []
 
-    jobs = await condor.query_dag_jobs(row.dagman_cluster_id)
-    return jobs if jobs is not None else []
+    try:
+        jobs = await condor.query_dag_jobs(row.dagman_cluster_id)
+        return jobs if jobs is not None else []
+    except Exception:
+        log.debug("HTCondor job query failed for DAG %s", dag_id)
+        return []
 
 
 # ---------------------------------------------------------------------------
