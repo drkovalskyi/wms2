@@ -239,6 +239,18 @@
             <div class="section">
                 <h3>Infrastructure</h3>
                 <dl class="detail-grid">
+                    <dt>Stageout Mode</dt>
+                    <dd>
+                        <template x-if="editing">
+                            <select class="settings-input" x-model="editValues.stageout_mode">
+                                <option value="local">local</option>
+                                <option value="grid">grid</option>
+                            </select>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.stageout_mode"></span>
+                        </template>
+                    </dd>
                     <dt>HTCondor Host</dt>
                     <dd x-text="settings.condor_host"></dd>
                     <dt>Schedd</dt>
