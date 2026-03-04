@@ -2310,9 +2310,9 @@ class MetricsCollector:
 
 ### 5.1 Overview
 
-WMS2 does not run a separate pilot job. Instead, the first production DAG uses resource hints from the request (TimePerEvent, Memory, SizePerEvent) as defaults. As work units complete, their Framework Job Report (FJR) data — per-step CPU efficiency, peak RSS, wall time — is collected by the sandbox and written to merge manifests. When a recovery round occurs (rescue DAG after clean stop, partial failure, or partial production step), the Lifecycle Manager aggregates this FJR data into `step_metrics` on the workflow, and the DAG Planner writes it to `step_profile.json` in the submit directory. The sandbox reads this file and applies per-step adaptive optimization.
+WMS2 does not run a separate pilot job. Instead, the first production round (Round 0) uses resource hints from the request (TimePerEvent, Memory, SizePerEvent) as defaults with a small number of work units. As work units complete, their Framework Job Report (FJR) data — per-step CPU efficiency, peak RSS, wall time — is collected by the sandbox. When the round completes, the Lifecycle Manager aggregates this data into `step_metrics` on the workflow and runs `compute_round_optimization()` to determine optimal parameters for the next round. The optimization composes independent dimensions: memory sizing, job splitting (reducing `request_cpus`), and internal parallelism (step 0 instance splitting).
 
-This design eliminates the latency of a dedicated pilot phase (~8 hours) while converging to optimal resource estimates asymptotically through production data. The existing recovery/rescue DAG mechanism is the natural re-optimization point — no new states, no new components. See `docs/adaptive.md` for the complete algorithm specification covering thread count rounding, memory source hierarchy, probe node design, job split, pipeline split, and multi-round convergence.
+This design eliminates the latency of a dedicated pilot phase (~8 hours) while converging to optimal resource estimates asymptotically through production data. See `docs/adaptive.md` for the complete algorithm specification covering composable optimization dimensions, metric collection, memory source hierarchy, job splitting, internal parallelism, work group sizing, and multi-round convergence.
 
 ### 5.2 Memory-Per-Core Window
 
@@ -2378,48 +2378,45 @@ Round K: Remaining work (≤10 WUs) → final DAG → COMPLETED
 
 ### 5.4 Per-Step Splitting Optimization
 
-Per-step splitting is a sandbox-owned optimization. When `step_profile.json` is present, the sandbox can split CPU-inefficient steps into N parallel `cmsRun` processes within a single slot, using `skipEvents`/`maxEvents` partitioning.
+The adaptive optimization composes independent dimensions rather than selecting one exclusive mode:
 
-**Decision rule**: If a step's CPU efficiency (CPU time / wall time / threads) is below a threshold (e.g., 50%), splitting may help. The number of parallel instances N is constrained by:
-- Memory: N instances must fit within the slot's `request_memory`
-- CPU: N should not exceed `request_cpus` (the allocated cores)
+1. **Memory sizing**: Unified source hierarchy (cgroup → FJR RSS → default) with safety margin
+2. **Job splitting**: When CPU efficiency is low, reduce `request_cpus` (e.g., 8→4) and multiply jobs. This is the real CPU knob — `request_cpus` determines scheduler resource allocation. A configurable `min_request_cpus` floor (default 4) prevents pool fragmentation.
+3. **Internal parallelism (step 0 splitting)**: Split CPU-inefficient step 0 into N parallel `cmsRun` processes within a single slot, using `skipEvents`/`maxEvents` partitioning. This is a sandbox-owned optimization invisible to the scheduler.
+4. **Internal parallelism (all-step pipeline split)**: Fork N complete StepChain pipelines within one sandbox — appropriate for workflows most efficient at 1 thread where submitting 1-core jobs would fragment the pool.
 
-**Example**: A GEN-SIM step running on 8 cores at 20% CPU efficiency (effectively using 1.6 cores). With measured RSS of 800 MB per instance and 4 GB slot memory, the sandbox could run 4 parallel single-threaded cmsRun processes (4 × 800 MB = 3.2 GB < 4 GB), each processing 1/4 of the events via `skipEvents`/`maxEvents`. This is entirely the sandbox's decision — WMS2 only provides the metrics.
+Job splitting and internal parallelism compose: when job splitting reduces `request_cpus` from 8 to 4, internal parallelism is computed at the new core count.
 
-**CPU overcommit** is a complementary optimization: instead of (or in addition to) splitting, give each cmsRun instance more threads than its proportional core share. The extra threads fill I/O bubbles — when some threads are waiting on disk or network, the overcommitted threads can use the idle CPU. For example, on 8 allocated cores with 2 parallel step 0 instances, each could get 5 threads (10 total, 25% overcommit) instead of 4. Steps 1+ running sequentially could get 10 threads instead of 8. Overcommit is optional (off by default, `overcommit_max=1.0`) and memory-safe: the projected RSS including per-thread overhead (conservatively 250 MB/thread for CMSSW) must fit within `request_memory`. Only steps with moderate CPU efficiency (50–90%) benefit from overcommit — low-efficiency steps need splitting, and high-efficiency steps are already saturating their threads. The scheduler-visible `request_cpus` is unchanged; overcommit operates entirely within the sandbox.
+**Example**: A GEN-SIM step running on 8 cores at 55% CPU efficiency (4.4 effective cores). Job splitting rounds to 4 cores (power-of-2 rounding), creating 2× more 4-core jobs. Within each 4-core job, internal parallelism finds no further splitting beneficial at 4 cores. The result: same total core allocation, but each job finishes independently (no tail effect).
+
+**CPU overcommit** is a complementary optimization: give each cmsRun instance more threads than its proportional core share. The extra threads fill I/O bubbles. Overcommit is optional (off by default, `overcommit_max=1.0`) and memory-safe: the projected RSS including per-thread overhead (conservatively 250 MB/thread for CMSSW) must fit within `request_memory`. Only steps with moderate CPU efficiency (50–90%) benefit. The scheduler-visible `request_cpus` is unchanged; overcommit operates entirely within the sandbox.
 
 ### 5.5 Memory Sizing
 
-The adaptive algorithm sizes `request_memory` for Round 2+ based on measured data from Round 1 (or earlier rounds). All measured values include a **20% safety margin** (default, configurable) to account for:
-- Memory leak accumulation over longer production runs (probes/early jobs process fewer events)
+The adaptive algorithm sizes `request_memory` for Round 1+ based on measured data from Round 0 (and earlier rounds). All measured values include a **20% safety margin** (default, configurable) to account for:
+- Memory leak accumulation over longer production runs (round 0 processes fewer events)
 - Event-to-event variation in RSS across different input data
 - Page cache pressure under concurrent load
 
-**Data sources** (in order of preference):
+**Data sources** (unified hierarchy, in order of preference):
 
-1. **Cgroup peak** (from probe jobs): HTCondor's cgroup accounting captures the full memory footprint — process RSS, tmpfs (e.g., gridpack extraction), and page cache. This is the most accurate measurement because it reflects what the cgroup OOM killer actually enforces. Available when probe jobs run in Round 1.
-2. **FJR peak RSS** (from completed work units): The Framework Job Report's `PeakValueRss` measures process RSS only — it misses tmpfs and page cache. Available from Round 2+ via `step_metrics` aggregation. Median of all sampled jobs, robust against outliers.
+1. **Cgroup peak**: HTCondor's cgroup accounting captures the full memory footprint — process RSS, tmpfs (e.g., gridpack extraction), page cache, and subprocess memory. This is the most accurate measurement because it reflects what the cgroup OOM killer actually enforces.
+2. **FJR peak RSS**: The Framework Job Report's `PeakValueRss` measures process RSS only — it misses tmpfs, page cache, and subprocess memory. Peak across all steps and jobs.
+3. **Default**: `default_memory_per_core × cores` when no measurements are available.
 
 **Sizing formula**:
 
 ```
 measured_memory = best available measurement (cgroup or FJR RSS)
 request_memory  = measured_memory × 1.20
-request_memory  = clamp(request_memory, default_memory_per_core × cores, max_memory_per_core × cores)
+request_memory  = clamp(request_memory, MIN_MEMORY_MB, max_memory_per_core × cores)
 ```
+
+Where `MIN_MEMORY_MB` = 4000 MB is a hard floor preventing pathologically small allocations.
 
 If the clamped value at `max_memory_per_core × cores` is still below what the measured data requires, the adaptive algorithm must reduce the number of parallel instances (fewer splits) rather than exceed the memory ceiling.
 
-**Thread count extrapolation**: Memory usage varies with thread count. Two data points enable a linear model:
-
-```
-RSS(threads) = base + per_thread × threads
-```
-
-- **Point 1**: Round 1 measurement (e.g., 8 threads, 2400 MB)
-- **Point 2**: Round 2 measurement at a different thread count (if the sandbox adjusts threads)
-
-With only one data point (common case), the 20% safety margin on the measured value absorbs the extrapolation uncertainty — a percentage scales naturally with job size (unlike a fixed MB buffer).
+With only one round of data (common case), the 20% safety margin absorbs extrapolation uncertainty — a percentage scales naturally with job size (unlike a fixed MB buffer).
 
 ### 5.6 Metric Aggregation
 
@@ -2458,11 +2455,11 @@ The `round` counter increments with each recovery. On round 2+, previous round m
 
 ### 5.7 Convergence
 
-- **Round 1**: Request defaults. May be suboptimal but functional.
-- **Round 2**: Most gains realized — memory sized to actual RSS, per-step splitting applied to inefficient steps.
-- **Round 3+**: Diminishing returns. Metrics refined with more data points but parameters are already near-optimal.
+- **Round 0**: Request defaults. Small pilot (1 WU). Collects baseline metrics.
+- **Round 1**: Most gains realized — memory sized to actual measurements, job splitting applied to inefficient steps, internal parallelism computed.
+- **Round 2+**: Diminishing returns. Metrics refined with more data points but parameters are already near-optimal.
 
-Partial production steps (Section 6.2.1) are natural re-optimization points: after the first 10% completes, the rescue DAG for the remaining 90% carries accumulated metrics. This means the bulk of every workflow benefits from measured data, even on the first submission.
+The multi-round lifecycle means every workflow benefits from measured data for the bulk of its processing — round 0 is intentionally small.
 
 ---
 
@@ -3337,9 +3334,9 @@ measured data for the bulk of its processing.
 
 ### DD-13: Memory-per-core window with 20% safety margin
 
-**Decision**: The adaptive algorithm operates within a `[default_memory_per_core, max_memory_per_core]` window. Round 1 production jobs use `default_memory_per_core` (maximizing site pool), probe jobs use `max_memory_per_core` (headroom for split testing), and Round 2+ sizes memory to measured data + 20% safety margin, clamped within the window. This replaces the previous fixed 512 MB headroom buffer.
+**Decision**: The adaptive algorithm operates within a `[default_memory_per_core, max_memory_per_core]` window. Round 0 uses request defaults, Round 1+ sizes memory to measured data + 20% safety margin, clamped within the window with a 4 GB hard minimum. This replaces the previous fixed 512 MB headroom buffer.
 
-**Why**: CMS sites advertise resources as memory per core with a practical minimum. Requesting more than the minimum narrows the pool of matching sites, creating a tradeoff between accurate memory sizing and scheduling breadth. The two-knob window makes this tradeoff explicit and tunable. The 20% percentage-based margin (rather than fixed MB) scales naturally with job size — it provides proportionally more headroom for memory-heavy jobs and avoids being either too generous for small jobs (512 MB on a 2 GB job is 25%) or too thin for large jobs (512 MB on a 20 GB job is 2.5%). The margin accounts for memory leak accumulation (probes process fewer events than production), event-to-event RSS variation, and page cache pressure under concurrent load.
+**Why**: CMS sites advertise resources as memory per core with a practical minimum. Requesting more than the minimum narrows the pool of matching sites, creating a tradeoff between accurate memory sizing and scheduling breadth. The two-knob window makes this tradeoff explicit and tunable. The 20% percentage-based margin (rather than fixed MB) scales naturally with job size — it provides proportionally more headroom for memory-heavy jobs and avoids being either too generous for small jobs (512 MB on a 2 GB job is 25%) or too thin for large jobs (512 MB on a 20 GB job is 2.5%). The margin accounts for memory leak accumulation (round 0 processes fewer events than production), event-to-event RSS variation, and page cache pressure under concurrent load.
 
 **Rejected alternative**: *Fixed MB headroom* (512 MB above measured peak). Doesn't scale — too large for small jobs, too small for large ones. Also conflated two sources of uncertainty (measurement noise vs. extrapolation error) into a single buffer.
 

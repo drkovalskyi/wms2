@@ -17,7 +17,6 @@ from pathlib import Path
 # Re-export all algorithm functions from core for backward compatibility
 from wms2.core.adaptive import (
     _nearest_power_of_2,
-    analyze_probe_metrics,
     analyze_wu_metrics,
     compute_all_step_split,
     compute_job_split,
@@ -111,36 +110,20 @@ def _replan_cli(args: list[str]) -> None:
         original_nthreads = 1
     print(f"Original nThreads: {original_nthreads}")
 
-    # 1a. Analyze probe metrics (if probe node was used — always in first dir)
-    probe_data = None
+    # Probe node analysis removed — round 0 is the probe, cgroup/FJR data
+    # from normal jobs is sufficient. --probe-node arg kept for backward compat.
     probe_rss_mb = 0.0
     probe_job_peak_total = 0.0
     probe_num_instances = 0
-    exclude_nodes: set[str] | None = None
+    probe_data = None
     if opts.probe_node:
-        print(f"\n--- Analyzing probe metrics ({opts.probe_node}) ---")
-        probe_data = analyze_probe_metrics(wu0_dir, opts.probe_node)
-        if probe_data:
-            probe_rss_mb = probe_data["max_instance_rss_mb"]
-            probe_num_instances = probe_data["num_instances"]
-            print(f"Probe instances: {probe_num_instances}")
-            print(f"Per-instance RSS: {probe_data['per_instance_rss_mb']}")
-            print(f"Max instance RSS: {probe_rss_mb:.0f} MB")
-            if "job_peak_mb" in probe_data:
-                probe_job_peak_total = probe_data["job_peak_mb"]
-                marginal = (probe_job_peak_total - 3000) / probe_num_instances
-                print(f"Job peak: {probe_job_peak_total:.0f} MB total"
-                      f" (marginal: {marginal:.0f} MB/instance after 3 GB shared overhead)")
-            exclude_nodes = {opts.probe_node}
-        else:
-            print(f"WARNING: Probe metrics not found, falling back to theoretical")
+        print(f"NOTE: --probe-node is deprecated (round 0 is the probe)")
 
-    # 1b. Analyze metrics from all prior rounds, merge with normalization
+    # 1. Analyze metrics from all prior rounds, merge with normalization
     print(f"\n--- Analyzing prior round metrics ({len(prior_dirs)} round(s)) ---")
     round_metrics = []
     for rd_idx, rd_dir in enumerate(prior_dirs):
-        # Exclude probe node only from first round (WU0)
-        excl = exclude_nodes if rd_idx == 0 else None
+        excl = None
         rm = analyze_wu_metrics(rd_dir, exclude_nodes=excl)
         round_metrics.append(rm)
         print(f"  Round {rd_idx + 1}: {rm['num_jobs']} jobs, "

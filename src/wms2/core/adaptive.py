@@ -1,31 +1,28 @@
 """Adaptive execution — analyze completed work unit metrics and tune parameters.
 
 Core adaptive algorithms for inter-round optimization. Given metrics from
-completed work units, these functions compute optimal nThreads, memory, and
-job split parameters for the next production round.
+completed work units, these functions compute optimal resource parameters
+for the next production round.
 
-The key insight: CMSSW step efficiency varies widely.  A GEN step may use 55%
-of its 8 allocated threads (4.4 effective cores) while a NANO step uses only
-15% (1.2 effective cores).  Rather than changing the scheduler-visible resource
-footprint (which causes fragmentation), we optimize inside the sandbox by
-telling each cmsRun step to use fewer threads matching its actual parallelism.
+Optimization is composable across independent dimensions:
+  1. Memory sizing   — cgroup/FJR RSS → request_memory with safety margin
+  2. Job splitting   — effective cores → request_cpus reduction, job multiplication
+  3. Internal parallelism — step 0 splitting (N instances) or all-step pipeline split
+  4. Work group sizing — measured output sizes → jobs_per_work_unit
 
-Three optimization modes:
-  per_step    — tune nThreads per step, optionally split step 0 into parallel instances
-  job_split   — more jobs with fewer cores (step-down nThreads, multiply jobs)
-  pipeline_split — N complete pipelines within one sandbox (future)
+Round 0 is the probe — controlled by first_round_work_units (default 1).
+No separate probe node design needed.
 
 Functions:
   analyze_wu_metrics       — read proc_*_metrics.json from a completed merge group
   load_cgroup_metrics      — read proc_*_cgroup.json for subprocess memory data
-  analyze_probe_metrics    — read probe node metrics for memory estimation
   merge_round_metrics      — merge metrics across rounds with normalization
   compute_per_step_nthreads — derive nThreads per step from CPU efficiency
   compute_job_split        — adaptive job split (more jobs, fewer cores)
   compute_all_step_split   — N-pipeline split for all steps
   patch_wu_manifests       — write manifest_tuned.json into merge group dirs
   rewrite_wu_for_job_split — rewrite WU DAG for job split
-  compute_round_optimization — orchestrator for inter-round optimization
+  compute_round_optimization — orchestrator composing all dimensions
 """
 
 from __future__ import annotations
@@ -385,94 +382,6 @@ def load_cgroup_metrics(
 # ── Probe metrics analysis ───────────────────────────────────
 
 
-def analyze_probe_metrics(
-    group_dir: Path, probe_node_name: str,
-) -> dict | None:
-    """Read the probe node's metrics and extract per-instance RSS.
-
-    The probe runs step 0 as 2×(N/2)T parallel instances.  Its metrics file
-    contains TWO entries with step_index=0, each from one instance, with its
-    own peak_rss_mb.
-
-    Returns:
-        {
-            "per_instance_rss_mb": [rss1, rss2],
-            "max_instance_rss_mb": float,
-            "num_instances": int,
-        }
-    or None if probe metrics aren't found.
-    """
-    # Node name is "proc_000001" but metrics file is "proc_1_metrics.json"
-    # (the wrapper uses the integer --node-index, not the 6-digit padded name)
-    idx_match = re.search(r"proc_0*(\d+)$", probe_node_name)
-    node_idx = idx_match.group(1) if idx_match else probe_node_name.replace("proc_", "")
-    probe_file = group_dir / f"proc_{node_idx}_metrics.json"
-
-    # Also check unmerged storage
-    if not probe_file.exists():
-        output_info_path = group_dir / "output_info.json"
-        if output_info_path.exists():
-            try:
-                oi = json.loads(output_info_path.read_text())
-                pfx = oi.get("local_pfn_prefix", "")
-                gi = oi.get("group_index", 0)
-                for ds in oi.get("output_datasets", []):
-                    ub = ds.get("unmerged_lfn_base", "")
-                    if ub and pfx:
-                        udir = Path(pfx) / ub.lstrip("/") / f"{gi:06d}"
-                        candidate = udir / f"proc_{node_idx}_metrics.json"
-                        if candidate.exists():
-                            probe_file = candidate
-                            break
-            except Exception:
-                pass
-
-    if not probe_file.exists():
-        logger.warning("Probe metrics file not found: %s", probe_file)
-        return None
-
-    try:
-        data = json.loads(probe_file.read_text())
-    except Exception as exc:
-        logger.warning("Failed to read probe metrics %s: %s", probe_file, exc)
-        return None
-
-    # Extract step 0 entries (one per parallel instance)
-    step0_rss = []
-    for entry in data:
-        if entry.get("step_index") == 0 and entry.get("peak_rss_mb"):
-            step0_rss.append(entry["peak_rss_mb"])
-
-    if not step0_rss:
-        logger.warning("No step 0 RSS data in probe metrics %s", probe_file)
-        return None
-
-    # Read peak MemoryUsage from HTCondor job log.
-    job_peak_mb = 0.0
-    log_file = group_dir / f"{probe_node_name}.log"
-    if log_file.exists():
-        try:
-            content = log_file.read_text()
-            for m in re.finditer(
-                r"(\d+)\s+-\s+MemoryUsage of job \(MB\)", content
-            ):
-                mb = int(m.group(1))
-                job_peak_mb = max(job_peak_mb, mb)
-        except Exception:
-            pass
-
-    result = {
-        "per_instance_rss_mb": step0_rss,
-        "max_instance_rss_mb": max(step0_rss),
-        "num_instances": len(step0_rss),
-    }
-    if job_peak_mb > 0:
-        result["job_peak_mb"] = job_peak_mb
-        # Per-instance peak memory = total / num_instances
-        result["per_instance_peak_mb"] = job_peak_mb / len(step0_rss)
-    return result
-
-
 # ── Per-step nThreads tuning ─────────────────────────────────
 
 
@@ -696,6 +605,7 @@ def compute_job_split(
     cgroup: dict | None = None,
     last_round_nthreads: int = 0,
     min_threads: int = 2,
+    min_request_cpus: int = 4,
 ) -> dict:
     """Compute adaptive job split: more jobs with fewer cores per job.
 
@@ -703,6 +613,9 @@ def compute_job_split(
     split the jobs themselves — run N× more jobs with N× fewer cores.
     Same total core allocation, but each job finishes independently
     (no tail effect, resources released sooner).
+
+    The min_request_cpus floor (default 4) prevents pool fragmentation —
+    jobs with very few cores are harder to schedule and fragment the pool.
 
     Memory follows spec Section 5.5: clamp(measured × (1 + safety_margin),
     default_per_core × tuned_cores, max_per_core × tuned_cores).
@@ -724,7 +637,9 @@ def compute_job_split(
     eff_cores = mean_eff * original_nthreads
 
     tuned = _nearest_power_of_2(eff_cores)
-    tuned = max(tuned, min_threads)
+    # Enforce both legacy min_threads and new min_request_cpus floor
+    effective_min = max(min_threads, min_request_cpus)
+    tuned = max(tuned, effective_min)
     tuned = min(tuned, original_nthreads)
 
     job_multiplier = original_nthreads // tuned
@@ -743,12 +658,12 @@ def compute_job_split(
                 if tuned * max_memory_per_core_mb >= est_mem:
                     break
                 tuned *= 2
-            tuned = max(tuned, min_threads)
+            tuned = max(tuned, effective_min)
             tuned = min(tuned, original_nthreads)
             job_multiplier = original_nthreads // tuned
         else:
             prev_nt = last_round_nthreads if last_round_nthreads > 0 else original_nthreads
-            min_tuned = max(prev_nt // 2, min_threads)
+            min_tuned = max(prev_nt // 2, effective_min)
             if tuned < min_tuned:
                 tuned = min_tuned
                 job_multiplier = original_nthreads // tuned
@@ -1275,14 +1190,22 @@ def compute_round_optimization(
     default_memory_per_core: int,
     max_memory_per_core: int,
     safety_margin: float = 0.20,
-    adaptive_mode: str = "per_step",
     events_per_job: int = 0,
     jobs_per_wu: int = 8,
+    min_request_cpus: int = 4,
+    # Deprecated — ignored, kept for call-site compatibility
+    adaptive_mode: str = "",
 ) -> dict:
     """Orchestrate inter-round adaptive optimization.
 
-    Reads work unit metrics from completed merge groups, computes optimal
-    parameters for the next round, and returns tuning results.
+    Composes independent optimization dimensions rather than dispatching to
+    one exclusive mode:
+
+      1. Collect and merge metrics from completed work units
+      2. Size memory from unified source hierarchy (cgroup → FJR RSS → default)
+      3. Decide job splitting (effective cores → request_cpus, clamped to min_request_cpus)
+      4. Compute internal parallelism (step 0 instances at the new request_cpus)
+      5. Return unified output dict with all dimensions
 
     Args:
         submit_dir: Path to the DAG's submit directory
@@ -1292,21 +1215,23 @@ def compute_round_optimization(
         default_memory_per_core: Floor memory per core (MB)
         max_memory_per_core: Ceiling memory per core (MB)
         safety_margin: Fractional margin on measured memory
-        adaptive_mode: "per_step" | "job_split" | "pipeline_split"
-        events_per_job: Current events per job (for job_split mode)
-        jobs_per_wu: Jobs per work unit (for job_split mode)
+        events_per_job: Current events per job (for job splitting)
+        jobs_per_wu: Jobs per work unit (for job splitting)
+        min_request_cpus: Floor for request_cpus to avoid pool fragmentation
 
     Returns:
         Dict with tuning results including:
-        - tuned_nthreads: Optimal thread count
+        - tuned_nthreads: Optimal thread count (original unless job split)
         - tuned_memory_mb: Optimal memory (MB)
-        - mode: Which optimization mode was used
+        - tuned_request_cpus: New request_cpus if job split applied
         - per_step: Per-step tuning details
         - metrics_summary: Summary of observed metrics
+        - job_multiplier: Job multiplication factor (1 if no split)
+        - memory_source: Where memory estimate came from
     """
     submit_path = Path(submit_dir)
 
-    # Collect metrics from all completed work units
+    # ── 1. Collect metrics from all completed work units ──
     round_metrics = []
     for wu_name in completed_wus:
         wu_dir = submit_path / wu_name
@@ -1328,14 +1253,16 @@ def compute_round_optimization(
     if not round_metrics:
         logger.warning("No WU metrics found — using defaults")
         return {
-            "mode": adaptive_mode,
             "tuned_nthreads": original_nthreads,
             "tuned_memory_mb": default_memory_per_core * request_cpus,
+            "tuned_request_cpus": request_cpus,
+            "job_multiplier": 1,
             "per_step": {},
             "metrics_summary": None,
+            "memory_source": "default",
         }
 
-    # Merge metrics across work units (normalizing to original nthreads)
+    # ── Merge metrics across work units ──
     merged = merge_round_metrics(round_metrics, original_nthreads)
     cgroup = merged.get("cgroup")
 
@@ -1343,7 +1270,6 @@ def compute_round_optimization(
     max_memory_mb = max_memory_per_core * request_cpus
 
     result = {
-        "mode": adaptive_mode,
         "metrics_summary": {
             "weighted_cpu_eff": merged["weighted_cpu_eff"],
             "effective_cores": merged["effective_cores"],
@@ -1353,8 +1279,28 @@ def compute_round_optimization(
         },
     }
 
-    if adaptive_mode == "job_split" and events_per_job > 0:
-        tuning = compute_job_split(
+    # ── 2. Size memory from unified source hierarchy ──
+    MIN_MEMORY_MB = 4000
+    peak_rss = merged["peak_rss_mb"]
+    if cgroup and cgroup.get("peak_nonreclaim_mb", 0) > 0:
+        measured_mem = int(cgroup["peak_nonreclaim_mb"] * (1.0 + safety_margin))
+        memory_source = "cgroup"
+    elif peak_rss > 0:
+        measured_mem = int(peak_rss * (1.0 + safety_margin))
+        memory_source = "fjr_rss"
+    else:
+        measured_mem = default_memory_mb
+        memory_source = "default"
+
+    tuned_memory_mb = max(MIN_MEMORY_MB, min(measured_mem, max_memory_mb))
+
+    # ── 3. Decide job splitting ──
+    tuned_request_cpus = request_cpus
+    job_multiplier = 1
+    tuned_events_per_job = events_per_job
+
+    if events_per_job > 0:
+        job_split = compute_job_split(
             merged, original_nthreads,
             request_cpus=request_cpus,
             memory_per_core_mb=default_memory_per_core,
@@ -1363,67 +1309,43 @@ def compute_round_optimization(
             num_jobs_wu=jobs_per_wu,
             safety_margin=safety_margin,
             cgroup=cgroup,
+            min_request_cpus=min_request_cpus,
         )
-        result["tuned_nthreads"] = tuning["tuned_nthreads"]
-        result["tuned_memory_mb"] = tuning["new_request_memory_mb"]
-        result["tuned_request_cpus"] = tuning["new_request_cpus"]
-        result["tuned_events_per_job"] = tuning["new_events_per_job"]
-        result["job_multiplier"] = tuning["job_multiplier"]
-        result["per_step"] = {str(k): v for k, v in tuning["per_step"].items()}
-        result["memory_source"] = tuning.get("memory_source", "unknown")
+        if job_split["job_multiplier"] > 1:
+            tuned_request_cpus = job_split["new_request_cpus"]
+            job_multiplier = job_split["job_multiplier"]
+            tuned_events_per_job = job_split["new_events_per_job"]
+            # Job split provides its own memory sizing at tuned_cpus
+            tuned_memory_mb = job_split["new_request_memory_mb"]
+            memory_source = job_split.get("memory_source", memory_source)
 
-    elif adaptive_mode == "pipeline_split":
-        tuning = compute_all_step_split(
-            merged, original_nthreads,
-            request_cpus=request_cpus,
-            request_memory_mb=max_memory_mb,
-            safety_margin=safety_margin,
-        )
-        result["tuned_nthreads"] = original_nthreads
-        result["tuned_memory_mb"] = max_memory_mb
-        result["n_pipelines"] = tuning["n_pipelines"]
-        result["per_step"] = {str(k): v for k, v in tuning["per_step"].items()}
+    # ── 4. Compute internal parallelism (per-step nThreads) ──
+    tuning = compute_per_step_nthreads(
+        merged, original_nthreads,
+        request_cpus=tuned_request_cpus,
+        default_memory_mb=default_memory_per_core * tuned_request_cpus,
+        max_memory_mb=max_memory_per_core * tuned_request_cpus,
+        safety_margin=safety_margin,
+        cgroup=cgroup,
+    )
 
-    else:
-        # Default: per_step mode — tune memory based on observations
-        tuning = compute_per_step_nthreads(
-            merged, original_nthreads,
-            request_cpus=request_cpus,
-            default_memory_mb=default_memory_mb,
-            max_memory_mb=max_memory_mb,
-            safety_margin=safety_margin,
-            cgroup=cgroup,
-        )
-        result["tuned_nthreads"] = original_nthreads
-        result["per_step"] = {str(k): v for k, v in tuning["per_step"].items()}
+    # ── 5. Build unified result ──
+    result["tuned_nthreads"] = tuned_request_cpus
+    result["tuned_memory_mb"] = tuned_memory_mb
+    result["tuned_request_cpus"] = tuned_request_cpus
+    result["job_multiplier"] = job_multiplier
+    result["memory_source"] = memory_source
+    result["per_step"] = {str(k): v for k, v in tuning["per_step"].items()}
 
-        # Compute tuned memory from peak RSS observation.
-        # For per_step mode, nthreads is unchanged so we size memory to
-        # the actual peak. The floor is the measured value with margin
-        # (we have real data, no need for the conservative per-core floor).
-        # A hard minimum of 4 GB prevents pathologically small allocations.
-        MIN_MEMORY_MB = 4000
-        peak_rss = merged["peak_rss_mb"]
-        if cgroup and cgroup.get("peak_nonreclaim_mb", 0) > 0:
-            measured_mem = int(cgroup["peak_nonreclaim_mb"] * (1.0 + safety_margin))
-            result["memory_source"] = "cgroup"
-        elif peak_rss > 0:
-            measured_mem = int(peak_rss * (1.0 + safety_margin))
-            result["memory_source"] = "fjr_rss"
-        else:
-            measured_mem = default_memory_mb
-            result["memory_source"] = "default"
-
-        result["tuned_memory_mb"] = max(
-            MIN_MEMORY_MB,
-            min(measured_mem, max_memory_mb),
-        )
+    if job_multiplier > 1:
+        result["tuned_events_per_job"] = tuned_events_per_job
 
     logger.info(
-        "Adaptive optimization (%s): nthreads=%d, memory=%d MB, cpu_eff=%.1f%%",
-        adaptive_mode,
-        result["tuned_nthreads"],
-        result["tuned_memory_mb"],
+        "Adaptive optimization: cpus=%d→%d, memory=%d MB [%s], "
+        "job_multiplier=%d, cpu_eff=%.1f%%",
+        request_cpus, tuned_request_cpus,
+        tuned_memory_mb, memory_source,
+        job_multiplier,
         merged["weighted_cpu_eff"] * 100,
     )
 

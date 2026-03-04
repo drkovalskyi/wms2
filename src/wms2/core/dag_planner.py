@@ -282,28 +282,24 @@ class DAGPlanner:
                     old_mem = resource_params.get("memory_mb", memory_mb)
                     resource_params["memory_mb"] = int(tuned_memory)
                     logger.info(
-                        "Adaptive: memory %s -> %d MB (mode=%s, source=%s)",
+                        "Adaptive: memory %s -> %d MB [%s]",
                         old_mem, tuned_memory,
-                        adaptive_params.get("mode", "?"),
                         adaptive_params.get("memory_source", "?"),
                     )
 
-                # For job_split mode: override cpus and events_per_job
-                mode = adaptive_params.get("mode", "per_step")
-                if mode == "job_split":
-                    tuned_cpus = adaptive_params.get("tuned_request_cpus")
-                    if tuned_cpus and tuned_cpus > 0:
-                        resource_params["ncpus"] = int(tuned_cpus)
-                    tuned_epj = adaptive_params.get("tuned_events_per_job")
-                    if tuned_epj and tuned_epj > 0:
-                        params = workflow.splitting_params or {}
-                        params["events_per_job"] = tuned_epj
-                        # Update jobs_per_work_unit based on multiplier
-                        multiplier = adaptive_params.get("job_multiplier", 1)
-                        if multiplier > 1:
-                            resource_params["_jobs_per_wu_override"] = (
-                                self.settings.jobs_per_work_unit * multiplier
-                            )
+                # Apply job splitting (unified — no mode dispatch)
+                tuned_cpus = adaptive_params.get("tuned_request_cpus")
+                if tuned_cpus and tuned_cpus > 0:
+                    resource_params["ncpus"] = int(tuned_cpus)
+                tuned_epj = adaptive_params.get("tuned_events_per_job")
+                if tuned_epj and tuned_epj > 0:
+                    params = workflow.splitting_params or {}
+                    params["events_per_job"] = tuned_epj
+                multiplier = adaptive_params.get("job_multiplier", 1)
+                if multiplier > 1:
+                    resource_params["_jobs_per_wu_override"] = (
+                        self.settings.jobs_per_work_unit * multiplier
+                    )
 
         # Plan merge groups (after resource_params is fully built)
         jobs_per_wu = resource_params.pop("_jobs_per_wu_override", None)

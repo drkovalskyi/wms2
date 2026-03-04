@@ -60,7 +60,7 @@ async def lifecycle_settings(request: Request):
         "pileup_remote_read": s.pileup_remote_read,
         "error_hold_threshold": s.error_hold_threshold,
         "error_max_rescue_attempts": s.error_max_rescue_attempts,
-        "adaptive_mode": s.adaptive_mode,
+        "min_request_cpus": s.min_request_cpus,
         "default_memory_per_core": s.default_memory_per_core,
         "max_memory_per_core": s.max_memory_per_core,
         "safety_margin": s.safety_margin,

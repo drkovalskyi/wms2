@@ -111,50 +111,33 @@
                 </div>
             </template>
 
-            <!-- Adaptive optimization -->
+            <!-- Adaptive optimization — current result summary -->
             <template x-if="adaptiveInfo">
                 <div class="section">
                     <h3>Adaptive Optimization</h3>
-                    <p style="font-size:0.85rem; opacity:0.7; margin-bottom:0.5rem;">
-                        Applied after round 0 based on measured job performance
-                    </p>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Parameter</th>
-                                <th>Original</th>
-                                <th>Optimized</th>
-                                <th>Change</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                                <td>Memory (MB)</td>
-                                <td x-text="fmtNum(adaptiveInfo.original_memory)"></td>
-                                <td><strong x-text="fmtNum(adaptiveInfo.tuned_memory)"></strong></td>
-                                <td>
-                                    <template x-if="adaptiveInfo.original_memory && adaptiveInfo.tuned_memory">
-                                        <span :style="adaptiveInfo.tuned_memory < adaptiveInfo.original_memory ? 'color:#16a34a' : 'color:#dc2626'"
-                                              x-text="(adaptiveInfo.tuned_memory < adaptiveInfo.original_memory ? '' : '+') + (((adaptiveInfo.tuned_memory - adaptiveInfo.original_memory) / adaptiveInfo.original_memory) * 100).toFixed(0) + '%'"></span>
-                                    </template>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Threads</td>
-                                <td x-text="adaptiveInfo.original_nthreads"></td>
-                                <td><strong x-text="adaptiveInfo.tuned_nthreads"></strong></td>
-                                <td>
-                                    <template x-if="adaptiveInfo.original_nthreads !== adaptiveInfo.tuned_nthreads">
-                                        <span x-text="adaptiveInfo.tuned_nthreads - adaptiveInfo.original_nthreads"></span>
-                                    </template>
-                                    <template x-if="adaptiveInfo.original_nthreads === adaptiveInfo.tuned_nthreads">
-                                        <span style="opacity:0.5">unchanged</span>
-                                    </template>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                    <dl class="detail-grid" style="margin-top:0.5rem;">
+                    <dl class="detail-grid">
+                        <dt>Memory Source</dt>
+                        <dd x-text="adaptiveInfo.memory_source || adaptiveInfo.mode || '—'"></dd>
+                        <dt>Request Memory</dt>
+                        <dd><span x-text="fmtNum(adaptiveInfo.original_memory)"></span> MB</dd>
+                        <dt>Tuned Memory</dt>
+                        <dd>
+                            <strong x-text="fmtNum(adaptiveInfo.tuned_memory)"></strong> MB
+                            <template x-if="adaptiveInfo.original_memory && adaptiveInfo.tuned_memory">
+                                <span style="margin-left:0.25rem;"
+                                      :style="adaptiveInfo.tuned_memory < adaptiveInfo.original_memory ? 'color:#16a34a' : 'color:#dc2626'"
+                                      x-text="'(' + (adaptiveInfo.tuned_memory < adaptiveInfo.original_memory ? '' : '+') + (((adaptiveInfo.tuned_memory - adaptiveInfo.original_memory) / adaptiveInfo.original_memory) * 100).toFixed(0) + '%)'"></span>
+                            </template>
+                        </dd>
+                        <dt>Request Threads</dt>
+                        <dd x-text="adaptiveInfo.original_nthreads"></dd>
+                        <dt>Tuned Threads</dt>
+                        <dd>
+                            <strong x-text="adaptiveInfo.tuned_nthreads"></strong>
+                            <template x-if="adaptiveInfo.original_nthreads !== adaptiveInfo.tuned_nthreads">
+                                <span style="margin-left:0.25rem;" x-text="'(' + (adaptiveInfo.tuned_nthreads - adaptiveInfo.original_nthreads) + ')'"></span>
+                            </template>
+                        </dd>
                         <template x-if="adaptiveInfo.peak_rss">
                             <div style="display:contents;">
                                 <dt>Measured Peak RSS</dt>
@@ -163,13 +146,44 @@
                         </template>
                         <template x-if="adaptiveInfo.cpu_eff != null">
                             <div style="display:contents;">
-                                <dt>CPU Efficiency</dt>
+                                <dt>Weighted CPU Eff</dt>
                                 <dd x-text="fmtPct(adaptiveInfo.cpu_eff * 100)"></dd>
                             </div>
                         </template>
                         <dt>Memory Source</dt>
                         <dd x-text="adaptiveInfo.memory_source || '—'"></dd>
                     </dl>
+
+                    <!-- Per-step adaptive detail -->
+                    <template x-if="adaptiveInfo.per_step">
+                        <div style="margin-top:0.75rem;">
+                            <h4 style="font-size:0.9rem; margin-bottom:0.25rem;">Per-Step Tuning</h4>
+                            <table style="font-size:0.85rem;">
+                                <thead>
+                                    <tr>
+                                        <th>Step</th>
+                                        <th>CPU Eff</th>
+                                        <th>Eff Cores</th>
+                                        <th>Tuned Threads</th>
+                                        <th>Parallel</th>
+                                        <th>Overcommit</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="[sn, sd] in Object.entries(adaptiveInfo.per_step).sort((a,b) => Number(a[0]) - Number(b[0]))" :key="sn">
+                                        <tr>
+                                            <td x-text="'Step ' + sn"></td>
+                                            <td x-text="sd.cpu_eff != null ? fmtPct(sd.cpu_eff * 100) : '—'"></td>
+                                            <td x-text="sd.effective_cores != null ? sd.effective_cores.toFixed(1) : '—'"></td>
+                                            <td x-text="sd.tuned_nthreads || '—'"></td>
+                                            <td x-text="sd.n_parallel || 1"></td>
+                                            <td x-text="sd.overcommit_applied ? 'yes' : 'no'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
                 </div>
             </template>
 
@@ -205,43 +219,98 @@
                 </div>
             </div>
 
-            <!-- Step metrics -->
-            <template x-if="stepMetrics.length > 0">
+            <!-- Step metrics with round selector -->
+            <template x-if="stepMetrics.length > 0 || metricsRoundOptions.length > 0">
                 <div class="section">
-                    <h3>Step Metrics</h3>
-                    <table>
+                    <div style="display:flex; align-items:center; gap:0.75rem; margin-bottom:0.5rem;">
+                        <h3 style="margin:0;">Step Metrics</h3>
+                        <template x-if="metricsRoundOptions.length > 1">
+                            <select x-model="selectedMetricsRound"
+                                    style="font-size:0.85rem; padding:0.15rem 0.4rem; border-radius:3px; border:1px solid var(--pico-muted-border-color);">
+                                <option value="all">All Rounds</option>
+                                <template x-for="rk in metricsRoundOptions" :key="rk">
+                                    <option :value="rk" x-text="'Round ' + rk"></option>
+                                </template>
+                            </select>
+                        </template>
+                    </div>
+                    <template x-if="stepMetrics.length > 0">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Step</th>
+                                    <th>Avg CPU Eff</th>
+                                    <th>Avg Memory (MB)</th>
+                                    <th>Avg Time/Event (s)</th>
+                                    <th>Avg Throughput</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="m in stepMetrics" :key="m.step">
+                                    <tr>
+                                        <td x-text="m.step"></td>
+                                        <td x-text="m.avg_cpu_efficiency != null ? fmtPct(m.avg_cpu_efficiency) : '—'"></td>
+                                        <td x-text="m.avg_peak_rss != null ? fmtNum(Math.round(m.avg_peak_rss)) : '—'"></td>
+                                        <td x-text="m.avg_time_per_event != null ? Number(m.avg_time_per_event).toFixed(2) : '—'"></td>
+                                        <td x-text="m.avg_throughput != null ? Number(m.avg_throughput).toFixed(1) : '—'"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </template>
+                    <template x-if="stepMetrics.length === 0">
+                        <p style="opacity:0.6; font-size:0.85rem;">No metrics for this round.</p>
+                    </template>
+                </div>
+            </template>
+
+            <!-- Round Performance History (from step_metrics.rounds) -->
+            <template x-if="roundOptimizationHistory.length > 0">
+                <div class="section">
+                    <h3>Round Performance</h3>
+                    <div style="overflow-x:auto;">
+                    <table style="font-size:0.85rem;">
                         <thead>
                             <tr>
-                                <th>Step</th>
+                                <th>Round</th>
+                                <th>WUs</th>
+                                <th>Done</th>
+                                <th>Failed</th>
+                                <th>Memory (MB)</th>
+                                <th>Threads</th>
                                 <th>Avg CPU Eff</th>
-                                <th>Avg Memory (MB)</th>
-                                <th>Avg Time/Event (s)</th>
-                                <th>Avg Throughput</th>
+                                <th>Peak RSS (MB)</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <template x-for="m in stepMetrics" :key="m.step">
+                            <template x-for="r in roundOptimizationHistory" :key="r.round">
                                 <tr>
-                                    <td x-text="m.step"></td>
-                                    <td x-text="m.avg_cpu_efficiency != null ? fmtPct(m.avg_cpu_efficiency) : '—'"></td>
-                                    <td x-text="m.avg_peak_rss != null ? fmtNum(Math.round(m.avg_peak_rss)) : '—'"></td>
-                                    <td x-text="m.avg_time_per_event != null ? Number(m.avg_time_per_event).toFixed(2) : '—'"></td>
-                                    <td x-text="m.avg_throughput != null ? Number(m.avg_throughput).toFixed(1) : '—'"></td>
+                                    <td>
+                                        <a href="#" @click.prevent="selectedMetricsRound = String(r.round)"
+                                           x-text="r.round" title="Click to filter Step Metrics"></a>
+                                    </td>
+                                    <td x-text="r.work_units"></td>
+                                    <td x-text="r.nodes_done"></td>
+                                    <td x-text="r.nodes_failed"></td>
+                                    <td x-text="fmtNum(r.memory_used)"></td>
+                                    <td x-text="r.threads_used"></td>
+                                    <td x-text="r.cpu_eff != null ? fmtPct(r.cpu_eff * 100) : '—'"></td>
+                                    <td x-text="r.peak_rss ? fmtNum(r.peak_rss) : '—'"></td>
                                 </tr>
                             </template>
                         </tbody>
                     </table>
+                    </div>
                 </div>
             </template>
 
-            <!-- Rounds / DAG history -->
+            <!-- DAG History (all DAGs in chronological order) -->
             <template x-if="allDags.length > 0">
                 <div class="section">
-                    <h3>Rounds</h3>
-                    <table>
+                    <h3>DAG History</h3>
+                    <table style="font-size:0.85rem;">
                         <thead>
                             <tr>
-                                <th>Round</th>
                                 <th>Status</th>
                                 <th>Work Units</th>
                                 <th>Nodes Done</th>
@@ -251,9 +320,8 @@
                             </tr>
                         </thead>
                         <tbody>
-                            <template x-for="(d, idx) in allDags" :key="d.id">
+                            <template x-for="d in [...allDags].reverse()" :key="d.id">
                                 <tr>
-                                    <td x-text="idx"></td>
                                     <td x-html="statusBadge(d.status)"></td>
                                     <td x-text="d.total_work_units || 0"></td>
                                     <td x-text="d.nodes_done || 0"></td>

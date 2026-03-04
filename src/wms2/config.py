@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     default_memory_per_core: int = 2000    # MB, floor for request_memory
     max_memory_per_core: int = 3000        # MB, ceiling for request_memory
     safety_margin: float = 0.20            # fractional margin on measured memory
-    adaptive_mode: str = "per_step"        # per_step | job_split | pipeline_split
+    min_request_cpus: int = 4              # floor for job splitting (avoids pool fragmentation)
 
     # API
     api_prefix: str = "/api/v1"

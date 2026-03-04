@@ -105,9 +105,9 @@ def _compute_adaptive_params(config, dag, workflow, new_metrics, settings):
             default_memory_per_core=settings.default_memory_per_core,
             max_memory_per_core=settings.max_memory_per_core,
             safety_margin=settings.safety_margin,
-            adaptive_mode=settings.adaptive_mode,
             events_per_job=events_per_job,
             jobs_per_wu=settings.jobs_per_work_unit,
+            min_request_cpus=settings.min_request_cpus,
         )
     except Exception:
         logger.exception("Adaptive optimization failed — using defaults")
@@ -170,19 +170,43 @@ async def complete_round(repo, settings, workflow, dag):
         wu_metrics_list=wu_metrics_list or None,
     )
 
+    # ── Store resource params used for this round ──
+    # Round 0 uses original request params; round 1+ uses previous adaptive
+    prev_ap = (workflow.step_metrics or {}).get("adaptive_params")
+    if current_round == 0 or not prev_ap:
+        resource_params = {
+            "memory_mb": int(config.get("memory_mb", 0)),
+            "nthreads": int(config.get("multicore", 0)),
+        }
+    else:
+        resource_params = {
+            "memory_mb": prev_ap.get("tuned_memory_mb",
+                                     int(config.get("memory_mb", 0))),
+            "nthreads": prev_ap.get("tuned_nthreads",
+                                    int(config.get("multicore", 0))),
+        }
+    round_key = str(current_round)
+    if round_key in new_metrics.get("rounds", {}):
+        new_metrics["rounds"][round_key]["resource_params"] = resource_params
+
     # ── Adaptive optimization ──
     adaptive_params = _compute_adaptive_params(
         config, dag, workflow, new_metrics, settings
     )
     if adaptive_params:
         new_metrics["adaptive_params"] = adaptive_params
+        # Also store per-round for history
+        if round_key in new_metrics.get("rounds", {}):
+            new_metrics["rounds"][round_key]["adaptive_params"] = adaptive_params
         logger.info(
-            "Workflow %s: adaptive optimization — nthreads=%d, memory=%d MB, "
-            "mode=%s, cpu_eff=%.1f%%",
+            "Workflow %s: adaptive optimization — cpus=%d, memory=%d MB [%s], "
+            "job_multiplier=%d, cpu_eff=%.1f%%",
             workflow.request_name,
-            adaptive_params.get("tuned_nthreads", 0),
+            adaptive_params.get("tuned_request_cpus",
+                                adaptive_params.get("tuned_nthreads", 0)),
             adaptive_params.get("tuned_memory_mb", 0),
-            adaptive_params.get("mode", "?"),
+            adaptive_params.get("memory_source", "?"),
+            adaptive_params.get("job_multiplier", 1),
             (adaptive_params.get("metrics_summary", {}) or {}).get(
                 "weighted_cpu_eff", 0
             ) * 100,

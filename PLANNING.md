@@ -36,6 +36,16 @@ Build observability for WMS2:
 - HTCondor queue overview (running/idle/held by workflow)
 - Technology TBD (Prometheus + Grafana, or simple web UI, or CLI status command)
 
+## Develop Next
+
+- Add configuration control to enable tmpfs for gridpacks in UI.
+- Make sure that work group size is optimized once after the pilot round to
+  get optimal merged output size.
+- Add support for TaskChain. Same approach as for StepChain, i.e. build work
+  units representing one merge group. The only difference is that the dagman
+  will now have instead of single layer of processing nodes, a chain of nodes
+  representing each task.
+
 ## Future improvements (not fixing now)
 
 - **Pileup (secondary input) site selection** — configure CMSSW to prefer
