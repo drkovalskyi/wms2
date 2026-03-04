@@ -251,6 +251,19 @@
                             <span x-text="settings.stageout_mode"></span>
                         </template>
                     </dd>
+                    <dt>Pileup Remote Read</dt>
+                    <dd>
+                        <template x-if="editing">
+                            <select class="settings-input" x-model="editValues.pileup_remote_read"
+                                    x-init="$watch('editValues.pileup_remote_read', v => editValues.pileup_remote_read = (v === true || v === 'true'))">
+                                <option :value="true">true (global redirector)</option>
+                                <option :value="false">false (local catalog)</option>
+                            </select>
+                        </template>
+                        <template x-if="!editing">
+                            <span x-text="settings.pileup_remote_read ? 'true (global redirector)' : 'false (local catalog)'"></span>
+                        </template>
+                    </dd>
                     <dt>HTCondor Host</dt>
                     <dd x-text="settings.condor_host"></dd>
                     <dt>Schedd</dt>

@@ -6,6 +6,42 @@
 
 ---
 
+## 2026-03-04 — Add configurable pileup remote read via global redirector
+
+### What was done
+
+Added `pileup_remote_read` setting to control how pileup files are accessed by
+CMSSW jobs. When `true` (default), pileup LFNs are prefixed with
+`root://cms-xrd-global.cern.ch/` at PSet injection time so CMSSW reads them via
+the CMS global XRootD redirector (AAA). When `false`, LFNs are left bare and
+resolved through the site's trivialcatalog (`storage.xml`), requiring local
+replicas.
+
+**Root cause**: proc_000073 in DAG `ae80b35e` (round 13) failed because
+`storage.xml` resolves pileup LFNs to `root://localhost:1094/` (local XRootD),
+but no pileup files exist locally. Real CMS sites keep `storage.xml` pointing to
+local storage — pileup access requires an explicit mechanism to use the global
+redirector, same as the existing `lfn_to_xrootd()` pattern for primary inputs.
+
+### Changes
+
+- **`config.py`**: Added `pileup_remote_read: bool = True` setting, controllable
+  via `WMS2_PILEUP_REMOTE_READ` env var
+- **`dag_planner.py`**: Added `--pileup-remote-read` CLI flag to proc script;
+  both PSet injection sites (single-pipeline and parallel-instance paths) now
+  conditionally prefix pileup LFNs based on the flag; threaded setting through
+  `plan_production_dag` → `_generate_dag_files` → `_generate_group_dag` → proc args
+- **`api/lifecycle.py`**: Added `pileup_remote_read` as live-editable setting
+- **Settings UI**: Added toggle (true = global redirector, false = local catalog)
+
+### Verification
+
+- All 5 matrix smoke tests pass (100.0, 150.0, 500.0, 501.0, 510.0)
+- Confirmed `--pileup-remote-read` appears in generated submit files
+- Setting controllable via env var, REST API, or web UI
+
+---
+
 ## 2026-03-04 — Fix adaptive memory using max cgroup peak across all WUs
 
 ### What was done

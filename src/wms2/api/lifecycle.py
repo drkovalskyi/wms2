@@ -28,6 +28,7 @@ EDITABLE_FIELDS = {
     "log_level": (str, lambda v: v.upper() in ("DEBUG", "INFO", "WARNING", "ERROR")),
     "default_pilot_priority": (int, lambda v: True),
     "stageout_mode": (str, lambda v: v in ("local", "grid")),
+    "pileup_remote_read": (bool, lambda v: isinstance(v, bool)),
 }
 
 
@@ -56,6 +57,7 @@ async def lifecycle_settings(request: Request):
         "submit_base_dir": s.submit_base_dir,
         "local_pfn_prefix": s.local_pfn_prefix,
         "stageout_mode": s.stageout_mode,
+        "pileup_remote_read": s.pileup_remote_read,
         "error_hold_threshold": s.error_hold_threshold,
         "error_max_rescue_attempts": s.error_max_rescue_attempts,
         "adaptive_mode": s.adaptive_mode,

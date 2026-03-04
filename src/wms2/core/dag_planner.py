@@ -356,7 +356,7 @@ class DAGPlanner:
                             if preferred:
                                 logger.info("Pileup %s: %d files at preferred RSEs %s", ds, len(files), preferred)
                             else:
-                                logger.info("Pileup %s: %d on-disk files", ds, len(files))
+                                logger.info("Pileup %s: %d files", ds, len(files))
                         except Exception:
                             logger.warning(
                                 "Rucio pileup query failed for %s", ds, exc_info=True
@@ -404,6 +404,7 @@ class DAGPlanner:
             job_priority=job_priority,
             extra_classads=config.get("extra_classads"),
             stageout_mode=self.settings.stageout_mode,
+            pileup_remote_read=self.settings.pileup_remote_read,
         )
 
         # 8. Count totals
@@ -742,6 +743,7 @@ def _generate_dag_files(
     job_priority: int = 0,
     extra_classads: dict[str, str] | None = None,
     stageout_mode: str = "local",
+    pileup_remote_read: bool = True,
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -799,6 +801,7 @@ def _generate_dag_files(
             job_priority=job_priority,
             extra_classads=extra_classads,
             stageout_mode=stageout_mode,
+            pileup_remote_read=pileup_remote_read,
         )
 
     # Category throttling for merge groups
@@ -829,6 +832,7 @@ def _generate_group_dag(
     job_priority: int = 0,
     extra_classads: dict[str, str] | None = None,
     stageout_mode: str = "local",
+    pileup_remote_read: bool = True,
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
     exe = executables or {}
@@ -980,6 +984,8 @@ def _generate_group_dag(
             proc_args += f" --test-fraction {rp['test_fraction']}"
         # filter_efficiency is handled at planning time (inflating total_events),
         # not at execution time. No --filter-eff arg needed.
+        if pileup_remote_read:
+            proc_args += " --pileup-remote-read"
 
         _write_submit_file(
             str(group_dir / f"{node_name}.sub"),
@@ -1343,6 +1349,7 @@ OUTPUT_INFO=""
 OVERRIDE_NCPUS=0
 TEST_FRACTION=0
 FILTER_EFF=1.0  # kept for backward compat; no longer used in PSet injection
+PILEUP_REMOTE_READ=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1357,6 +1364,7 @@ while [[ $# -gt 0 ]]; do
         --ncpus)      OVERRIDE_NCPUS="$2"; shift 2 ;;
         --test-fraction) TEST_FRACTION="$2"; shift 2 ;;
         --filter-eff)  FILTER_EFF="$2";    shift 2 ;;
+        --pileup-remote-read) PILEUP_REMOTE_READ=true; shift ;;
         *)            echo "Unknown arg: $1" >&2; shift ;;
     esac
 done
@@ -2003,14 +2011,21 @@ if _pu_found:
             lines.append('    _pu_list = _pu_data.get(\"' + _ds + '\", [])')
             lines.append('    if _pu_list:')
             lines.append('        _purandom.shuffle(_pu_list)')
+            lines.append('        _pu_remote = (\"$PILEUP_REMOTE_READ\" == \"true\")')
+            lines.append('        if _pu_remote:')
+            lines.append('            _pu_prefix = \"root://cms-xrd-global.cern.ch/\"')
+            lines.append('            _pu_pfns = [(_pu_prefix + f if not f.startswith(\"root://\") else f) for f in _pu_list]')
+            lines.append('        else:')
+            lines.append('            _pu_pfns = _pu_list')
             lines.append('        for _mixer in [\"mixData\", \"mix\"]:')
             lines.append('            _mobj = getattr(process, _mixer, None)')
             lines.append('            if _mobj is None: continue')
             lines.append('            _inp = getattr(_mobj, \"input\", None) or getattr(_mobj, \"secsource\", None)')
             lines.append('            if _inp is None: continue')
             lines.append('            _inp.fileNames = cms.untracked.vstring()')
-            lines.append('            for _lfn in _pu_list: _inp.fileNames.append(str(_lfn))')
-            lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_list)) + \" on-disk pileup files\")')
+            lines.append('            for _pfn in _pu_pfns: _inp.fileNames.append(str(_pfn))')
+            lines.append('            _how = (\"via global redirector\" if _pu_remote else \"via local catalog\")')
+            lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_pfns)) + \" pileup files \" + _how)')
 
 with open(pset, 'a') as f:
     f.write(chr(10).join(lines) + chr(10))
@@ -2328,14 +2343,21 @@ if _pu_found:
             lines.append('    _pu_list = _pu_data.get(\"' + _ds + '\", [])')
             lines.append('    if _pu_list:')
             lines.append('        _purandom.shuffle(_pu_list)')
+            lines.append('        _pu_remote = (\"$PILEUP_REMOTE_READ\" == \"true\")')
+            lines.append('        if _pu_remote:')
+            lines.append('            _pu_prefix = \"root://cms-xrd-global.cern.ch/\"')
+            lines.append('            _pu_pfns = [(_pu_prefix + f if not f.startswith(\"root://\") else f) for f in _pu_list]')
+            lines.append('        else:')
+            lines.append('            _pu_pfns = _pu_list')
             lines.append('        for _mixer in [\"mixData\", \"mix\"]:')
             lines.append('            _mobj = getattr(process, _mixer, None)')
             lines.append('            if _mobj is None: continue')
             lines.append('            _inp = getattr(_mobj, \"input\", None) or getattr(_mobj, \"secsource\", None)')
             lines.append('            if _inp is None: continue')
             lines.append('            _inp.fileNames = cms.untracked.vstring()')
-            lines.append('            for _lfn in _pu_list: _inp.fileNames.append(str(_lfn))')
-            lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_list)) + \" on-disk pileup files\")')
+            lines.append('            for _pfn in _pu_pfns: _inp.fileNames.append(str(_pfn))')
+            lines.append('            _how = (\"via global redirector\" if _pu_remote else \"via local catalog\")')
+            lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_pfns)) + \" pileup files \" + _how)')
 
 with open(pset, 'a') as f:
     f.write(chr(10).join(lines) + chr(10))

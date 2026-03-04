@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # Example: "T2_CH_CERN,T1_US_FNAL_Disk"
     pileup_preferred_rses: str = ""
 
+    # Pileup remote read — when True (default), pileup file LFNs are prefixed
+    # with root://cms-xrd-global.cern.ch/ so CMSSW reads them via the global
+    # redirector (AAA).  When False, LFNs are left bare and resolved through
+    # the site's trivialcatalog (storage.xml), requiring local replicas.
+    pileup_remote_read: bool = True
+
     # Work unit sizing
     jobs_per_work_unit: int = 8  # processing jobs per merge group
     first_round_work_units: int = 1  # work units for round 0 (pilot)
