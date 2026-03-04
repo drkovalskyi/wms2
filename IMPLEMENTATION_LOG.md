@@ -1,8 +1,59 @@
 # WMS2 — Implementation Log
 
-**Date**: 2026-03-02
+**Date**: 2026-03-04
 **Spec Version**: 2.4.0
 **Phase**: 1 — Project Scaffold and Foundation
+
+---
+
+## 2026-03-04 — OOM recovery for cgroup-held jobs + UI hold reason display
+
+### What was done
+
+When HTCondor holds a job for exceeding cgroup memory limit (HoldReasonCode 34),
+the POST script never fires (it only runs on termination), so the DAG gets stuck
+forever. Added automatic OOM recovery to the DAG Monitor.
+
+1. **Condor adapter — held job helpers** (`src/wms2/adapters/condor.py`, `base.py`, `mock.py`):
+   - `_query_dag_jobs_sync()` now includes `HoldReason` and `HoldReasonCode` in
+     projection; held jobs expose `hold_reason` and `hold_reason_code` in response dict
+   - New `query_held_jobs(cluster_id)` — queries held payload jobs under DAG hierarchy
+   - New `edit_job_attr(constraint, attr, value)` — wraps `schedd.edit()`
+   - New `release_jobs(constraint)` — wraps `schedd.act(JobAction.Release)`
+   - Base class has default no-ops; mock records calls and supports `_held_jobs` attribute
+
+2. **OOM recovery in DAG Monitor** (`src/wms2/core/dag_monitor.py`):
+   - `__init__` takes optional `settings` param (for `max_memory_per_core`)
+   - New `_handle_held_oom_jobs(dag)` — called from `poll_dag()` when `held > 0`:
+     filters for HoldReasonCode 34, bumps `request_memory` by 50% (capped at
+     `max_memory_per_core × cpus`), updates `.sub` file on disk, releases job
+   - Static `_update_sub_file_memory(sub_path, new_mem)` helper
+   - Jobs already at memory cap are logged as warnings and left held
+
+3. **Lifecycle manager + CLI** (`lifecycle_manager.py`, `cli.py`):
+   - Both now pass `settings` to `DAGMonitor` constructor
+
+4. **UI enhancements** (`dag_detail.html`, `dag-detail.js`):
+   - Jobs table: new "Details" column shows `hold_reason` for held jobs (truncated
+     with full text as tooltip)
+   - Node names are clickable links → `jumpToNodeLog(nodeName)` opens the Node Event
+     Log section, sets filter to that node, and smooth-scrolls to it
+   - Node Event Log section has `data-section="node-event-log"` for scroll targeting
+
+### Design decisions
+
+- **50% bump with cap**: Same multiplier as POST script (`old_mem * 3 / 2`), capped at
+  `max_memory_per_core × cpus` to avoid requesting unreasonable memory. If already at
+  cap, the job stays held for operator intervention.
+- **No separate propagation needed**: After bump + release, the job retries with more
+  memory. Its metrics naturally reflect the higher usage. `complete_round()` picks it
+  up via the normal adaptive path.
+- **Sub file update**: Same pattern as POST script — regex replace `request_memory = N`
+  in the `.sub` file so DAGMan retries also use the bumped value.
+
+### Verification
+
+- All 5 smoke tests pass (100.0, 150.0, 500.0, 501.0, 510.0)
 
 ---
 
