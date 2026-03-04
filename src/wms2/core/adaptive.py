@@ -286,9 +286,19 @@ def merge_round_metrics(round_metrics: list[dict], original_nthreads: int) -> di
         "num_jobs": latest["num_jobs"],
         "nthreads": original_nthreads,
     }
-    # Propagate cgroup data from latest round (most recent measurement)
-    if "cgroup" in latest:
-        result["cgroup"] = latest["cgroup"]
+    # Propagate cgroup data — use max peak_nonreclaim_mb across ALL entries,
+    # not just the latest.  Each entry is one work unit; completion order is
+    # arbitrary, so taking the last one's cgroup would pick a random WU's peak
+    # instead of the true worst-case.
+    best_cgroup = None
+    best_peak = 0
+    for rm in round_metrics:
+        cg = rm.get("cgroup")
+        if cg and cg.get("peak_nonreclaim_mb", 0) > best_peak:
+            best_peak = cg["peak_nonreclaim_mb"]
+            best_cgroup = cg
+    if best_cgroup:
+        result["cgroup"] = best_cgroup
     return result
 
 
