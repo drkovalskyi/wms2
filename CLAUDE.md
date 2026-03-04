@@ -65,6 +65,29 @@ This is the main deliverable. It is a comprehensive design spec (~3100 lines) co
 - **Section 16**: Design decisions (rationale for key choices, rejected alternatives)
 - **Appendices A–C**: WMCore mapping, ReqMgr2 schema, DAGMan file format
 
+## Service architecture
+
+WMS2 runs as a single uvicorn process:
+
+```bash
+uvicorn wms2.main:create_app --factory --host 0.0.0.0 --port 8080
+```
+
+**Continuously running background tasks** (launched via `asyncio.create_task()` in FastAPI lifespan):
+
+| Task | Interval | What it does |
+|------|----------|-------------|
+| Lifecycle Manager | 60s (`WMS2_LIFECYCLE_CYCLE_INTERVAL`) | Evaluates all non-terminal requests each cycle — polls DAGs, handles completions, triggers replanning, error recovery |
+| CRIC Sync | 1h (`WMS2_CRIC_SYNC_INTERVAL`) | Fetches CMS site configuration from CRIC into the DB |
+
+**Stateless worker components** (rebuilt each lifecycle cycle with a fresh DB session):
+- DAGMonitor, DAGPlanner, ErrorHandler, OutputManager, WorkflowManager, SiteManager
+
+**Also in the same process:**
+- REST API at `/api/v1/` (requests, workflows, DAGs, imports, settings)
+- Web UI at `/ui/` (dashboard, DAG detail pages)
+- Lifecycle control: `GET/PATCH /api/v1/lifecycle/settings`, `POST /api/v1/lifecycle/restart`
+
 ## Key architectural concepts
 
 - **Request Lifecycle Manager**: Single owner of every request's state machine. Replaces distributed polling loops. All other components are workers called by it.
