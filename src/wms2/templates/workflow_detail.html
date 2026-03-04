@@ -222,11 +222,68 @@
                 </div>
             </div>
 
-            <!-- Step metrics with round selector -->
+            <!-- Round History (merged performance + DAG status) -->
+            <template x-if="roundHistory.length > 0">
+                <div class="section">
+                    <h3>Round History</h3>
+                    <div style="overflow-x:auto;">
+                    <table style="font-size:0.85rem;">
+                        <thead>
+                            <tr>
+                                <th>Round</th>
+                                <th>Status</th>
+                                <th>WUs</th>
+                                <th>Done</th>
+                                <th>Failed</th>
+                                <th>Memory (MB)</th>
+                                <th>Threads</th>
+                                <th>Avg CPU Eff</th>
+                                <th>Peak Memory (MB)</th>
+                                <th>Started</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="r in roundHistory" :key="r.round">
+                                <tr>
+                                    <td>
+                                        <a href="#" @click.prevent="selectedMetricsRound = String(r.round)"
+                                           x-text="r.round" title="Click to filter detailed metrics"></a>
+                                    </td>
+                                    <td>
+                                        <span x-html="r.status ? statusBadge(r.status) : '—'"></span>
+                                        <template x-if="r.num_dags > 1">
+                                            <span style="opacity:0.5; font-size:0.75rem; margin-left:0.2rem;"
+                                                  x-text="'(' + r.num_dags + ' DAGs)'"
+                                                  title="Multiple DAGs due to rescue resubmission"></span>
+                                        </template>
+                                    </td>
+                                    <td x-text="r.work_units"></td>
+                                    <td x-text="r.nodes_done"></td>
+                                    <td x-text="r.nodes_failed"></td>
+                                    <td x-text="fmtNum(r.memory_used)"></td>
+                                    <td x-text="r.threads_used"></td>
+                                    <td x-text="r.cpu_eff != null ? fmtPct(r.cpu_eff * 100) : '—'"></td>
+                                    <td x-text="r.peak_memory ? fmtNum(r.peak_memory) : '—'"></td>
+                                    <td x-text="r.created_at ? fmtDateTime(r.created_at) : '—'"></td>
+                                    <td>
+                                        <template x-if="r.dag_id">
+                                            <a :href="'/ui/dags/' + encodeURIComponent(r.dag_id)">DAG &rarr;</a>
+                                        </template>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Detailed Performance Information (per-step metrics with round selector) -->
             <template x-if="stepMetrics.length > 0 || metricsRoundOptions.length > 0">
                 <div class="section">
                     <div style="display:flex; align-items:center; gap:0.75rem; margin-bottom:0.5rem;">
-                        <h3 style="margin:0;">Step Metrics</h3>
+                        <h3 style="margin:0;">Detailed Performance Information</h3>
                         <template x-if="metricsRoundOptions.length > 1">
                             <select x-model="selectedMetricsRound"
                                     style="font-size:0.85rem; padding:0.15rem 0.4rem; border-radius:3px; border:1px solid var(--pico-muted-border-color);">
@@ -264,77 +321,6 @@
                     <template x-if="stepMetrics.length === 0">
                         <p style="opacity:0.6; font-size:0.85rem;">No metrics for this round.</p>
                     </template>
-                </div>
-            </template>
-
-            <!-- Round Performance History (from step_metrics.rounds) -->
-            <template x-if="roundOptimizationHistory.length > 0">
-                <div class="section">
-                    <h3>Round Performance</h3>
-                    <div style="overflow-x:auto;">
-                    <table style="font-size:0.85rem;">
-                        <thead>
-                            <tr>
-                                <th>Round</th>
-                                <th>WUs</th>
-                                <th>Done</th>
-                                <th>Failed</th>
-                                <th>Memory (MB)</th>
-                                <th>Threads</th>
-                                <th>Avg CPU Eff</th>
-                                <th>Peak Memory (MB)</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <template x-for="r in roundOptimizationHistory" :key="r.round">
-                                <tr>
-                                    <td>
-                                        <a href="#" @click.prevent="selectedMetricsRound = String(r.round)"
-                                           x-text="r.round" title="Click to filter Step Metrics"></a>
-                                    </td>
-                                    <td x-text="r.work_units"></td>
-                                    <td x-text="r.nodes_done"></td>
-                                    <td x-text="r.nodes_failed"></td>
-                                    <td x-text="fmtNum(r.memory_used)"></td>
-                                    <td x-text="r.threads_used"></td>
-                                    <td x-text="r.cpu_eff != null ? fmtPct(r.cpu_eff * 100) : '—'"></td>
-                                    <td x-text="r.peak_rss ? fmtNum(r.peak_rss) : '—'"></td>
-                                </tr>
-                            </template>
-                        </tbody>
-                    </table>
-                    </div>
-                </div>
-            </template>
-
-            <!-- DAG History (all DAGs in chronological order) -->
-            <template x-if="allDags.length > 0">
-                <div class="section">
-                    <h3>DAG History</h3>
-                    <table style="font-size:0.85rem;">
-                        <thead>
-                            <tr>
-                                <th>Status</th>
-                                <th>Work Units</th>
-                                <th>Nodes Done</th>
-                                <th>Nodes Failed</th>
-                                <th>Created</th>
-                                <th></th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <template x-for="d in [...allDags].reverse()" :key="d.id">
-                                <tr>
-                                    <td x-html="statusBadge(d.status)"></td>
-                                    <td x-text="d.total_work_units || 0"></td>
-                                    <td x-text="d.nodes_done || 0"></td>
-                                    <td x-text="d.nodes_failed || 0"></td>
-                                    <td x-text="fmtDateTime(d.created_at)"></td>
-                                    <td><a :href="'/ui/dags/' + encodeURIComponent(d.id)">Details &rarr;</a></td>
-                                </tr>
-                            </template>
-                        </tbody>
-                    </table>
                 </div>
             </template>
 

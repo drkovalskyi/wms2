@@ -125,36 +125,57 @@ document.addEventListener('alpine:init', () => {
         },
 
         /**
-         * Per-round optimization history.
-         * Returns array of {round, memory_used, threads_used, cpu_eff, peak_rss,
-         *   tuned_memory, tuned_nthreads, mode, memory_source, work_units, nodes_done}.
+         * Merged round history — combines round performance metrics with
+         * DAG status/dates into a single table.
+         *
+         * Groups DAGs by round number (extracted from dag_file_path).
+         * For rounds with rescue DAGs, shows the latest DAG's status.
          */
-        get roundOptimizationHistory() {
+        get roundHistory() {
             const sm = this.workflow?.step_metrics;
-            if (!sm || !sm.rounds) return [];
-            const cd = this.workflow.config_data || {};
+            const cd = this.workflow?.config_data || {};
             const origMem = cd.memory_mb;
             const origThreads = cd.multicore;
-            const rounds = sm.rounds;
-            const sortedKeys = Object.keys(rounds).sort((a, b) => Number(a) - Number(b));
+            const rounds = sm?.rounds || {};
+
+            // Build DAG-by-round index: extract round from dag_file_path
+            const dagsByRound = {};
+            for (const d of this.allDags) {
+                const m = (d.dag_file_path || '').match(/round_(\d+)/);
+                const rnd = m ? Number(m[1]) : 0;
+                if (!dagsByRound[rnd]) dagsByRound[rnd] = [];
+                dagsByRound[rnd].push(d);
+            }
+            // Sort each round's DAGs by created_at (latest last)
+            for (const rnd of Object.keys(dagsByRound)) {
+                dagsByRound[rnd].sort((a, b) =>
+                    (a.created_at || '').localeCompare(b.created_at || ''));
+            }
+
+            // Collect all round numbers from both sources
+            const allRounds = new Set();
+            for (const rk of Object.keys(rounds)) allRounds.add(Number(rk));
+            for (const rk of Object.keys(dagsByRound)) allRounds.add(Number(rk));
+            const sortedRounds = [...allRounds].sort((a, b) => a - b);
 
             const history = [];
-            for (const rk of sortedKeys) {
+            for (const roundNum of sortedRounds) {
+                const rk = String(roundNum);
                 const rd = rounds[rk];
-                const roundNum = Number(rk);
+                const dags = dagsByRound[roundNum] || [];
+                const latestDag = dags.length > 0 ? dags[dags.length - 1] : null;
 
                 // Resources used for this round
                 let memUsed, threadsUsed;
-                if (rd.resource_params) {
+                if (rd?.resource_params) {
                     memUsed = rd.resource_params.memory_mb;
                     threadsUsed = rd.resource_params.nthreads;
                 } else if (roundNum === 0) {
                     memUsed = origMem;
                     threadsUsed = origThreads;
                 } else {
-                    // No stored resource_params — derive from previous round's adaptive
                     const prevRd = rounds[String(roundNum - 1)];
-                    const prevAp = prevRd?.adaptive_params || sm.adaptive_params;
+                    const prevAp = prevRd?.adaptive_params || sm?.adaptive_params;
                     if (prevAp && roundNum > 0) {
                         memUsed = prevAp.tuned_memory_mb || origMem;
                         threadsUsed = prevAp.tuned_nthreads || origThreads;
@@ -164,11 +185,11 @@ document.addEventListener('alpine:init', () => {
                     }
                 }
 
-                // Compute average CPU efficiency and peak RSS from wu_metrics
-                let cpuEff = null, peakRss = null;
-                const wuMetrics = rd.wu_metrics || [];
+                // Compute average CPU efficiency and peak memory from wu_metrics
+                let cpuEff = null, peakMem = null;
+                const wuMetrics = rd?.wu_metrics || [];
                 if (wuMetrics.length > 0) {
-                    let cpuSum = 0, cpuWeight = 0, maxRss = 0;
+                    let cpuSum = 0, cpuWeight = 0, maxMem = 0;
                     for (const wu of wuMetrics) {
                         const ps = wu.per_step || {};
                         for (const [_sn, sd] of Object.entries(ps)) {
@@ -177,31 +198,28 @@ document.addEventListener('alpine:init', () => {
                                 cpuSum += sd.cpu_efficiency.mean * nJobs;
                                 cpuWeight += nJobs;
                             }
-                            if (sd.peak_rss_mb?.mean != null && sd.peak_rss_mb.mean > maxRss) {
-                                maxRss = sd.peak_rss_mb.mean;
+                            if (sd.peak_rss_mb?.mean != null && sd.peak_rss_mb.mean > maxMem) {
+                                maxMem = sd.peak_rss_mb.mean;
                             }
                         }
                     }
                     if (cpuWeight > 0) cpuEff = cpuSum / cpuWeight;
-                    if (maxRss > 0) peakRss = Math.round(maxRss);
+                    if (maxMem > 0) peakMem = Math.round(maxMem);
                 }
-
-                // Adaptive params computed from this round's data (applied to next round)
-                const ap = rd.adaptive_params;
 
                 history.push({
                     round: roundNum,
+                    status: latestDag?.status || null,
+                    work_units: rd?.work_units || latestDag?.total_work_units || 0,
+                    nodes_done: rd?.nodes_done || latestDag?.nodes_done || 0,
+                    nodes_failed: rd?.nodes_failed || latestDag?.nodes_failed || 0,
                     memory_used: memUsed,
                     threads_used: threadsUsed,
                     cpu_eff: cpuEff,
-                    peak_rss: peakRss,
-                    tuned_memory: ap?.tuned_memory_mb || null,
-                    tuned_nthreads: ap?.tuned_nthreads || null,
-                    mode: ap?.mode || null,
-                    memory_source: ap?.memory_source || null,
-                    work_units: rd.work_units || 0,
-                    nodes_done: rd.nodes_done || 0,
-                    nodes_failed: rd.nodes_failed || 0,
+                    peak_memory: peakMem,
+                    created_at: latestDag?.created_at || null,
+                    dag_id: latestDag?.id || null,
+                    num_dags: dags.length,
                 });
             }
             return history;
