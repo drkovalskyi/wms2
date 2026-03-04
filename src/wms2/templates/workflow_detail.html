@@ -116,10 +116,21 @@
                 <div class="section">
                     <h3>Adaptive Optimization</h3>
                     <dl class="detail-grid">
-                        <dt>Memory Source</dt>
-                        <dd x-text="adaptiveInfo.memory_source || adaptiveInfo.mode || '—'"></dd>
                         <dt>Request Memory</dt>
                         <dd><span x-text="fmtNum(adaptiveInfo.original_memory)"></span> MB</dd>
+                        <dt>Measured Memory</dt>
+                        <dd>
+                            <template x-if="adaptiveInfo.measured_memory">
+                                <span>
+                                    <span x-text="fmtNum(adaptiveInfo.measured_memory)"></span> MB
+                                    <span style="opacity:0.6; margin-left:0.25rem;"
+                                          x-text="'(' + (adaptiveInfo.memory_source || '—') + ')'"></span>
+                                </span>
+                            </template>
+                            <template x-if="!adaptiveInfo.measured_memory">
+                                <span x-text="adaptiveInfo.peak_rss ? fmtNum(adaptiveInfo.peak_rss) + ' MB (FJR RSS)' : '—'"></span>
+                            </template>
+                        </dd>
                         <dt>Tuned Memory</dt>
                         <dd>
                             <strong x-text="fmtNum(adaptiveInfo.tuned_memory)"></strong> MB
@@ -138,20 +149,12 @@
                                 <span style="margin-left:0.25rem;" x-text="'(' + (adaptiveInfo.tuned_nthreads - adaptiveInfo.original_nthreads) + ')'"></span>
                             </template>
                         </dd>
-                        <template x-if="adaptiveInfo.peak_rss">
-                            <div style="display:contents;">
-                                <dt>Measured Peak RSS</dt>
-                                <dd><span x-text="fmtNum(adaptiveInfo.peak_rss)"></span> MB</dd>
-                            </div>
-                        </template>
                         <template x-if="adaptiveInfo.cpu_eff != null">
                             <div style="display:contents;">
                                 <dt>Weighted CPU Eff</dt>
                                 <dd x-text="fmtPct(adaptiveInfo.cpu_eff * 100)"></dd>
                             </div>
                         </template>
-                        <dt>Memory Source</dt>
-                        <dd x-text="adaptiveInfo.memory_source || '—'"></dd>
                     </dl>
 
                     <!-- Per-step adaptive detail -->
@@ -279,7 +282,7 @@
                                 <th>Memory (MB)</th>
                                 <th>Threads</th>
                                 <th>Avg CPU Eff</th>
-                                <th>Peak RSS (MB)</th>
+                                <th>Peak Memory (MB)</th>
                             </tr>
                         </thead>
                         <tbody>

@@ -237,7 +237,7 @@ def merge_round_metrics(round_metrics: list[dict], original_nthreads: int) -> di
             "nthreads": [],
         }
 
-    # Collect normalized cpu_eff from ALL rounds
+    # Collect normalized cpu_eff and peak RSS from ALL rounds/WUs
     for rm in round_metrics:
         round_nt = rm["nthreads"]
         for si, s in rm["steps"].items():
@@ -251,6 +251,10 @@ def merge_round_metrics(round_metrics: list[dict], original_nthreads: int) -> di
                     "cpu_time_sec": list(s["cpu_time_sec"]),
                     "nthreads": [],
                 }
+            else:
+                # Extend RSS from all entries (not just latest) so max()
+                # covers all WUs, not just the last one.
+                merged_steps[si]["peak_rss_mb"].extend(s["peak_rss_mb"])
             step_nts = s.get("nthreads", [])
             step_nt = (sum(step_nts) / len(step_nts)) if step_nts else round_nt
             ratio = step_nt / original_nthreads if original_nthreads > 0 else 1.0
@@ -1283,12 +1287,15 @@ def compute_round_optimization(
     MIN_MEMORY_MB = 4000
     peak_rss = merged["peak_rss_mb"]
     if cgroup and cgroup.get("peak_nonreclaim_mb", 0) > 0:
+        measured_memory_mb = round(cgroup["peak_nonreclaim_mb"])
         measured_mem = int(cgroup["peak_nonreclaim_mb"] * (1.0 + safety_margin))
         memory_source = "cgroup"
     elif peak_rss > 0:
+        measured_memory_mb = round(peak_rss)
         measured_mem = int(peak_rss * (1.0 + safety_margin))
         memory_source = "fjr_rss"
     else:
+        measured_memory_mb = 0
         measured_mem = default_memory_mb
         memory_source = "default"
 
@@ -1335,6 +1342,7 @@ def compute_round_optimization(
     result["tuned_request_cpus"] = tuned_request_cpus
     result["job_multiplier"] = job_multiplier
     result["memory_source"] = memory_source
+    result["measured_memory_mb"] = measured_memory_mb
     result["per_step"] = {str(k): v for k, v in tuning["per_step"].items()}
 
     if job_multiplier > 1:

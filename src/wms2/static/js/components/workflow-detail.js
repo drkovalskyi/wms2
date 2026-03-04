@@ -207,7 +207,7 @@ document.addEventListener('alpine:init', () => {
             return history;
         },
 
-        /** Legacy single adaptive info — latest optimization result. */
+        /** Latest adaptive optimization result summary. */
         get adaptiveInfo() {
             const sm = this.workflow?.step_metrics;
             if (!sm || !sm.adaptive_params) return null;
@@ -220,7 +220,7 @@ document.addEventListener('alpine:init', () => {
                 original_nthreads: cd.multicore,
                 tuned_nthreads: ap.tuned_nthreads,
                 memory_source: ap.memory_source,
-                mode: ap.mode,
+                measured_memory: ap.measured_memory_mb || null,
                 peak_rss: summary.peak_rss_mb ? Math.round(summary.peak_rss_mb) : null,
                 cpu_eff: summary.weighted_cpu_eff,
                 rounds_completed: sm.rounds_completed || 0,
