@@ -875,6 +875,7 @@ def rewrite_wu_for_job_split(
     sandbox_ref = sandbox_match.group(1) if sandbox_match else "sandbox.tar.gz"
     oi_match = re.search(r"--output-info\s+(\S+)", template_args)
     output_info_ref = oi_match.group(1) if oi_match else ""
+    pileup_remote_read = "--pileup-remote-read" in template_args
 
     # Extract SCRIPT PRE/POST patterns from group.dag
     dag_path = group_dir / "group.dag"
@@ -922,6 +923,8 @@ def rewrite_wu_for_job_split(
         proc_args += f" --last-event {le}"
         proc_args += f" --events-per-job {new_events_per_job}"
         proc_args += f" --ncpus {new_request_cpus}"
+        if pileup_remote_read:
+            proc_args += " --pileup-remote-read"
 
         lines = [
             f"# processing node {node_index} (job split)",

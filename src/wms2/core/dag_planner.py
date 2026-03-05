@@ -2022,6 +2022,22 @@ if _pu_found:
             lines.append('            for _pfn in _pu_pfns: _inp.fileNames.append(str(_pfn))')
             lines.append('            _how = (\"via global redirector\" if _pu_remote else \"via local catalog\")')
             lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_pfns)) + \" pileup files \" + _how)')
+else:
+    # No pileup_files.json — prefix existing pileup LFNs with AAA global redirector
+    lines.append('if (\"$PILEUP_REMOTE_READ\" == \"true\"):')
+    lines.append('    _pu_prefix = \"root://cms-xrd-global.cern.ch/\"')
+    lines.append('    for _mixer in [\"mixData\", \"mix\"]:')
+    lines.append('        _mobj = getattr(process, _mixer, None)')
+    lines.append('        if _mobj is None: continue')
+    lines.append('        _inp = getattr(_mobj, \"input\", None) or getattr(_mobj, \"secsource\", None)')
+    lines.append('        if _inp is None: continue')
+    lines.append('        _old = list(_inp.fileNames)')
+    lines.append('        if _old:')
+    lines.append('            _inp.fileNames = cms.untracked.vstring()')
+    lines.append('            for _fn in _old:')
+    lines.append('                _pfn = (_pu_prefix + _fn) if not _fn.startswith(\"root://\") else _fn')
+    lines.append('                _inp.fileNames.append(str(_pfn))')
+    lines.append('            print(\"WMS2: Prefixed \" + str(len(_old)) + \" existing pileup LFNs in \" + _mixer + \" with AAA global redirector\")')
 
 with open(pset, 'a') as f:
     f.write(chr(10).join(lines) + chr(10))
@@ -2354,6 +2370,22 @@ if _pu_found:
             lines.append('            for _pfn in _pu_pfns: _inp.fileNames.append(str(_pfn))')
             lines.append('            _how = (\"via global redirector\" if _pu_remote else \"via local catalog\")')
             lines.append('            print(\"WMS2: Overrode \" + _mixer + \".input.fileNames with \" + str(len(_pu_pfns)) + \" pileup files \" + _how)')
+else:
+    # No pileup_files.json — prefix existing pileup LFNs with AAA global redirector
+    lines.append('if (\"$PILEUP_REMOTE_READ\" == \"true\"):')
+    lines.append('    _pu_prefix = \"root://cms-xrd-global.cern.ch/\"')
+    lines.append('    for _mixer in [\"mixData\", \"mix\"]:')
+    lines.append('        _mobj = getattr(process, _mixer, None)')
+    lines.append('        if _mobj is None: continue')
+    lines.append('        _inp = getattr(_mobj, \"input\", None) or getattr(_mobj, \"secsource\", None)')
+    lines.append('        if _inp is None: continue')
+    lines.append('        _old = list(_inp.fileNames)')
+    lines.append('        if _old:')
+    lines.append('            _inp.fileNames = cms.untracked.vstring()')
+    lines.append('            for _fn in _old:')
+    lines.append('                _pfn = (_pu_prefix + _fn) if not _fn.startswith(\"root://\") else _fn')
+    lines.append('                _inp.fileNames.append(str(_pfn))')
+    lines.append('            print(\"WMS2: Prefixed \" + str(len(_old)) + \" existing pileup LFNs in \" + _mixer + \" with AAA global redirector\")')
 
 with open(pset, 'a') as f:
     f.write(chr(10).join(lines) + chr(10))
