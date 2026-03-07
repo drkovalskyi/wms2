@@ -74,6 +74,16 @@ class CondorAdapter(ABC):
         """Query a job's initial working directory (Iwd classad)."""
         return None
 
+    async def query_dag_site_summary(
+        self, cluster_id: str, schedd_name: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Per-site job status counts for payload jobs under a DAGMan hierarchy.
+
+        Returns {site_name: {"running": N, "idle": N, "held": N}, ...}.
+        Idle jobs without a site are grouped under "" (empty string).
+        """
+        return {}
+
 
 class ReqMgrAdapter(ABC):
     @abstractmethod
@@ -105,7 +115,8 @@ class DBSAdapter(ABC):
         """Invalidate a dataset in DBS."""
 
     @abstractmethod
-    async def open_block(self, dataset_name: str, block_index: int) -> str:
+    async def open_block(self, dataset_name: str, block_index: int,
+                         origin_site_name: str = "local") -> str:
         """Create/open a new DBS block. Returns block_name."""
 
     @abstractmethod

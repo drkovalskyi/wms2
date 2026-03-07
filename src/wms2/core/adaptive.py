@@ -60,8 +60,10 @@ def analyze_wu_metrics(group_dir: Path, exclude_nodes: set[str] | None = None) -
     num_jobs = 0
     nthreads = 1
 
-    # Also check unmerged storage for metrics files
-    search_dirs = [group_dir]
+    # Also check unmerged storage for metrics files.
+    # In spool mode, HTCondor transfers proc output to the spool root
+    # (parent of mg_xxx/), so check there too.
+    search_dirs = [group_dir, group_dir.parent]
     output_info_path = group_dir / "output_info.json"
     if output_info_path.exists():
         try:

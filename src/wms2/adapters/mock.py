@@ -70,6 +70,12 @@ class MockCondorAdapter(CondorAdapter):
         self.calls.append(("get_job_iwd", (cluster_id,), {}))
         return None
 
+    async def query_dag_site_summary(
+        self, cluster_id: str, schedd_name: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        self.calls.append(("query_dag_site_summary", (cluster_id,), {}))
+        return {}
+
 
 class MockReqMgrAdapter(ReqMgrAdapter):
     def __init__(self, requests: dict[str, dict] | None = None):
@@ -138,8 +144,9 @@ class MockDBSAdapter(DBSAdapter):
     async def invalidate_dataset(self, dataset_name: str, reason: str) -> None:
         self.calls.append(("invalidate_dataset", (dataset_name, reason), {}))
 
-    async def open_block(self, dataset_name: str, block_index: int) -> str:
-        self.calls.append(("open_block", (dataset_name, block_index), {}))
+    async def open_block(self, dataset_name: str, block_index: int,
+                         origin_site_name: str = "local") -> str:
+        self.calls.append(("open_block", (dataset_name, block_index), {"origin_site_name": origin_site_name}))
         return f"{dataset_name}#block_{block_index}"
 
     async def register_files(self, block_name: str, files: list[dict]) -> None:

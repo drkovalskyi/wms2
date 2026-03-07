@@ -51,6 +51,33 @@ class Repository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_requests_with_progress(
+        self,
+        status: str | None = None,
+        campaign: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List requests with workflow progress in a single query."""
+        stmt = (
+            select(
+                RequestRow,
+                WorkflowRow.events_produced,
+                WorkflowRow.target_events,
+            )
+            .outerjoin(WorkflowRow, WorkflowRow.request_name == RequestRow.request_name)
+        )
+        if status:
+            stmt = stmt.where(RequestRow.status == status)
+        if campaign:
+            stmt = stmt.where(RequestRow.campaign == campaign)
+        stmt = stmt.order_by(RequestRow.created_at.desc()).limit(limit).offset(offset)
+        result = await self.session.execute(stmt)
+        rows = []
+        for req, ep, te in result.all():
+            rows.append({"request": req, "events_produced": ep, "target_events": te})
+        return rows
+
     async def update_request(self, request_name: str, **kwargs: Any) -> RequestRow | None:
         kwargs["updated_at"] = datetime.now(timezone.utc)
         stmt = (

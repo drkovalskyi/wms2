@@ -52,28 +52,59 @@ class DAGMonitor:
     async def poll_dag(self, dag) -> DAGPollResult:
         """Poll a DAG's status. Main entry point called by lifecycle manager."""
         # Check if DAGMan process is still alive
-        job_info = await self.condor.query_job(
-            schedd_name=dag.schedd_name,
-            cluster_id=dag.dagman_cluster_id,
-        )
+        try:
+            job_info = await self.condor.query_job(
+                schedd_name=dag.schedd_name,
+                cluster_id=dag.dagman_cluster_id,
+            )
+        except Exception:
+            logger.warning(
+                "Cannot reach schedd %s for DAG %s — will retry next cycle",
+                dag.schedd_name, dag.id,
+            )
+            return DAGPollResult(
+                dag_id=str(dag.id),
+                status=DAGStatus.RUNNING,
+                nodes_idle=dag.nodes_idle or 0,
+                nodes_running=dag.nodes_running or 0,
+                nodes_done=dag.nodes_done or 0,
+                nodes_failed=dag.nodes_failed or 0,
+                nodes_held=dag.nodes_held or 0,
+            )
 
         if job_info is None:
             # DAGMan process gone — read final metrics
             return await self._handle_dag_completion(dag)
 
+        # DAGMan completed but still in queue (LeaveJobInQueue)
+        job_status = int(job_info.get("JobStatus", 0))
+        if job_status in (3, 4):  # 3=removed, 4=completed
+            return await self._handle_dag_completion(dag)
+
         # DAGMan alive — parse .status file for progress
-        status_file = dag.dag_file_path + ".status"
+        status_file = self._resolve_dag_file(dag, ".status")
         summary = self._parse_dagman_status(status_file)
+        logger.debug(
+            "DAG %s outer status: done=%d failed=%d running=%d idle=%d, mg_nodes=%d",
+            dag.id, summary.done, summary.failed, summary.running, summary.idle,
+            sum(1 for n in summary.node_statuses if n.startswith("mg_")),
+        )
 
         # Aggregate inner SUBDAG status files for actual node counts;
         # fall back to condor_q if inner status files don't exist yet
         inner_summary = self._aggregate_inner_status(dag, summary)
         if inner_summary is summary:
             # No inner status files found — try condor_q
+            logger.debug("DAG %s: falling back to condor_q for node counts", dag.id)
             condor_counts = await self._count_jobs_from_condor(dag)
 
             if condor_counts is not None:
                 inner_summary = condor_counts
+                logger.debug(
+                    "DAG %s condor_q counts: done=%d running=%d idle=%d failed=%d",
+                    dag.id, condor_counts.done, condor_counts.running,
+                    condor_counts.idle, condor_counts.failed,
+                )
 
         # Detect newly completed work units
         newly_completed = self._detect_completed_work_units(dag, summary)
@@ -100,14 +131,20 @@ class DAGMonitor:
             await self._handle_held_oom_jobs(dag)
 
 
-        # Update workflow node counts
+        # Update workflow node counts (including total from live poll)
         if dag.workflow_id:
+            live_total = (
+                inner_summary.idle + inner_summary.running
+                + inner_summary.done + inner_summary.failed
+                + inner_summary.held
+            )
             await self.db.update_workflow(
                 dag.workflow_id,
                 nodes_done=inner_summary.done,
                 nodes_failed=inner_summary.failed,
                 nodes_running=inner_summary.running,
                 nodes_queued=inner_summary.idle,
+                total_nodes=live_total,
             )
 
         return DAGPollResult(
@@ -120,6 +157,20 @@ class DAGMonitor:
             nodes_held=inner_summary.held,
             newly_completed_work_units=newly_completed,
         )
+
+    @staticmethod
+    def _resolve_dag_file(dag, suffix: str) -> str:
+        """Resolve DAG auxiliary file path, preferring submit_dir.
+
+        In spool mode the submit_dir (DAGMan's Iwd) may differ from the
+        directory containing dag_file_path. DAGMan writes .status, .metrics,
+        .dagman.out etc. in its Iwd, so prefer that when available.
+        """
+        dag_basename = os.path.basename(dag.dag_file_path)
+        candidate = os.path.join(dag.submit_dir, dag_basename + suffix)
+        if os.path.exists(candidate):
+            return candidate
+        return dag.dag_file_path + suffix
 
     # NodeStatus integer → string mapping for DAGMan NODE_STATUS_FILE
     _NODE_STATUS_MAP = {
@@ -222,10 +273,12 @@ class DAGMonitor:
         """
         total = NodeSummary()
         found_any = False
+        mg_count = 0
 
         for node_name, status in outer_summary.node_statuses.items():
             if not node_name.startswith("mg_"):
                 continue
+            mg_count += 1
             inner_status_file = os.path.join(
                 dag.submit_dir, node_name, "group.dag.status"
             )
@@ -241,7 +294,15 @@ class DAGMonitor:
             total.held += inner.held
 
         if not found_any:
+            logger.debug(
+                "No inner status files found for DAG %s (%d mg_ nodes in outer status)",
+                dag.id, mg_count,
+            )
             return outer_summary
+        logger.debug(
+            "Aggregated inner status for DAG %s: done=%d running=%d idle=%d failed=%d (from %d mg_ nodes)",
+            dag.id, total.done, total.running, total.idle, total.failed, mg_count,
+        )
         return total
 
     async def _count_jobs_from_condor(self, dag) -> NodeSummary | None:
@@ -252,9 +313,13 @@ class DAGMonitor:
         """
         if not dag.dagman_cluster_id:
             return None
-        counts = await self.condor.count_dag_jobs(
-            dag.dagman_cluster_id, schedd_name=dag.schedd_name,
-        )
+        try:
+            counts = await self.condor.count_dag_jobs(
+                dag.dagman_cluster_id, schedd_name=dag.schedd_name,
+            )
+        except Exception:
+            logger.warning("Cannot query condor for DAG %s job counts", dag.id)
+            return None
         if counts is None or counts["total"] == 0:
             return None
         return NodeSummary(
@@ -310,6 +375,9 @@ class DAGMonitor:
         manifest_path = os.path.join(
             dag.submit_dir, group_name, "merge_output.json"
         )
+        # In spool mode, merge output files end up at the spool root
+        if not os.path.exists(manifest_path):
+            manifest_path = os.path.join(dag.submit_dir, "merge_output.json")
         if not os.path.exists(manifest_path):
             return None
         with open(manifest_path) as f:
@@ -318,6 +386,9 @@ class DAGMonitor:
     def _read_work_unit_metrics(self, dag, group_name: str) -> dict | None:
         """Read the work_unit_metrics.json for a completed work unit."""
         metrics_path = os.path.join(dag.submit_dir, group_name, "work_unit_metrics.json")
+        # In spool mode, merge output files end up at the spool root
+        if not os.path.exists(metrics_path):
+            metrics_path = os.path.join(dag.submit_dir, "work_unit_metrics.json")
         if not os.path.exists(metrics_path):
             return None
         try:
@@ -352,9 +423,13 @@ class DAGMonitor:
 
     async def _handle_held_oom_jobs(self, dag) -> None:
         """Detect jobs held for cgroup OOM (HoldReasonCode 34), bump memory, release."""
-        held_jobs = await self.condor.query_held_jobs(
-            dag.dagman_cluster_id, schedd_name=dag.schedd_name,
-        )
+        try:
+            held_jobs = await self.condor.query_held_jobs(
+                dag.dagman_cluster_id, schedd_name=dag.schedd_name,
+            )
+        except Exception:
+            logger.warning("Cannot query held jobs for DAG %s", dag.id)
+            return
         if not held_jobs:
             return
 
@@ -429,16 +504,16 @@ class DAGMonitor:
 
     async def _handle_dag_completion(self, dag) -> DAGPollResult:
         """Handle a DAG whose DAGMan process has exited."""
-        metrics_file = dag.dag_file_path + ".metrics"
+        metrics_file = self._resolve_dag_file(dag, ".metrics")
         summary = self._parse_dagman_metrics(metrics_file)
 
         # Fall back to .status file if metrics file is missing
         if summary.done == 0 and summary.failed == 0:
-            status_file = dag.dag_file_path + ".status"
+            status_file = self._resolve_dag_file(dag, ".status")
             summary = self._parse_dagman_status(status_file)
 
         # Also parse .status to detect work units that completed since last poll
-        status_file = dag.dag_file_path + ".status"
+        status_file = self._resolve_dag_file(dag, ".status")
         status_summary = self._parse_dagman_status(status_file)
         newly_completed = self._detect_completed_work_units(dag, status_summary)
 

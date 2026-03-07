@@ -78,7 +78,11 @@ const WMS2_API = (() => {
         updateSettings:    (body)       => patch('/lifecycle/settings', body),
         restartLifecycle:  ()           => post('/lifecycle/restart'),
 
+        // Monitoring
+        htcondorOverview:  ()           => get('/htcondor-overview'),
+
         // Import
+        previewRequest:    (name)       => get('/import/preview?request_name=' + encodeURIComponent(name)),
         importRequest:     (body)       => post('/import', body),
     };
 })();

@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import tempfile
 from datetime import datetime, timezone
 
 from wms2.adapters.base import CondorAdapter
@@ -53,6 +55,9 @@ def _count_events_from_disk(submit_dir, completed_wus):
     total = 0
     for wu_name in (completed_wus or []):
         metrics_path = os.path.join(submit_dir, wu_name, "work_unit_metrics.json")
+        # In spool mode, merge output files end up at the spool root
+        if not os.path.exists(metrics_path):
+            metrics_path = os.path.join(submit_dir, "work_unit_metrics.json")
         if not os.path.exists(metrics_path):
             continue
         try:
@@ -72,6 +77,30 @@ def _count_events_from_disk(submit_dir, completed_wus):
         except Exception:
             logger.warning("Failed to read WU metrics: %s", metrics_path)
     return total
+
+
+_SKIP_EXTENSIONS = {".root", ".log", ".out", ".err"}
+
+
+def _copy_dag_infrastructure(src_dir: str, dst_dir: str) -> None:
+    """Copy DAG infrastructure files, skipping large outputs (.root/.log/.out/.err).
+
+    Used for rescue DAG resubmission in spool mode where the original
+    submit_dir is on a read-only sshfs mount.
+    """
+    for entry in os.scandir(src_dir):
+        dst_path = os.path.join(dst_dir, entry.name)
+        if entry.is_dir(follow_symlinks=False):
+            if entry.name.startswith("mg_"):
+                os.makedirs(dst_path, exist_ok=True)
+                _copy_dag_infrastructure(entry.path, dst_path)
+        elif entry.is_file(follow_symlinks=False):
+            _, ext = os.path.splitext(entry.name)
+            if ext not in _SKIP_EXTENSIONS:
+                try:
+                    shutil.copy2(entry.path, dst_path)
+                except (PermissionError, OSError):
+                    pass
 
 
 def _compute_adaptive_params(config, dag, workflow, new_metrics, settings):
@@ -176,6 +205,11 @@ async def complete_round(repo, settings, workflow, dag):
             metrics_path = os.path.join(
                 dag.submit_dir, wu_name, "work_unit_metrics.json"
             )
+            # In spool mode, merge output files end up at the spool root
+            if not os.path.exists(metrics_path):
+                metrics_path = os.path.join(
+                    dag.submit_dir, "work_unit_metrics.json"
+                )
             if os.path.exists(metrics_path):
                 try:
                     wu_metrics_list.append(json.load(open(metrics_path)))
@@ -473,14 +507,79 @@ class RequestLifecycleManager:
                 # Rescue DAG re-admission — submit the *original* DAG file;
                 # DAGMan's AutoRescue finds and applies the rescue file automatically.
                 if dag.rescue_dag_path and dag.status == DAGStatus.READY.value:
-                    cluster_id, schedd = await self.condor.submit_dag(
-                        dag.dag_file_path
+                    config = (workflow.config_data or {})
+                    condor_pool = config.get("condor_pool", "local")
+                    use_spool = (
+                        condor_pool == "global"
+                        and bool(self.settings.spool_mount)
+                        and bool(self.settings.remote_spool_prefix)
                     )
+                    schedd_name = (
+                        self.settings.remote_schedd if use_spool else None
+                    )
+
+                    dag_file = dag.dag_file_path
+                    local_copy_dir = None
+                    if use_spool:
+                        # Spool-mode DAG: submit_dir is on sshfs mount
+                        # (read-only). Copy only DAG infrastructure
+                        # files to local temp so from_dag() can write
+                        # .condor.sub, then re-spool. Skip large output
+                        # files (.root, .log, .out, .err, metrics).
+                        local_copy_dir = tempfile.mkdtemp(
+                            prefix="wms2_rescue_"
+                        )
+                        await asyncio.to_thread(
+                            _copy_dag_infrastructure,
+                            dag.submit_dir, local_copy_dir,
+                        )
+                        dag_file = os.path.join(
+                            local_copy_dir,
+                            os.path.basename(dag.dag_file_path),
+                        )
+
+                    # Remove stale .condor.sub and .lock so from_dag()
+                    # can recreate them without Force. We must NOT use
+                    # Force because that passes -force to DAGMan which
+                    # causes it to ignore the rescue file.
+                    for stale in (dag_file + ".condor.sub",
+                                  dag_file + ".lock"):
+                        if os.path.exists(stale):
+                            os.remove(stale)
+
+                    try:
+                        cluster_id, schedd = await self.condor.submit_dag(
+                            dag_file, force=False,
+                            spool=use_spool, schedd_name=schedd_name,
+                        )
+                    finally:
+                        if local_copy_dir:
+                            shutil.rmtree(local_copy_dir, ignore_errors=True)
+
+                    # Map new spool Iwd to local mount for monitoring
+                    new_submit_dir = dag.submit_dir
+                    if use_spool:
+                        iwd = await self.condor.get_job_iwd(
+                            cluster_id, schedd
+                        )
+                        if iwd:
+                            new_submit_dir = iwd.replace(
+                                self.settings.remote_spool_prefix,
+                                self.settings.spool_mount, 1,
+                            )
+
                     await self.db.update_dag(
                         dag.id,
                         dagman_cluster_id=cluster_id,
                         schedd_name=schedd,
                         status=DAGStatus.SUBMITTED.value,
+                        submit_dir=new_submit_dir,
+                    )
+                    # Reset workflow status back to active (was set to
+                    # RESUBMITTING by error_handler._prepare_rescue)
+                    await self.db.update_workflow(
+                        workflow.id,
+                        status=WorkflowStatus.ACTIVE.value,
                     )
                     await self.transition(request, RequestStatus.ACTIVE)
                     return
@@ -488,25 +587,20 @@ class RequestLifecycleManager:
         current_round = getattr(workflow, "current_round", 0) or 0
         is_adaptive = getattr(request, "adaptive", False)
 
+        # Round 0 IS the pilot — no separate pilot submission.
+        # All rounds use plan_production_dag; round 0 just uses
+        # smaller test_fraction sizing.
         if current_round > 0:
-            # Round 2+: skip pilot, go straight to production (always adaptive)
+            # Round 2+: always adaptive
             dag = await self.dag_planner.plan_production_dag(workflow, adaptive=True)
-            if dag is None:
-                await self.transition(request, RequestStatus.COMPLETED)
-            else:
-                await self.transition(request, RequestStatus.ACTIVE)
-        elif request.urgent:
-            # Skip pilot, go straight to production DAG
+        else:
             dag = await self.dag_planner.plan_production_dag(
                 workflow, adaptive=is_adaptive,
             )
-            if is_adaptive and dag is None:
-                await self.transition(request, RequestStatus.COMPLETED)
-            else:
-                await self.transition(request, RequestStatus.ACTIVE)
+        if dag is None:
+            await self.transition(request, RequestStatus.COMPLETED)
         else:
-            await self.dag_planner.submit_pilot(workflow)
-            await self.transition(request, RequestStatus.PILOT_RUNNING)
+            await self.transition(request, RequestStatus.ACTIVE)
 
     async def _handle_pilot_running(self, request):
         """Poll pilot status, trigger DAG planning on completion."""
@@ -518,9 +612,16 @@ class RequestLifecycleManager:
         if not workflow or not workflow.pilot_cluster_id:
             return
 
-        completed = await self.condor.check_job_completed(
-            workflow.pilot_cluster_id, workflow.pilot_schedd
-        )
+        try:
+            completed = await self.condor.check_job_completed(
+                workflow.pilot_cluster_id, workflow.pilot_schedd
+            )
+        except Exception:
+            logger.warning(
+                "Cannot reach schedd for pilot %s — will retry next cycle",
+                request.request_name,
+            )
+            return
         if completed:
             is_adaptive = getattr(request, "adaptive", False)
             report_path = os.path.join(
@@ -557,7 +658,17 @@ class RequestLifecycleManager:
             # Process completed work units through output manager
             if result.newly_completed_work_units and self.output_manager:
                 try:
-                    blocks = await self.db.get_processing_blocks(workflow.id)
+                    all_blocks = await self.db.get_processing_blocks(workflow.id)
+                    # Use only the latest block per dataset (current round).
+                    # Multiple rounds create blocks with the same dataset_name;
+                    # we must register output only to the current round's blocks.
+                    latest_by_ds: dict[str, object] = {}
+                    for b in all_blocks:
+                        prev = latest_by_ds.get(b.dataset_name)
+                        if prev is None or b.created_at > prev.created_at:
+                            latest_by_ds[b.dataset_name] = b
+                    blocks = list(latest_by_ds.values())
+
                     for wu in result.newly_completed_work_units:
                         manifest = wu.get("manifest") or {}
                         datasets_info = manifest.get("datasets", {})

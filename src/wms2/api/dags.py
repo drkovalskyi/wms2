@@ -85,7 +85,6 @@ async def list_dags(
 @router.get("/{dag_id}")
 async def get_dag(
     dag_id: str,
-    raw_request: FastAPIRequest,
     repo: Repository = Depends(get_repository),
 ):
     try:
@@ -99,23 +98,8 @@ async def get_dag(
 
     result = _dag_detail(row)
 
-    # Override with live counts from condor when available
-    if row.dagman_cluster_id:
-        condor = getattr(raw_request.app.state, "condor", None)
-        if condor:
-            try:
-                live = await condor.count_dag_jobs(
-                    row.dagman_cluster_id, schedd_name=row.schedd_name,
-                )
-                if live and live.get("total", 0) > 0:
-                    result["nodes_done"] = live["done"]
-                    result["nodes_running"] = live["running"]
-                    result["nodes_idle"] = live["idle"]
-                    result["nodes_failed"] = live["failed"]
-                    result["nodes_held"] = live["held"]
-            except Exception:
-                log.debug("HTCondor query failed for DAG %s, using DB counts", dag_id)
-
+    # DB counts are already accurate — lifecycle manager aggregates
+    # inner SUBDAG status files and updates these each cycle.
     return result
 
 

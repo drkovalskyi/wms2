@@ -26,10 +26,12 @@ class ImportBody(BaseModel):
     request_name: str
     sandbox_mode: str = "cmssw"
     test_fraction: float | None = None
+    request_num_events: int | None = None
     events_per_job: int | None = None
     files_per_job: int | None = None
     max_files: int | None = None
     processing_version: int | None = None
+    work_units_per_round: int | None = None
     dry_run: bool = False
     high_priority: int = 5
     nominal_priority: int = 3
@@ -113,6 +115,63 @@ def _apply_processing_version(reqdata: dict, version: int):
         reqdata["OutputModulesLFNBases"] = new_bases
 
 
+@router.get("/import/preview")
+async def preview_request(
+    request_name: str,
+    raw_request: FastAPIRequest,
+    settings=Depends(get_settings),
+):
+    """Fetch request params from ReqMgr2 for preview (no DB writes)."""
+    reqmgr = getattr(raw_request.app.state, "reqmgr", None)
+    if reqmgr is None:
+        raise HTTPException(status_code=503, detail="ReqMgr2 adapter not available")
+
+    try:
+        reqdata = await reqmgr.get_request(request_name)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch from ReqMgr2: {exc}")
+
+    reqdata = _normalize_request(reqdata)
+
+    # Count steps for StepChain/TaskChain
+    step_count = 0
+    if reqdata.get("RequestType") == "StepChain":
+        step_count = reqdata.get("StepChain", 0)
+    elif reqdata.get("RequestType") == "TaskChain":
+        step_count = reqdata.get("TaskChain", 0)
+
+    step1 = reqdata.get("Step1") or reqdata.get("Task1") or {}
+    filter_eff = reqdata.get("FilterEfficiency") or step1.get("FilterEfficiency", 1.0)
+
+    result = {
+        "request_type": reqdata.get("RequestType"),
+        "is_gen": bool(reqdata.get("_is_gen")),
+        "request_num_events": reqdata.get("RequestNumEvents"),
+        "memory_mb": reqdata.get("Memory", 2048),
+        "multicore": reqdata.get("Multicore", 1),
+        "time_per_event": reqdata.get("TimePerEvent"),
+        "size_per_event": reqdata.get("SizePerEvent"),
+        "filter_efficiency": filter_eff,
+        "events_per_job": reqdata.get("EventsPerJob"),
+        "files_per_job": (reqdata.get("SplittingParams") or {}).get("files_per_job"),
+        "splitting_algo": reqdata.get("SplittingAlgo"),
+        "cmssw_version": reqdata.get("CMSSWVersion"),
+        "scram_arch": reqdata.get("ScramArch"),
+        "campaign": reqdata.get("Campaign"),
+        "input_dataset": reqdata.get("InputDataset"),
+        "output_datasets": reqdata.get("OutputDatasets", []),
+        "processing_version": reqdata.get("ProcessingVersion"),
+        "requestor": reqdata.get("Requestor"),
+        "step_count": step_count,
+        "defaults": {
+            "jobs_per_work_unit": settings.jobs_per_work_unit,
+            "first_round_work_units": settings.first_round_work_units,
+            "work_units_per_round": settings.work_units_per_round,
+        },
+    }
+    return result
+
+
 @router.post("/import")
 async def import_request(
     body: ImportBody,
@@ -179,6 +238,16 @@ async def import_request(
         logger.info("Overriding ProcessingVersion to %d for %s",
                      body.processing_version, body.request_name)
 
+    # Override RequestNumEvents if requested
+    if body.request_num_events is not None:
+        reqdata["RequestNumEvents"] = body.request_num_events
+        # Also update Step1 if StepChain
+        if reqdata.get("RequestType") == "StepChain":
+            step1 = reqdata.get("Step1", {})
+            step1["RequestNumEvents"] = body.request_num_events
+        logger.info("Overriding RequestNumEvents to %d for %s",
+                     body.request_num_events, body.request_name)
+
     # Store pool and priority profile in request_data for UI display
     reqdata["_condor_pool"] = body.condor_pool
     reqdata["_priority_profile"] = {
@@ -242,6 +311,8 @@ async def import_request(
         config_data["stageout_mode"] = settings.stageout_mode
     if body.allowed_sites:
         config_data["allowed_sites"] = body.allowed_sites
+    if body.work_units_per_round is not None:
+        config_data["work_units_per_round"] = body.work_units_per_round
 
     # Priority profile
     config_data["priority_profile"] = {

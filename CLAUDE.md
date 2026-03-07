@@ -106,6 +106,32 @@ uvicorn wms2.main:create_app --factory --host 0.0.0.0 --port 8080
 - **Site selection belongs to HTCondor.** WMS2 does not do load balancing or site assignment. The landing node mechanism lets HTCondor pick sites via normal negotiation. Never add site-selection logic to the DAG Planner.
 - **One DAG per workflow from WMS2's perspective.** WMS2 submits and monitors one top-level DAG. Merge group sub-DAGs are DAGMan's internal concern.
 
+## Restarting the WMS2 service
+
+After changing Python source or templates, **restart the service automatically** — don't ask. This is safe and expected during development.
+
+```bash
+# 1. Clear stale bytecode
+find src -name "*.pyc" -delete
+
+# 2. Kill old uvicorn
+pkill -9 -f "uvicorn wms2" 2>/dev/null; sleep 2
+
+# 3. Start fresh (background)
+source .venv/bin/activate && \
+  WMS2_CONDOR_HOST="localhost:9618" WMS2_LIFECYCLE_CYCLE_INTERVAL=30 \
+  uvicorn wms2.main:create_app --factory --host 0.0.0.0 --port 8080
+```
+
+**What is safe to restart without asking:**
+- The uvicorn dev server (port 8080) — it's a single-user dev instance, no production traffic
+- There are no active DAGs affected by a restart — the lifecycle manager resumes from DB state
+
+**What is NOT safe (always ask first):**
+- PostgreSQL (`systemctl restart postgresql`) — only if schema/config changes require it
+- HTCondor (`systemctl restart condor`) — disrupts running jobs
+- XRootD (`systemctl restart xrootd@standalone`) — disrupts file access
+
 ## When committing changes
 
 - **Update `IMPLEMENTATION_LOG.md`** with every significant commit. Add a new section or append to the current phase with: what was built/changed, design decisions, verification steps, and known issues.

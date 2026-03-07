@@ -47,14 +47,15 @@ class ErrorHandler:
 
     async def handle_dag_completion(self, dag, request, workflow) -> CompletionResult:
         """Handle DAG that completed with failures. Returns CompletionResult."""
-        # Ratio is per work unit, not per inner node — a failed sub-DAG
-        # is one work unit regardless of how many proc nodes it contains.
-        ratio = dag.nodes_failed / max(dag.total_work_units, 1)
+        # Ratio is per work unit, not per inner node — nodes_failed counts
+        # inner sub-DAG nodes, but we need failed top-level WU count.
+        completed_wus = len(dag.completed_work_units or [])
+        failed_wus = max(0, (dag.total_work_units or 0) - completed_wus)
+        ratio = failed_wus / max(dag.total_work_units, 1)
         await self._record_event(dag, "dag_completion", {
             "failure_ratio": ratio,
-            "nodes_done": dag.nodes_done,
-            "nodes_failed": dag.nodes_failed,
-            "total_nodes": dag.total_nodes,
+            "failed_work_units": failed_wus,
+            "completed_work_units": completed_wus,
             "total_work_units": dag.total_work_units,
         })
 

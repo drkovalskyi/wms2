@@ -63,9 +63,11 @@ class OutputManager:
 
         # 1. Open DBS block on first work unit
         block_name = block.dbs_block_name
+        site = merge_info.get("site", "local")
         if not block.dbs_block_open:
             block_name = await self.dbs.open_block(
-                block.dataset_name, block.block_index
+                block.dataset_name, block.block_index,
+                origin_site_name=site,
             )
             await self.db.update_processing_block(
                 block.id, dbs_block_name=block_name, dbs_block_open=True

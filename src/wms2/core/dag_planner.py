@@ -214,7 +214,7 @@ class DAGPlanner:
             if current_round == 0:
                 wus = self.settings.first_round_work_units
             else:
-                wus = self.settings.work_units_per_round
+                wus = config.get("work_units_per_round") or self.settings.work_units_per_round
             max_jobs = wus * self.settings.jobs_per_work_unit
         else:
             max_jobs = 0
@@ -433,32 +433,35 @@ class DAGPlanner:
         )
 
         # 8. Count totals
+        stageout_mode = config.get("stageout_mode", self.settings.stageout_mode)
+        skip_site_pinning = (stageout_mode == "grid")
         total_proc = sum(len(mg.processing_nodes) for mg in merge_groups)
-        if use_spool:
-            # Spool mode: no landing node. proc_000000 is landing.
-            # N proc + 1 merge + 1 cleanup = N + 2
+        if skip_site_pinning:
+            # No landing node: N proc + 1 merge + 1 cleanup = N + 2
             total_nodes = sum(len(mg.processing_nodes) + 2 for mg in merge_groups)
-            # proc_000000→rest_proc + all_proc→merge + merge→cleanup
-            total_edges = sum(2 * len(mg.processing_nodes) for mg in merge_groups)
+            # proc→merge + merge→cleanup = N + 1
+            total_edges = sum(len(mg.processing_nodes) + 1 for mg in merge_groups)
         else:
-            # Each group: 1 landing + N proc + 1 merge + 1 cleanup = N + 3
+            # With landing: 1 landing + N proc + 1 merge + 1 cleanup = N + 3
             total_nodes = sum(len(mg.processing_nodes) + 3 for mg in merge_groups)
-            # landing→all_proc + all_proc→merge + merge→cleanup = N + N + 1 = 2N + 1
+            # landing→all_proc + all_proc→merge + merge→cleanup = 2N + 1
             total_edges = sum(2 * len(mg.processing_nodes) + 1 for mg in merge_groups)
 
         # 9. Create DAG row (paths may be updated after spool submission)
+        node_counts = {
+            "processing": total_proc,
+            "merge": len(merge_groups),
+            "cleanup": len(merge_groups),
+        }
+        if not skip_site_pinning:
+            node_counts["landing"] = len(merge_groups)
         dag = await self.db.create_dag(
             workflow_id=workflow.id,
             dag_file_path=dag_file_path,
             submit_dir=submit_dir,
             total_nodes=total_nodes,
             total_edges=total_edges,
-            node_counts={
-                "processing": total_proc,
-                "merge": len(merge_groups),
-                "cleanup": len(merge_groups),
-                "landing": len(merge_groups),
-            },
+            node_counts=node_counts,
             total_work_units=len(merge_groups),
             status=DAGStatus.READY.value,
         )
@@ -813,7 +816,6 @@ def _generate_dag_files(
     _write_elect_site_script(str(submit_path / "elect_site.sh"))
     _write_pin_site_script(str(submit_path / "pin_site.sh"))
     _write_post_script(str(submit_path / "post_script.sh"))
-    _write_landing_post_script(str(submit_path / "landing_post.sh"))
     _write_post_collector(str(submit_path / "wms2_post_collect.py"))
     _write_proc_script(str(submit_path / "wms2_proc.sh"))
     _write_merge_script(str(submit_path / "wms2_merge.py"))
@@ -863,7 +865,7 @@ def _generate_dag_files(
             # Local mode: symlink shared scripts into mg_dir so inner DAG
             # can reference them as ./script.sh (DIR sets IWD to mg_dir).
             for script in ("elect_site.sh", "pin_site.sh", "post_script.sh",
-                            "landing_post.sh", "wms2_post_collect.py"):
+                            "wms2_post_collect.py"):
                 link = mg_dir / script
                 if not link.exists():
                     os.symlink(f"../{script}", str(link))
@@ -1042,6 +1044,12 @@ def _generate_group_dag(
     x509_cert_dir = os.environ.get("X509_CERT_DIR", "")
     if x509_cert_dir:
         proc_env["X509_CERT_DIR"] = x509_cert_dir
+    # Pass GLIDEIN_CMSSite from the matched slot to the job environment.
+    # This lets merge/cleanup jobs find the correct site-specific siteconf
+    # at /cvmfs/cms.cern.ch/SITECONF/<site>/. The $$() syntax is evaluated
+    # by HTCondor at match time.
+    if stageout_mode == "grid":
+        proc_env["GLIDEIN_CMSSite"] = "$$([GLIDEIN_CMSSite])"
 
     # Write output_info.json — shared by proc (stage-out) and merge (read input/write output)
     output_info_path = None
@@ -1060,6 +1068,7 @@ def _generate_group_dag(
             "stageout_mode": stageout_mode,
             "group_index": merge_group.group_index,
             "max_merge_size": rp.get("max_merge_size", 4 * 1024**3),
+            "proc_node_indices": [n.node_index for n in merge_group.processing_nodes],
         }
         output_info_path = str(group_dir / "output_info.json")
         _write_file(output_info_path, json.dumps(output_info, indent=2))
@@ -1083,6 +1092,12 @@ def _generate_group_dag(
 
     proc_nodes = merge_group.processing_nodes
 
+    # Site pinning is always needed: even in grid stageout mode, merge/cleanup
+    # jobs must run at the same site as proc jobs because they resolve the
+    # storage endpoint from site-specific storage.json. Without pinning, a
+    # merge job could land at a different site and use the wrong endpoint.
+    skip_site_pinning = False
+
     # In spool mode, elected_site needs a per-group name to avoid clashes
     # between merge groups sharing the same CWD (spool root).
     elected_site = f"{mg_name}_elected_site" if spool_mode else "elected_site"
@@ -1097,22 +1112,17 @@ def _generate_group_dag(
     # GlideinWMS START expression requires DESIRED_Sites to be defined;
     # if allowed_sites is set use those, otherwise list all CRIC sites.
     if allowed_sites:
-        landing_desired = ",".join(allowed_sites)
+        all_desired = ",".join(allowed_sites)
     elif all_sites:
-        landing_desired = ",".join(all_sites)
+        all_desired = ",".join(all_sites)
     else:
-        landing_desired = ""
+        all_desired = ""
     out_dir = mg_name if spool_mode else ""
 
-    # In spool mode (global pool), proc_000000 acts as the landing node:
-    # it runs as a real proc job with free site selection, and its POST
-    # script elects the site for the remaining pinned proc/merge/cleanup.
-    # In local mode, a trivial /bin/true landing node is used (no site
-    # election needed).
-    use_proc_landing = spool_mode
-
-    if not use_proc_landing:
-        # Trivial landing node for local pool
+    if not skip_site_pinning:
+        # Trivial landing node: /bin/true job with free site selection.
+        # Its POST script (elect_site.sh) extracts MATCH_GLIDEIN_CMSSite
+        # so remaining nodes can be pinned to the same site.
         landing_priority = max(job_priority, 5) + 10
         landing_classads = dict(extra_classads or {})
         landing_classads["WMS2_QuickJob"] = "True"
@@ -1121,12 +1131,13 @@ def _generate_group_dag(
             executable="/bin/true",
             arguments="",
             description="landing node",
-            desired_sites=landing_desired,
+            desired_sites=all_desired,
             banned_sites=banned_sites,
             allowed_sites=allowed_sites,
             priority=landing_priority,
             extra_classads=landing_classads,
             output_dir=out_dir,
+            transfer_executable=False,
         )
         lines.append(f"JOB landing {fp}landing.sub")
         landing_log = f"{fp}landing.log"
@@ -1140,7 +1151,6 @@ def _generate_group_dag(
     post_args = f"$JOB $RETURN $RETRY $MAX_RETRIES {mg_name}" if spool_mode else "$JOB $RETURN $RETRY $MAX_RETRIES"
     for node in proc_nodes:
         node_name = f"proc_{node.node_index:06d}"
-        is_landing_proc = use_proc_landing and node.node_index == proc_nodes[0].node_index
         input_lfns = ",".join(f.lfn for f in node.input_files)
 
         # Build arguments with event range info
@@ -1163,57 +1173,29 @@ def _generate_group_dag(
         if pileup_remote_read:
             proc_args += " --pileup-remote-read"
 
-        if is_landing_proc:
-            # proc_000000 acts as the landing node: free site selection
-            # (DESIRED_Sites from policy, no GLIDEIN_CMSSite pinning).
-            # POST script elects the site for remaining nodes.
-            _write_submit_file(
-                str(group_dir / f"{node_name}.sub"),
-                executable=proc_exe,
-                arguments=proc_args,
-                description=f"processing node {node.node_index} (landing)",
-                desired_sites=landing_desired,
-                banned_sites=banned_sites,
-                allowed_sites=allowed_sites,
-                memory_mb=memory_mb,
-                disk_kb=disk_kb,
-                ncpus=ncpus,
-                transfer_input_files=proc_transfer_files or None,
-                environment=proc_env or None,
-                priority=job_priority,
-                extra_classads=extra_classads,
-                output_dir=out_dir,
-            )
-            lines.append(f"JOB {node_name} {fp}{node_name}.sub")
-            landing_log = f"{fp}{node_name}.log"
-            # Combined POST: runs post_script.sh, then elect_site.sh on success
-            landing_post_args = f"$JOB $RETURN $RETRY $MAX_RETRIES {mg_name} {elected_site} {landing_log}" if spool_mode else f"$JOB $RETURN $RETRY $MAX_RETRIES . {elected_site} {landing_log}"
-            lines.append(
-                f"SCRIPT POST {node_name} landing_post.sh {landing_post_args}"
-            )
-        else:
-            _write_submit_file(
-                str(group_dir / f"{node_name}.sub"),
-                executable=proc_exe,
-                arguments=proc_args,
-                description=f"processing node {node.node_index}",
-                desired_sites=node.primary_location or "",
-                memory_mb=memory_mb,
-                disk_kb=disk_kb,
-                ncpus=ncpus,
-                transfer_input_files=proc_transfer_files or None,
-                environment=proc_env or None,
-                priority=job_priority,
-                extra_classads=extra_classads,
-                output_dir=out_dir,
-            )
-            lines.append(f"JOB {node_name} {fp}{node_name}.sub")
+        _write_submit_file(
+            str(group_dir / f"{node_name}.sub"),
+            executable=proc_exe,
+            arguments=proc_args,
+            description=f"processing node {node.node_index}",
+            desired_sites=all_desired if skip_site_pinning else (node.primary_location or ""),
+            memory_mb=memory_mb,
+            disk_kb=disk_kb,
+            ncpus=ncpus,
+            transfer_input_files=proc_transfer_files or None,
+            environment=proc_env or None,
+            priority=job_priority,
+            extra_classads=extra_classads,
+            output_dir=out_dir,
+        )
+        lines.append(f"JOB {node_name} {fp}{node_name}.sub")
+        if not skip_site_pinning:
             lines.append(
                 f"SCRIPT PRE {node_name} pin_site.sh {fp}{node_name}.sub {elected_site}"
             )
-            lines.append(
-                f"SCRIPT POST {node_name} post_script.sh {post_args}"
-            )
+        lines.append(
+            f"SCRIPT POST {node_name} post_script.sh {post_args}"
+        )
         lines.append("")
 
     # Merge node
@@ -1235,6 +1217,7 @@ def _generate_group_dag(
         executable=merge_exe,
         arguments=merge_args,
         description="merge node",
+        desired_sites=all_desired if skip_site_pinning else "",
         memory_mb=memory_mb,
         disk_kb=disk_kb,
         transfer_input_files=merge_transfer or None,
@@ -1244,9 +1227,10 @@ def _generate_group_dag(
         output_dir=out_dir,
     )
     lines.append(f"JOB merge {fp}merge.sub")
-    lines.append(
-        f"SCRIPT PRE merge pin_site.sh {fp}merge.sub {elected_site}"
-    )
+    if not skip_site_pinning:
+        lines.append(
+            f"SCRIPT PRE merge pin_site.sh {fp}merge.sub {elected_site}"
+        )
     lines.append(
         f"SCRIPT POST merge post_script.sh {post_args}"
     )
@@ -1258,9 +1242,13 @@ def _generate_group_dag(
     if output_info_path:
         cleanup_args = f"--output-info {os.path.basename(output_info_path)}"
         cleanup_transfer.append(f"{fp}output_info.json")
-    # cleanup_manifest.json is written by the merge job into the group dir;
-    # it exists by the time the cleanup node runs (merge → cleanup dependency).
-    cleanup_transfer.append(f"{fp}cleanup_manifest.json")
+    # cleanup_manifest.json is written by the merge job. In spool mode,
+    # HTCondor transfers merge output back to the spool root (not mg_xxx/).
+    # In local mode, it's in the group directory.
+    if spool_mode:
+        cleanup_transfer.append("cleanup_manifest.json")
+    else:
+        cleanup_transfer.append(f"{fp}cleanup_manifest.json")
     if stageout_mode == "grid" and os.path.isfile(stageout_utility_path):
         if spool_mode:
             cleanup_transfer.append("wms2_stageout.py")
@@ -1271,6 +1259,7 @@ def _generate_group_dag(
         executable=cleanup_exe,
         arguments=cleanup_args,
         description="cleanup node",
+        desired_sites=all_desired if skip_site_pinning else "",
         transfer_input_files=cleanup_transfer or None,
         environment=proc_env or None,
         priority=job_priority,
@@ -1278,15 +1267,16 @@ def _generate_group_dag(
         output_dir=out_dir,
     )
     lines.append(f"JOB cleanup {fp}cleanup.sub")
-    lines.append(
-        f"SCRIPT PRE cleanup pin_site.sh {fp}cleanup.sub {elected_site}"
-    )
+    if not skip_site_pinning:
+        lines.append(
+            f"SCRIPT PRE cleanup pin_site.sh {fp}cleanup.sub {elected_site}"
+        )
     lines.append("")
 
     # Retries
     for node in proc_nodes:
         node_name = f"proc_{node.node_index:06d}"
-        lines.append(f"RETRY {node_name} 3 UNLESS-EXIT 42")
+        lines.append(f"RETRY {node_name} 5 UNLESS-EXIT 42")
     lines.append("RETRY merge 2 UNLESS-EXIT 42")
     lines.append("RETRY cleanup 1")
     lines.append("")
@@ -1300,18 +1290,9 @@ def _generate_group_dag(
 
     # Dependencies
     proc_names = " ".join(f"proc_{n.node_index:06d}" for n in proc_nodes)
-    if use_proc_landing:
-        # proc_000000 is the landing: remaining proc nodes depend on it
-        landing_name = f"proc_{proc_nodes[0].node_index:06d}"
-        rest_names = " ".join(
-            f"proc_{n.node_index:06d}" for n in proc_nodes[1:]
-        )
-        if rest_names:
-            lines.append(f"PARENT {landing_name} CHILD {rest_names}")
-        lines.append(f"PARENT {proc_names} CHILD merge")
-    else:
+    if not skip_site_pinning:
         lines.append(f"PARENT landing CHILD {proc_names}")
-        lines.append(f"PARENT {proc_names} CHILD merge")
+    lines.append(f"PARENT {proc_names} CHILD merge")
     lines.append("PARENT merge CHILD cleanup")
     lines.append("")
 
@@ -1346,6 +1327,7 @@ def _write_submit_file(
     priority: int = 0,
     extra_classads: dict[str, str] | None = None,
     output_dir: str = "",
+    transfer_executable: bool = True,
 ) -> None:
     stem = Path(path).stem
     out_prefix = f"{output_dir}/" if output_dir else ""
@@ -1367,6 +1349,8 @@ def _write_submit_file(
     if environment:
         env_str = " ".join(f"{k}={v}" for k, v in environment.items())
         lines.append(f'environment = "{env_str}"')
+    if not transfer_executable:
+        lines.append("transfer_executable = false")
     lines.append("should_transfer_files = YES")
     lines.append("when_to_transfer_output = ON_EXIT")
     # X509 proxy delegation (following CRABServer approach):
@@ -1388,7 +1372,18 @@ def _write_submit_file(
     # MaxWallTimeMins: glidein START checks remaining lifetime against this.
     # Without it, the default (16h) rejects many short-lived glideins.
     lines.append("+MaxWallTimeMins = 1440")
-    lines.append('+CMS_Type = "Production"')
+    lines.append('+CMS_Type = "production"')
+    lines.append('+CMS_JobType = "Processing"')
+    # CMS_MATCH_MICROARCH: glidein START expression evaluates the slot's own
+    # CMS_MATCH_MICROARCH which compares int(REQUIRED_MINIMUM_MICROARCH) against
+    # the slot's Microarch level. Must be an integer (2 = x86_64-v2, 3 = v3).
+    lines.append("+CMS_MATCH_MICROARCH = true")
+    lines.append('+CMS_ALLOW_OVERFLOW = "True"')
+    lines.append("+REQUIRED_MINIMUM_MICROARCH = 2")
+    # CMS accounting group: the global pool has three groups:
+    # highprio, production, analysis. Use "production" to match Tier-0 jobs.
+    lines.append("accounting_group = production")
+    lines.append("accounting_group_user = dmytro")
     req_parts = []
     if allowed_sites:
         pos = " || ".join(
@@ -1468,7 +1463,7 @@ ELECTED_SITE_FILE=$1
 LOG_FILE=$2
 # Extract the cluster ID from the landing node's HTCondor log.
 # The log contains "Job submitted from host" with (cluster.proc.subproc) pattern.
-CLUSTER_ID=$(grep -o '([0-9]*\\.' "$LOG_FILE" 2>/dev/null | head -1 | tr -d '(.')
+CLUSTER_ID=$(grep -o '([0-9]*\\.' "$LOG_FILE" 2>/dev/null | tail -1 | tr -d '(.')
 if [ -n "$CLUSTER_ID" ]; then
     SITE=$(condor_history "${CLUSTER_ID}.0" -limit 1 -af MATCH_GLIDEIN_CMSSite 2>/dev/null)
 fi
@@ -1584,35 +1579,6 @@ case "$CLASSIFICATION" in
     *)
         exit 1 ;;
 esac
-""")
-    os.chmod(path, 0o755)
-
-
-def _write_landing_post_script(path: str) -> None:
-    """Combined POST script for the landing proc node (spool/global pool mode).
-
-    Runs post_script.sh first.  If the job succeeded (exit 0), also runs
-    elect_site.sh to lock the remaining nodes to the elected site.
-    Propagates the exit code from post_script.sh in all cases.
-    """
-    _write_file(path, """\
-#!/bin/bash
-# landing_post.sh — combined POST script for landing proc node
-# Args: $JOB $RETURN $RETRY $MAX_RETRIES group_dir elected_site_file log_file
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-JOB=$1; RETURN=$2; RETRY=$3; MAX_RETRIES=$4; GROUP_DIR=$5
-ELECTED_SITE_FILE=$6; LOG_FILE=$7
-
-# Run standard post_script first
-"$SCRIPT_DIR/post_script.sh" "$JOB" "$RETURN" "$RETRY" "$MAX_RETRIES" "$GROUP_DIR"
-POST_RC=$?
-
-# If the job succeeded, elect the site for remaining nodes
-if [ "$RETURN" -eq 0 ]; then
-    "$SCRIPT_DIR/elect_site.sh" "$ELECTED_SITE_FILE" "$LOG_FILE"
-fi
-
-exit $POST_RC
 """)
     os.chmod(path, 0o755)
 
@@ -1749,7 +1715,26 @@ cmssw_env_exec() {
     local scram_arch="$1"
     shift
     local arch_os="${scram_arch%%_*}"   # "el8" from "el8_amd64_gcc10"
-    if [[ -x "$CMSSW_ENV" ]]; then
+
+    # If already inside a container (glidein-provided), skip cmssw-env to avoid
+    # nested singularity/apptainer which fails on many grid sites.
+    # Detection: APPTAINER_CONTAINER or SINGULARITY_CONTAINER env vars, or /.singularity.d
+    if [[ -n "${APPTAINER_CONTAINER:-}" || -n "${SINGULARITY_CONTAINER:-}" || -d "/.singularity.d" ]]; then
+        echo "  [cmssw_env_exec] Already inside container, running directly"
+        export SCRAM_ARCH="$scram_arch"
+        # cmsset_default.sh expects VO_CMS_SW_DIR, CMS_PATH, SITECONFIG_PATH;
+        # set if missing to avoid "unbound variable" errors under set -u
+        # in glidein containers.
+        export VO_CMS_SW_DIR="${VO_CMS_SW_DIR:-/cvmfs/cms.cern.ch}"
+        export CMS_PATH="${CMS_PATH:-/cvmfs/cms.cern.ch}"
+        export SITECONFIG_PATH="${SITECONFIG_PATH:-/cvmfs/cms.cern.ch/SITECONF/local}"
+        # Temporarily disable nounset — cmsset_default.sh references many
+        # potentially-unset vars (CVSROOT, MANPATH, etc.) that we can't predict.
+        set +u
+        source /cvmfs/cms.cern.ch/cmsset_default.sh
+        set -u
+        "$@"
+    elif [[ -x "$CMSSW_ENV" ]]; then
         "$CMSSW_ENV" --cmsos "$arch_os" -- "$@"
     else
         echo "ERROR: cmssw-env not found at $CMSSW_ENV (is CVMFS mounted?)" >&2
@@ -1762,19 +1747,44 @@ run_step() {
     local cmssw="$1" arch="$2" cmsrun_args="$3" cmsrun_cwd="${4:-}"
 
     # Resolve siteconfig path: default to /opt/cms/siteconf if SITECONFIG_PATH unset
-    local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+    local SITE_CFG="${SITECONFIG_PATH:-}"
+    if [[ -z "$SITE_CFG" || ! -d "$SITE_CFG/JobConfig" ]]; then
+        for _try in /opt/cms/siteconf /cvmfs/cms.cern.ch/SITECONF/local; do
+            if [[ -f "$_try/JobConfig/site-local-config.xml" ]]; then
+                SITE_CFG="$_try"
+                break
+            fi
+        done
+    fi
+    echo "siteconf: ${SITE_CFG:-NOT FOUND}"
 
     # Copy siteconf files into the execute directory so they're available
     # inside the container via the working-directory bind mount.
     # Layout for SITECONFIG_PATH (CMSSW >=14.x): _siteconf/JobConfig/site-local-config.xml
     mkdir -p "$WORK_DIR/_siteconf/JobConfig"
     cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
-    [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
-    [[ -f "$SITE_CFG/storage.json" ]] && cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+    # Copy PhEDEx — check current dir and parent (for subsite siteconfs)
+    if [[ -d "$SITE_CFG/PhEDEx" ]]; then
+        cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
+    elif [[ -d "$SITE_CFG/../PhEDEx" ]]; then
+        cp -r "$SITE_CFG/../PhEDEx" "$WORK_DIR/_siteconf/"
+    fi
+    # Copy storage.json — check current dir and parent (for subsite siteconfs)
+    if [[ -f "$SITE_CFG/storage.json" ]]; then
+        cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+    elif [[ -f "$SITE_CFG/../storage.json" ]]; then
+        cp "$SITE_CFG/../storage.json" "$WORK_DIR/_siteconf/"
+    fi
+    # Also place at $WORK_DIR/ — CMSSW subsites look at SITECONFIG_PATH/../storage.json
+    [[ -f "$WORK_DIR/_siteconf/storage.json" ]] && cp "$WORK_DIR/_siteconf/storage.json" "$WORK_DIR/"
     # Layout for CMS_PATH (CMSSW <14.x): _siteconf/SITECONF/local/JobConfig/site-local-config.xml
     mkdir -p "$WORK_DIR/_siteconf/SITECONF/local/JobConfig"
     cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/SITECONF/local/JobConfig/" 2>/dev/null || true
-    [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+    if [[ -d "$SITE_CFG/PhEDEx" ]]; then
+        cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+    elif [[ -d "$SITE_CFG/../PhEDEx" ]]; then
+        cp -r "$SITE_CFG/../PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+    fi
     # Rewrite catalog URLs in copied siteconf to use absolute paths within _siteconf.
     # TrivialFileCatalog resolves relative to CWD, not SITECONFIG_PATH, so we must
     # make the PhEDEx/storage.xml reference absolute to where we copied it.
@@ -1999,14 +2009,36 @@ run_step0_parallel() {
     echo "  Parallel execution: $n_par instances, $events_per_inst events each"
 
     # Prepare siteconf for container access
-    local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+    local SITE_CFG="${SITECONFIG_PATH:-}"
+    if [[ -z "$SITE_CFG" || ! -d "$SITE_CFG/JobConfig" ]]; then
+        for _try in /opt/cms/siteconf /cvmfs/cms.cern.ch/SITECONF/local; do
+            if [[ -f "$_try/JobConfig/site-local-config.xml" ]]; then
+                SITE_CFG="$_try"
+                break
+            fi
+        done
+    fi
+    echo "siteconf: ${SITE_CFG:-NOT FOUND}"
     mkdir -p "$WORK_DIR/_siteconf/JobConfig"
     cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
-    [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
-    [[ -f "$SITE_CFG/storage.json" ]] && cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+    if [[ -d "$SITE_CFG/PhEDEx" ]]; then
+        cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
+    elif [[ -d "$SITE_CFG/../PhEDEx" ]]; then
+        cp -r "$SITE_CFG/../PhEDEx" "$WORK_DIR/_siteconf/"
+    fi
+    if [[ -f "$SITE_CFG/storage.json" ]]; then
+        cp "$SITE_CFG/storage.json" "$WORK_DIR/_siteconf/"
+    elif [[ -f "$SITE_CFG/../storage.json" ]]; then
+        cp "$SITE_CFG/../storage.json" "$WORK_DIR/_siteconf/"
+    fi
+    [[ -f "$WORK_DIR/_siteconf/storage.json" ]] && cp "$WORK_DIR/_siteconf/storage.json" "$WORK_DIR/"
     mkdir -p "$WORK_DIR/_siteconf/SITECONF/local/JobConfig"
     cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/SITECONF/local/JobConfig/" 2>/dev/null || true
-    [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+    if [[ -d "$SITE_CFG/PhEDEx" ]]; then
+        cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+    elif [[ -d "$SITE_CFG/../PhEDEx" ]]; then
+        cp -r "$SITE_CFG/../PhEDEx" "$WORK_DIR/_siteconf/SITECONF/local/"
+    fi
     for slc in "$WORK_DIR/_siteconf/JobConfig/site-local-config.xml" \
                "$WORK_DIR/_siteconf/SITECONF/local/JobConfig/site-local-config.xml"; do
         [[ -f "$slc" ]] && sed -i "s|trivialcatalog_file:[^?]*storage.xml|trivialcatalog_file:$WORK_DIR/_siteconf/PhEDEx/storage.xml|g" "$slc"
@@ -2155,7 +2187,16 @@ run_all_steps_pipeline() {
     done
 
     # Prepare siteconf for container access
-    local SITE_CFG="${SITECONFIG_PATH:-/opt/cms/siteconf}"
+    local SITE_CFG="${SITECONFIG_PATH:-}"
+    if [[ -z "$SITE_CFG" || ! -d "$SITE_CFG/JobConfig" ]]; then
+        for _try in /opt/cms/siteconf /cvmfs/cms.cern.ch/SITECONF/local; do
+            if [[ -f "$_try/JobConfig/site-local-config.xml" ]]; then
+                SITE_CFG="$_try"
+                break
+            fi
+        done
+    fi
+    echo "siteconf: ${SITE_CFG:-NOT FOUND}"
     mkdir -p "$WORK_DIR/_siteconf/JobConfig"
     cp "$SITE_CFG/JobConfig/site-local-config.xml" "$WORK_DIR/_siteconf/JobConfig/" 2>/dev/null || true
     [[ -d "$SITE_CFG/PhEDEx" ]] && cp -r "$SITE_CFG/PhEDEx" "$WORK_DIR/_siteconf/"
@@ -2730,7 +2771,7 @@ try:
         print(0)
         raise SystemExit
     if gp.endswith('.tar.xz') or gp.endswith('.xz'):
-        r = subprocess.run(['xz', '-l', '--robot', gp], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(['xz', '-l', '--robot', gp], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
         for line in r.stdout.strip().split(chr(10)):
             if line.startswith('totals'):
                 parts = line.split()
@@ -3371,9 +3412,10 @@ def _write_merge_script(path: str) -> None:
     Falls back to hadd if CMSSW setup fails.
     For text files: concatenates proc_*.out into merged text output.
     """
-    # Use venv Python in shebang for numpy/uproot availability (simulator merge)
+    # Use /usr/bin/env python3 for portability (grid WNs don't have the venv).
+    # Simulator merge (numpy/uproot) only works locally where the venv is available.
     _venv_python = sys.executable
-    _script = '''#!__VENV_PYTHON__
+    _script = '''#!/usr/bin/env python3
 """wms2_merge.py — WMS2 merge job.
 
 Reads proc outputs from unmerged site storage, merges them, writes to merged
@@ -3435,9 +3477,23 @@ if stageout_mode == "grid":
     try:
         import wms2_stageout
         stageout = wms2_stageout
-        siteconfig = os.environ.get("SITECONFIG_PATH", "/opt/cms/siteconf")
+        # Resolve siteconf: prefer _siteconf copy, then GLIDEIN_CMSSite, then env, then CVMFS
         if os.path.isdir("_siteconf") and os.path.isfile("_siteconf/storage.json"):
             siteconfig = os.path.abspath("_siteconf")
+        else:
+            # GLIDEIN_CMSSite is passed via $$() in submit file — most reliable on grid
+            _glidein_site = os.environ.get("GLIDEIN_CMSSite", "")
+            if _glidein_site:
+                _site_path = f"/cvmfs/cms.cern.ch/SITECONF/{_glidein_site}"
+                if os.path.isfile(os.path.join(_site_path, "storage.json")):
+                    siteconfig = _site_path
+            if not siteconfig:
+                siteconfig = os.environ.get("SITECONFIG_PATH", "")
+            if not siteconfig or not os.path.isfile(os.path.join(siteconfig, "storage.json")):
+                for _try in ["/opt/cms/siteconf", "/cvmfs/cms.cern.ch/SITECONF/local"]:
+                    if os.path.isfile(os.path.join(_try, "storage.json")):
+                        siteconfig = _try
+                        break
         # Probe the write command once
         _probe_lfn = datasets[0].get("unmerged_lfn_base", "/store/test") + "/probe"
         _, grid_write_cmd = stageout.resolve_write_pfn(_probe_lfn, siteconfig)
@@ -3519,9 +3575,20 @@ def write_merge_pset(pset_path, input_files, output_file, is_nano=False, is_dqmi
         fh.write("\\n".join(lines) + "\\n")
 
 
+def _resolve_siteconf():
+    """Find the siteconf directory on this host."""
+    env_val = os.environ.get("SITECONFIG_PATH", "")
+    if env_val and os.path.isdir(os.path.join(env_val, "JobConfig")):
+        return env_val
+    for candidate in ["/opt/cms/siteconf", "/cvmfs/cms.cern.ch/SITECONF/local"]:
+        if os.path.isfile(os.path.join(candidate, "JobConfig", "site-local-config.xml")):
+            return candidate
+    return os.environ.get("SITECONFIG_PATH", "/opt/cms/siteconf")
+
+
 def _prepare_siteconf(work_dir):
     """Copy site-local-config into work_dir/_siteconf for container access."""
-    site_cfg = os.environ.get("SITECONFIG_PATH", "/opt/cms/siteconf")
+    site_cfg = _resolve_siteconf()
     # Layout for SITECONFIG_PATH (CMSSW >=14.x)
     local_siteconf = os.path.join(work_dir, "_siteconf", "JobConfig")
     os.makedirs(local_siteconf, exist_ok=True)
@@ -3533,9 +3600,11 @@ def _prepare_siteconf(work_dir):
     except Exception:
         pass
     phedex_src = os.path.join(site_cfg, "PhEDEx")
+    phedex_dst = os.path.join(work_dir, "_siteconf", "PhEDEx")
     if os.path.isdir(phedex_src):
-        shutil.copytree(phedex_src, os.path.join(work_dir, "_siteconf", "PhEDEx"),
-                        dirs_exist_ok=True)
+        if os.path.isdir(phedex_dst):
+            shutil.rmtree(phedex_dst)
+        shutil.copytree(phedex_src, phedex_dst)
     storage_json = os.path.join(site_cfg, "storage.json")
     if os.path.isfile(storage_json):
         shutil.copy2(storage_json, os.path.join(work_dir, "_siteconf"))
@@ -3551,7 +3620,9 @@ def _prepare_siteconf(work_dir):
         work_dir, "_siteconf", "SITECONF", "local", "PhEDEx"
     )
     if os.path.isdir(phedex_src):
-        shutil.copytree(phedex_src, local_cms_phedex, dirs_exist_ok=True)
+        if os.path.isdir(local_cms_phedex):
+            shutil.rmtree(local_cms_phedex)
+        shutil.copytree(phedex_src, local_cms_phedex)
 
 
 def run_cmsrun(pset_path, cmssw_version, scram_arch, work_dir):
@@ -3585,7 +3656,7 @@ cmsRun {pset_path}
     cmd = cmssw_env_cmd(scram_arch, ["bash", runner_path])
 
     print(f"  Running: cmsRun {os.path.basename(pset_path)} (CMSSW {cmssw_version}, {scram_arch})")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=7200)
 
     if result.stdout:
         for line in result.stdout.strip().split("\\n")[-10:]:
@@ -3621,7 +3692,7 @@ def merge_root_with_hadd(root_files, out_file, cmssw_version, scram_arch):
     cmd = cmssw_env_cmd(scram_arch, ["bash", "-c", hadd_script])
 
     print(f"  Fallback: hadd -f {out_file} ({len(root_files)} inputs)")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=3600)
 
     if result.stdout:
         for line in result.stdout.strip().split("\\n")[-5:]:
@@ -3832,6 +3903,7 @@ has_unmerged = any(ds.get("unmerged_lfn_base") for ds in datasets)
 
 if has_unmerged and stageout_mode == "grid" and stageout is not None:
     # Grid mode: discover files via remote listing, download JSON, resolve ROOT file URLs
+    proc_node_indices = info.get("proc_node_indices", [])
     for ds in datasets:
         unmerged_base = ds.get("unmerged_lfn_base", "")
         if not unmerged_base:
@@ -3840,27 +3912,63 @@ if has_unmerged and stageout_mode == "grid" and stageout is not None:
         write_pfn, write_cmd = stageout.resolve_write_pfn(unmerged_lfn_dir + "/probe", siteconfig)
         write_pfn_dir = os.path.dirname(write_pfn)
         print(f"Grid listing: {write_pfn_dir} (cmd={write_cmd})")
+        entries = []
         try:
             entries = stageout.list_dir(write_pfn_dir, write_cmd)
         except Exception as e:
             print(f"WARNING: Grid list failed for {write_pfn_dir}: {e}")
-            continue
 
-        # Download JSON files (manifests, metrics) to local working dir
-        for entry in entries:
-            if entry.endswith("_outputs.json"):
-                lfn = f"{unmerged_lfn_dir}/{entry}"
-                pfn, cmd = stageout.resolve_write_pfn(lfn, siteconfig)
-                local = os.path.join(os.getcwd(), entry)
-                stageout.download_file(pfn, local, cmd)
-                unmerged_manifests.append(local)
-            elif entry.endswith("_metrics.json") or entry.endswith("_cgroup.json"):
-                lfn = f"{unmerged_lfn_dir}/{entry}"
-                pfn, cmd = stageout.resolve_write_pfn(lfn, siteconfig)
-                local = os.path.join(os.getcwd(), entry)
-                stageout.download_file(pfn, local, cmd)
-                if entry.endswith("_metrics.json"):
-                    unmerged_metrics.append(local)
+        # Fallback: if listing returned empty but we know proc indices,
+        # probe for expected files directly (works around gfal-ls failures)
+        if not entries and proc_node_indices:
+            print(f"  Grid listing empty, probing {len(proc_node_indices)} proc outputs...")
+            for ni in proc_node_indices:
+                # Try to download the outputs manifest for this proc node
+                manifest_name = f"proc_{ni}_outputs.json"
+                lfn = f"{unmerged_lfn_dir}/{manifest_name}"
+                local = os.path.join(os.getcwd(), manifest_name)
+                try:
+                    pfn, cmd = stageout.resolve_write_pfn(lfn, siteconfig)
+                    stageout.download_file(pfn, local, cmd)
+                    unmerged_manifests.append(local)
+                    # Parse the manifest to discover ROOT file names
+                    with open(local) as _mf:
+                        _manifest_data = json.load(_mf)
+                    for fname in _manifest_data:
+                        if fname.endswith(".root"):
+                            entries.append(fname)
+                except Exception as _e:
+                    print(f"  Probe failed for proc_{ni}: {_e}")
+                # Also try metrics
+                for suffix in ("_metrics.json", "_cgroup.json"):
+                    aux_name = f"proc_{ni}{suffix}"
+                    aux_lfn = f"{unmerged_lfn_dir}/{aux_name}"
+                    aux_local = os.path.join(os.getcwd(), aux_name)
+                    try:
+                        pfn, cmd = stageout.resolve_write_pfn(aux_lfn, siteconfig)
+                        stageout.download_file(pfn, aux_local, cmd)
+                        if suffix == "_metrics.json":
+                            unmerged_metrics.append(aux_local)
+                    except Exception:
+                        pass
+            if entries:
+                print(f"  Probe discovered {len(entries)} ROOT files")
+        else:
+            # Download JSON files (manifests, metrics) to local working dir
+            for entry in entries:
+                if entry.endswith("_outputs.json"):
+                    lfn = f"{unmerged_lfn_dir}/{entry}"
+                    pfn, cmd = stageout.resolve_write_pfn(lfn, siteconfig)
+                    local = os.path.join(os.getcwd(), entry)
+                    stageout.download_file(pfn, local, cmd)
+                    unmerged_manifests.append(local)
+                elif entry.endswith("_metrics.json") or entry.endswith("_cgroup.json"):
+                    lfn = f"{unmerged_lfn_dir}/{entry}"
+                    pfn, cmd = stageout.resolve_write_pfn(lfn, siteconfig)
+                    local = os.path.join(os.getcwd(), entry)
+                    stageout.download_file(pfn, local, cmd)
+                    if entry.endswith("_metrics.json"):
+                        unmerged_metrics.append(local)
 
         # Resolve ROOT file read URLs (prefer XRootD for direct CMSSW access)
         for entry in entries:
@@ -4156,10 +4264,14 @@ if root_files:
     print(f"Wrote merge_output.json: {len(merge_output['datasets'])} dataset(s)")
 
 else:
-    print(f"Detected {len(text_files)} text file(s) — using text merge mode")
-    merge_text_files(datasets, text_files, local_pfn_prefix, group_index)
+    if text_files:
+        print(f"Detected {len(text_files)} text file(s) — using text merge mode")
+        merge_text_files(datasets, text_files, local_pfn_prefix, group_index)
+    else:
+        print("WARNING: No ROOT files and no text files found — nothing to merge")
+        sys.exit(1)
 '''
-    _write_file(path, _script.replace("__VENV_PYTHON__", _venv_python))
+    _write_file(path, _script)
     os.chmod(path, 0o755)
 
 
@@ -4235,9 +4347,22 @@ if stageout_mode == "grid":
     try:
         import wms2_stageout
         stageout = wms2_stageout
-        siteconfig = os.environ.get("SITECONFIG_PATH", "/opt/cms/siteconf")
+        # Resolve siteconf: prefer _siteconf copy, then GLIDEIN_CMSSite, then env, then CVMFS
         if os.path.isdir("_siteconf") and os.path.isfile("_siteconf/storage.json"):
             siteconfig = os.path.abspath("_siteconf")
+        else:
+            _glidein_site = os.environ.get("GLIDEIN_CMSSite", "")
+            if _glidein_site:
+                _site_path = f"/cvmfs/cms.cern.ch/SITECONF/{_glidein_site}"
+                if os.path.isfile(os.path.join(_site_path, "storage.json")):
+                    siteconfig = _site_path
+            if not siteconfig:
+                siteconfig = os.environ.get("SITECONFIG_PATH", "")
+            if not siteconfig or not os.path.isfile(os.path.join(siteconfig, "storage.json")):
+                for _try in ["/opt/cms/siteconf", "/cvmfs/cms.cern.ch/SITECONF/local"]:
+                    if os.path.isfile(os.path.join(_try, "storage.json")):
+                        siteconfig = _try
+                        break
         print(f"Grid cleanup mode: siteconfig={siteconfig}")
     except Exception as e:
         print(f"WARNING: Grid stageout init failed ({e}), falling back to local", file=sys.stderr)
@@ -4507,7 +4632,8 @@ def _run_cmd(cmd, retries=3, retry_delay=10, description=""):
     for attempt in range(retries):
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=3600,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=3600,
             )
             if result.returncode == 0:
                 return result
@@ -4574,14 +4700,24 @@ def list_dir(pfn_dir, command):
             return sorted(os.listdir(pfn_dir))
         return []
     elif command == "xrdcp":
-        # Extract host and path from root://host//path
+        # xrdfs only supports root:// URLs; for davs/https, fall through to gfal-ls
         m = re.match(r"(root://[^/]+/)(/.*)", pfn_dir)
-        if not m:
-            return []
-        host_prefix, path = m.group(1), m.group(2)
+        if m:
+            host_prefix, path = m.group(1), m.group(2)
+            result = _run_cmd(
+                ["xrdfs", host_prefix.rstrip("/"), "ls", path],
+                retries=2, description=f"xrdfs ls {path}",
+            )
+            entries = []
+            for line in result.stdout.strip().split("\\n"):
+                line = line.strip()
+                if line:
+                    entries.append(os.path.basename(line))
+            return sorted(entries)
+        # davs:// or https:// — use gfal-ls instead
         result = _run_cmd(
-            ["xrdfs", host_prefix.rstrip("/"), "ls", path],
-            retries=2, description=f"xrdfs ls {path}",
+            ["gfal-ls", pfn_dir],
+            retries=2, description=f"gfal-ls {pfn_dir}",
         )
         entries = []
         for line in result.stdout.strip().split("\\n"):
@@ -4654,13 +4790,18 @@ def mkdir_p(pfn, command):
         os.makedirs(pfn, exist_ok=True)
     elif command == "xrdcp":
         m = re.match(r"(root://[^/]+/)(/.*)", pfn)
-        if not m:
-            return
-        host, path = m.group(1).rstrip("/"), m.group(2)
-        _run_cmd(
-            ["xrdfs", host, "mkdir", "-p", path],
-            retries=2, description=f"xrdfs mkdir -p {path}",
-        )
+        if m:
+            host, path = m.group(1).rstrip("/"), m.group(2)
+            _run_cmd(
+                ["xrdfs", host, "mkdir", "-p", path],
+                retries=2, description=f"xrdfs mkdir -p {path}",
+            )
+        else:
+            # davs:// or https:// — use gfal-mkdir
+            _run_cmd(
+                ["gfal-mkdir", "-p", pfn],
+                retries=2, description=f"gfal-mkdir -p {pfn}",
+            )
     elif command == "gfal-copy":
         _run_cmd(
             ["gfal-mkdir", "-p", pfn],

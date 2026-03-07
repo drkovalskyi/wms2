@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}WMS2 — Monitoring{% endblock %}
+{% block content %}
+<div x-data="monitoringPage" x-init="fetchData()">
+    <h1>HTCondor Job Monitoring</h1>
+
+    <!-- Error banner -->
+    <div x-show="error" class="error-banner" x-text="error"></div>
+    <div x-show="loading && !data" style="opacity:0.6">Loading...</div>
+
+    <!-- Grand totals -->
+    <template x-if="data">
+        <div class="status-cards" style="margin-bottom:1.5rem;">
+            <div class="status-card">
+                <div class="count" style="color:#3b82f6" x-text="data.totals.running"></div>
+                <div class="label">Running</div>
+            </div>
+            <div class="status-card">
+                <div class="count" style="color:#6b7280" x-text="data.totals.idle"></div>
+                <div class="label">Pending</div>
+            </div>
+            <div class="status-card">
+                <div class="count" style="color:#f59e0b" x-text="data.totals.held"></div>
+                <div class="label">Held</div>
+            </div>
+            <div class="status-card">
+                <div class="count" x-text="data.requests.length"></div>
+                <div class="label">Active Requests</div>
+            </div>
+        </div>
+    </template>
+
+    <!-- Per-request table -->
+    <template x-if="data && data.requests.length > 0">
+        <div class="section">
+            <h3>Jobs by Request</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Request</th>
+                        <th>Status</th>
+                        <th>Round</th>
+                        <th style="text-align:right">Running</th>
+                        <th style="text-align:right">Pending</th>
+                        <th style="text-align:right">Held</th>
+                        <th>Sites</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="r in data.requests" :key="r.request_name">
+                        <tr>
+                            <td class="truncate">
+                                <a :href="'/ui/requests/' + encodeURIComponent(r.request_name)"
+                                   x-text="r.request_name"></a>
+                            </td>
+                            <td x-html="statusBadge(r.request_status)"></td>
+                            <td x-text="r.round"></td>
+                            <td style="text-align:right; font-weight:600; color:#3b82f6"
+                                x-text="r.totals.running"></td>
+                            <td style="text-align:right; font-weight:600; color:#6b7280"
+                                x-text="r.totals.idle"></td>
+                            <td style="text-align:right; font-weight:600; color:#f59e0b"
+                                x-text="r.totals.held"></td>
+                            <td>
+                                <span class="site-chips">
+                                    <template x-for="s in requestSites(r)" :key="s.site">
+                                        <span class="site-chip" :title="s.detail">
+                                            <span x-text="s.site || '(unmatched)'"></span>
+                                            <span class="site-counts" x-text="s.label"></span>
+                                        </span>
+                                    </template>
+                                </span>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+                <tfoot>
+                    <tr style="font-weight:700; border-top:2px solid var(--pico-muted-border-color);">
+                        <td colspan="3">Total</td>
+                        <td style="text-align:right; color:#3b82f6" x-text="data.totals.running"></td>
+                        <td style="text-align:right; color:#6b7280" x-text="data.totals.idle"></td>
+                        <td style="text-align:right; color:#f59e0b" x-text="data.totals.held"></td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+    </template>
+
+    <template x-if="data && data.requests.length === 0">
+        <p style="opacity:0.6">No active requests with running DAGs.</p>
+    </template>
+
+    <!-- Per-site summary -->
+    <template x-if="data && allSites.length > 0">
+        <div class="section">
+            <h3>Jobs by Site</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Site</th>
+                        <th style="text-align:right">Running</th>
+                        <th style="text-align:right">Pending</th>
+                        <th style="text-align:right">Held</th>
+                        <th style="text-align:right">Total</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="s in allSites" :key="s.site">
+                        <tr>
+                            <td x-text="s.site || '(unmatched)'"></td>
+                            <td style="text-align:right; color:#3b82f6" x-text="s.running"></td>
+                            <td style="text-align:right; color:#6b7280" x-text="s.idle"></td>
+                            <td style="text-align:right; color:#f59e0b" x-text="s.held"></td>
+                            <td style="text-align:right; font-weight:600" x-text="s.running + s.idle + s.held"></td>
+                        </tr>
+                    </template>
+                </tbody>
+                <tfoot>
+                    <tr style="font-weight:700; border-top:2px solid var(--pico-muted-border-color);">
+                        <td>Total</td>
+                        <td style="text-align:right; color:#3b82f6" x-text="data.totals.running"></td>
+                        <td style="text-align:right; color:#6b7280" x-text="data.totals.idle"></td>
+                        <td style="text-align:right; color:#f59e0b" x-text="data.totals.held"></td>
+                        <td style="text-align:right" x-text="data.totals.running + data.totals.idle + data.totals.held"></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+    </template>
+</div>
+
+<style>
+.site-chips {
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+}
+.site-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    font-size: 0.78rem;
+    background: var(--pico-card-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    white-space: nowrap;
+}
+.site-counts {
+    font-weight: 600;
+    opacity: 0.85;
+}
+</style>
+
+<script>
+document.addEventListener('alpine:init', () => {
+    Alpine.data('monitoringPage', () => ({
+        data: null,
+        loading: true,
+        error: null,
+
+        init() {
+            this.fetchData();
+            window.addEventListener('wms2:refresh', () => this.fetchData());
+        },
+
+        async fetchData() {
+            try {
+                this.error = null;
+                this.loading = true;
+                this.data = await WMS2_API.htcondorOverview();
+            } catch (e) {
+                this.error = e.message;
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        requestSites(r) {
+            // Build sorted list of {site, label, detail} for the chips
+            const entries = Object.entries(r.sites || {})
+                .map(([site, c]) => ({
+                    site,
+                    running: c.running || 0,
+                    idle: c.idle || 0,
+                    held: c.held || 0,
+                }))
+                .filter(s => s.running + s.idle + s.held > 0)
+                .sort((a, b) => (b.running + b.idle + b.held) - (a.running + a.idle + a.held));
+
+            return entries.map(s => {
+                const parts = [];
+                if (s.running) parts.push(s.running + 'r');
+                if (s.idle) parts.push(s.idle + 'i');
+                if (s.held) parts.push(s.held + 'h');
+                return {
+                    site: s.site,
+                    label: parts.join('/'),
+                    detail: `Running: ${s.running}, Pending: ${s.idle}, Held: ${s.held}`,
+                };
+            });
+        },
+
+        get allSites() {
+            if (!this.data || !this.data.totals.by_site) return [];
+            return Object.entries(this.data.totals.by_site)
+                .map(([site, c]) => ({
+                    site,
+                    running: c.running || 0,
+                    idle: c.idle || 0,
+                    held: c.held || 0,
+                }))
+                .sort((a, b) => (b.running + b.idle + b.held) - (a.running + a.idle + a.held));
+        },
+    }));
+});
+</script>
+{% endblock %}

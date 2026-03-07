@@ -51,6 +51,7 @@
                 <th class="sortable" @click="sort('pool')">
                     Pool<span x-text="sortIcon('pool')"></span>
                 </th>
+                <th>Progress</th>
                 <th>Job Priority</th>
                 <th class="sortable" @click="sort('created_at')">
                     Age<span x-text="sortIcon('created_at')"></span>
@@ -69,6 +70,22 @@
                     </td>
                     <td x-html="statusBadge(r.status)"></td>
                     <td x-text="r.pool || '—'"></td>
+                    <td style="min-width:140px;">
+                        <template x-if="r._progress != null">
+                            <div>
+                                <div style="display:flex; justify-content:space-between; font-size:0.8rem; margin-bottom:2px;">
+                                    <span x-text="fmtNum(r._events_produced) + ' / ' + fmtNum(r._target_events)"></span>
+                                    <span x-text="fmtPct(r._progress)"></span>
+                                </div>
+                                <div class="progress-bar" style="height:6px;">
+                                    <div class="fill" :style="'width:' + Math.min(100, r._progress) + '%'"></div>
+                                </div>
+                            </div>
+                        </template>
+                        <template x-if="r._progress == null">
+                            <span style="opacity:0.4;">—</span>
+                        </template>
+                    </td>
                     <td x-text="(r.request_data && r.request_data._current_job_priority != null) ? r.request_data._current_job_priority : '—'"></td>
                     <td x-text="fmtAge(r.created_at)"></td>
                     <td x-text="fmtAge(r.updated_at)"></td>

@@ -467,3 +467,57 @@ class HTCondorAdapter(CondorAdapter):
     async def get_job_iwd(self, cluster_id: str,
                           schedd_name: str | None = None) -> str | None:
         return await asyncio.to_thread(self._get_job_iwd_sync, cluster_id, schedd_name)
+
+    def _query_dag_site_summary_sync(
+        self, cluster_id: str, schedd_name: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Per-site job status counts for payload jobs under a DAGMan hierarchy."""
+        schedd = self._get_schedd(schedd_name)
+        sub_dagman_ads = schedd.query(
+            constraint=f"DAGManJobId == {cluster_id} && JobUniverse == 7",
+            projection=["ClusterId"],
+        )
+        if not sub_dagman_ads:
+            return {}
+
+        sub_ids = [str(int(ad["ClusterId"])) for ad in sub_dagman_ads]
+        parts = " || ".join(f"DAGManJobId == {sid}" for sid in sub_ids)
+        constraint = f"({parts}) && JobUniverse =!= 7"
+
+        ads = schedd.query(
+            constraint=constraint,
+            projection=["JobStatus", "MATCH_GLIDEIN_CMSSite", "DESIRED_Sites"],
+        )
+
+        is_local = schedd_name in (None, "localhost", self._default_schedd_name)
+
+        result: dict[str, dict[str, int]] = {}
+        for ad in ads:
+            status_int = int(ad.get("JobStatus", 0))
+            site = ad.get("MATCH_GLIDEIN_CMSSite") or ""
+            if not site:
+                if is_local:
+                    site = "local"
+                else:
+                    # Use DESIRED_Sites for pinned idle/held jobs
+                    desired = ad.get("DESIRED_Sites") or ""
+                    if desired:
+                        site = desired
+                    elif status_int == 1:
+                        site = "pending"
+            if site not in result:
+                result[site] = {"running": 0, "idle": 0, "held": 0}
+            if status_int == 1:
+                result[site]["idle"] += 1
+            elif status_int == 2:
+                result[site]["running"] += 1
+            elif status_int == 5:
+                result[site]["held"] += 1
+        return result
+
+    async def query_dag_site_summary(
+        self, cluster_id: str, schedd_name: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        return await asyncio.to_thread(
+            self._query_dag_site_summary_sync, cluster_id, schedd_name
+        )

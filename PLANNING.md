@@ -18,6 +18,11 @@ to be acceptable.
 Make sure that running in the global pool works reliably. Focus on
 debugging.
 
+### Things to review
+
+- pilot concept needs to be clarified. there should be no "pilot",
+  round 0 in a request processing is the pilot.
+
 ### Service mode
 
 Build the service that manages requests autonomously:
@@ -61,6 +66,15 @@ Build observability for WMS2:
 - **Remote schedd rescue DAG** — copy `.rescue001` from sshfs mount into local
   submit_dir, apply site exclusions locally, then re-spool. Currently rescue
   resubmission doesn't use spool mode.
+- **Chirp-based landing optimization** — eliminate the trivial `/bin/true`
+  landing node by making proc_000000 elect the site. proc_000000 starts,
+  immediately calls `condor_chirp set_job_attr WMS2_ElectedSite` with
+  MATCH_GLIDEIN_CMSSite, then proceeds with real CMSSW processing. Other proc
+  nodes have no DAG parent dependency on proc_000000; instead, their PRE scripts
+  poll `condor_q` for proc_000000's WMS2_ElectedSite attribute, rewrite their
+  submit files with site pinning, and exit. This saves ~1-2 min of landing
+  overhead while proc_000000 does useful work during site election. Current
+  `/bin/true` landing adds ~60s — this is a minor optimization for later.
 
 ## After every failure
 
@@ -70,6 +84,15 @@ request status. Confirm no time was wasted on unnecessary retries. If
 error handling misbehaved, fix it before re-running.
 
 ---
+
+## Known bugs
+
+- **Local pool memory overcommit** — The local HTCondor pool reports 166 GB
+  slot memory but the machine has only 128 GB physical RAM. With multiple WUs
+  running concurrently, HTCondor schedules more jobs than the machine can
+  handle, causing SIGBUS (bus error) in memory-heavy steps like DRPremix
+  (pileup mixing). Fix: set `MEMORY = 128000` (or actual physical RAM) in
+  HTCondor config so the partitionable slot doesn't overcommit.
 
 ## Technical debt
 
@@ -87,13 +110,39 @@ error handling misbehaved, fix it before re-running.
 
 ### Current status
 
-**Service mode works end-to-end** with real CMSSW workflows. The lifecycle manager
-runs as an autonomous service: CLI imports with `--no-monitor`, service handles
-DAG monitoring, round completion, adaptive optimization, and multi-round planning.
+**Global pool commissioning validated.** Two requests running in the CMS global
+pool (00058 at 94.7%, 00060 at 29.0%) with zero failures. The full pipeline
+works end-to-end: spool-mode DAG submission to remote schedd, grid stageout,
+multi-round adaptive optimization, error recovery (rescue chain + HELD + fresh
+replan). Merges verified at T2_CH_CERN (prefix storage.json) and T1_US_FNAL
+(rules storage.json). No architectural issues found — all bugs were
+implementation-level fixes.
 
-Tested with `cmsunified_task_GEN-Run3Summer23wmLHEGS-00058` (5-step StepChain,
-test_fraction=0.01): round 0 completed autonomously, adaptive optimization reduced
-memory 7900 → 5672 MB, round 1 automatically planned (10 WUs, 80 jobs).
+Four active requests:
+- **00058**: round 17, 56840/60000 events (94.7%) — global pool, near completion
+- **00060**: round 1, 17400/60000 events (29.0%) — global pool, fresh DAG after rescue exhaustion
+- **00057**: round 7, 19960/30000 events (66.5%) — local pool
+- **00059**: completed, 12000/12000 events (100%)
+
+### Global pool commissioning
+
+**Validated:**
+- Spool-mode DAG submission to remote schedd (vocms047.cern.ch)
+- Landing node site election + site pinning (elect_site.sh / pin_site.sh)
+- Grid stageout via storage.json LFN→PFN resolution (xrdcp)
+- Merge at T2_CH_CERN (prefix format, `root://eoscms.cern.ch`)
+- Merge at T1_US_FNAL (rules format, `root://cmseos.fnal.gov`)
+- Cleanup of unmerged files on grid storage
+- Rescue DAG submission in spool mode
+- Rescue chain exhaustion → HELD → fresh replan with updated code
+- Multi-round adaptive optimization across 17+ rounds
+- Autonomous lifecycle manager operation in global pool
+
+**Not yet validated:**
+- Merge at European sites using `davs://` protocol (KIT, NCBJ, DESY) —
+  `proc_node_indices` probe fallback deployed but untested at those sites
+- Production-scale requests (current tests use test_fraction=0.01)
+- TaskChain request type in global pool
 
 ### Verified working
 
@@ -114,25 +163,30 @@ memory 7900 → 5672 MB, round 1 automatically planned (10 WUs, 80 jobs).
   - Supports CMS storage.json formats: prefix, rules, chained rules
   - Self-contained `wms2_stageout.py` utility transferred to worker nodes
   - Local XRootD server at T2_LOCAL_DEV for integration testing
+- **Global pool**: spool-mode submission, site election, grid merge/cleanup at CERN + FNAL
 
 ### Test commands
 
-Service mode (start service + import via CLI):
+Service mode with global pool:
 ```bash
 # Terminal 1: start service
-unset WMS2_CERT_FILE WMS2_KEY_FILE
-WMS2_CONDOR_HOST="localhost:9618" WMS2_LIFECYCLE_CYCLE_INTERVAL=30 \
+WMS2_CONDOR_HOST="localhost:9618" \
+  WMS2_EXTRA_COLLECTORS="cmsgwms-collector-global.cern.ch:9620" \
+  WMS2_LIFECYCLE_CYCLE_INTERVAL=30 \
+  WMS2_SPOOL_MOUNT="/mnt/remote_spool" \
+  WMS2_REMOTE_SPOOL_PREFIX="/data/srv/glidecondor/condor_local/spool" \
+  WMS2_REMOTE_SCHEDD="vocms047.cern.ch" \
+  WMS2_SEC_TOKEN_DIRECTORY="/mnt/creds/tokens.d" \
   uvicorn wms2.main:create_app --factory --host 0.0.0.0 --port 8080
 
 # Terminal 2: import request (exits immediately)
-wms2 import cmsunified_task_GEN-Run3Summer23wmLHEGS-00058__v1_T_230922_115553_5657 \
-  --sandbox-mode cmssw --test-fraction 0.01 --no-monitor
+wms2 import <request_name> --sandbox-mode cmssw --test-fraction 0.01 --no-monitor
 ```
 
-Real CMSSW workflow (CLI monitoring mode):
+Local pool mode:
 ```bash
-wms2 import cmsunified_task_B2G-Run3Summer23BPixwmLHEGS-06000__v1_T_250628_211038_1313 \
-  --sandbox-mode cmssw
+WMS2_CONDOR_HOST="localhost:9618" WMS2_LIFECYCLE_CYCLE_INTERVAL=30 \
+  uvicorn wms2.main:create_app --factory --host 0.0.0.0 --port 8080
 ```
 
 Matrix smoke tests:
@@ -140,14 +194,12 @@ Matrix smoke tests:
 python -m tests.matrix -l smoke
 ```
 
-Adaptive 3-round test:
-```bash
-python -m tests.matrix -l 391.4
-```
-
 ### Known issues
 
 - NanoAOD Rivet segfault on 0 events (CMSSW_10_6_47 bug, not WMS2)
+- Grid listing via `gfal-ls` on `davs://` returns empty at T1_DE_KIT and
+  T1_PL_NCBJ — `proc_node_indices` probe fallback deployed but not yet
+  validated at those sites
 
 ### Historical issues (fixed)
 
@@ -170,3 +222,8 @@ python -m tests.matrix -l 391.4
 17. Matrix mock missing adaptive fields — MagicMock returned mocks instead of ints
 18. CLI duplicated round-completion logic — refactored to shared `complete_round()`
 19. Apptainer `/dev/null: Permission denied` with split_tmpfs — `cd /dev/shm` before launching apptainer caused container's `/dev` mount conflict; fixed by cd-ing to tmpfs inside the container after `cmsset_default.sh`
+20. Workflow status stuck at "resubmitting" after rescue DAG submission — `transition()` only updated request status; fixed to also reset workflow status to ACTIVE
+21. `nodes_done > total_nodes` — total_nodes was stale from DAG creation; fixed with live total computed from inner summary each poll cycle
+22. Stale status files in spool mode — `dag_file_path + ".status"` pointed to old spool dir; fixed with `_resolve_dag_file()` that checks `submit_dir` first
+23. Merge crash on grid workers when gfal-ls returns empty — fell to text merge path, crashed on `os.makedirs("/mnt/shared")` (read-only); fixed with guard to exit with error if no ROOT and no text files
+24. Grid listing empty at T1_DE_KIT/T1_PL_NCBJ — `gfal-ls` on `davs://` returned empty; added `proc_node_indices` probe fallback in merge script

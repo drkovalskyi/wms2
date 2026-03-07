@@ -138,11 +138,22 @@ document.addEventListener('alpine:init', () => {
             const origThreads = cd.multicore;
             const rounds = sm?.rounds || {};
 
-            // Build DAG-by-round index: extract round from dag_file_path
+            // Build DAG-by-round index from creation order.
+            // A new round starts only after a previously completed DAG
+            // (status=completed). Failed/partial DAGs don't advance the
+            // round — the next DAG is a retry or rescue of the same round.
             const dagsByRound = {};
-            for (const d of this.allDags) {
-                const m = (d.dag_file_path || '').match(/round_(\d+)/);
-                const rnd = m ? Number(m[1]) : 0;
+            const sortedDags = [...this.allDags].sort((a, b) =>
+                (a.created_at || '').localeCompare(b.created_at || ''));
+            let rnd = 0;
+            for (let i = 0; i < sortedDags.length; i++) {
+                const d = sortedDags[i];
+                if (i > 0) {
+                    const prev = sortedDags[i - 1];
+                    if (prev.status === 'completed') {
+                        rnd++;
+                    }
+                }
                 if (!dagsByRound[rnd]) dagsByRound[rnd] = [];
                 dagsByRound[rnd].push(d);
             }

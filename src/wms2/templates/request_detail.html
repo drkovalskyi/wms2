@@ -117,6 +117,12 @@
                     <dd x-text="fmtDateTime(request.updated_at)"></dd>
                     <dt>Cleanup Policy</dt>
                     <dd x-text="request.cleanup_policy || '—'"></dd>
+                    <template x-if="testFraction">
+                        <div style="display:contents;">
+                            <dt>Test Fraction</dt>
+                            <dd><span style="color:#b45309; font-weight:600;" x-text="testFraction"></span></dd>
+                        </div>
+                    </template>
                 </dl>
             </div>
 

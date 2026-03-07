@@ -61,7 +61,7 @@ async def create_request(
     return Request.model_validate(row)
 
 
-@router.get("", response_model=list[Request])
+@router.get("")
 async def list_requests(
     status: str | None = None,
     campaign: str | None = None,
@@ -69,8 +69,20 @@ async def list_requests(
     offset: int = 0,
     repo: Repository = Depends(get_repository),
 ):
-    rows = await repo.list_requests(status=status, campaign=campaign, limit=limit, offset=offset)
-    return [Request.model_validate(r) for r in rows]
+    rows = await repo.list_requests_with_progress(
+        status=status, campaign=campaign, limit=limit, offset=offset,
+    )
+    result = []
+    for item in rows:
+        req = Request.model_validate(item["request"])
+        d = req.model_dump(mode="json")
+        ep = item["events_produced"] or 0
+        te = item["target_events"] or 0
+        d["events_produced"] = ep
+        d["target_events"] = te
+        d["progress_pct"] = (ep / te * 100) if te > 0 else None
+        result.append(d)
+    return result
 
 
 @router.get("/{request_name}", response_model=Request)

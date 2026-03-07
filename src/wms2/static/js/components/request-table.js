@@ -24,10 +24,14 @@ document.addEventListener('alpine:init', () => {
                 if (this.filterStatus) params.set('status', this.filterStatus);
                 params.set('limit', '500');
                 const raw = await WMS2_API.listRequests(params.toString());
-                // Enrich with pool from request_data
+                // Progress is now included in the API response — no
+                // extra per-request calls needed.
                 this.requests = raw.map(r => ({
                     ...r,
                     pool: (r.request_data && r.request_data._condor_pool) || 'local',
+                    _progress: r.progress_pct,
+                    _events_produced: r.events_produced || 0,
+                    _target_events: r.target_events || 0,
                 }));
             } catch (e) {
                 this.error = e.message;

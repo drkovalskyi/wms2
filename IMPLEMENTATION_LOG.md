@@ -6,6 +6,66 @@
 
 ---
 
+## 2026-03-07 — Global pool site pinning, merge/cleanup on grid
+
+### What was done
+
+**End-to-end grid execution verified** — request 00058 completed full cycle on the
+CMS global pool: landing node → 8 proc jobs → merge → cleanup, all at T2_CH_CERN.
+Merged AODSIM (183 MB), MINIAODSIM (28 MB), NANOAODSIM (3.2 MB) uploaded to EOS
+via xrdcp. Round 0 completed, lifecycle manager advanced to round 1 with 10 WUs
+across multiple sites (T1_US_FNAL, T1_DE_KIT, T1_ES_PIC, T1_IT_CNAF, T2_CH_CERN).
+
+**Fixes applied:**
+
+1. **Site pinning always on** — removed `skip_site_pinning = (stageout_mode == "grid")`.
+   Even in grid mode, merge/cleanup must run at the same site as proc because they
+   resolve storage endpoints from site-specific storage.json. Without pinning, merge
+   jobs landed at wrong sites (e.g., T2_US_Vanderbilt instead of T2_CH_CERN).
+
+2. **Landing node transfer_executable=false** — `/bin/true` was being transferred to
+   worker nodes, causing GLIBC version mismatch (vocms047 has GLIBC 2.34, some workers
+   have older). Fixed by adding `transfer_executable = false` to landing.sub.
+
+3. **Python 3.6 compatibility** — grid worker nodes run Python 3.6 which doesn't
+   support `shutil.copytree(dirs_exist_ok=True)` (added in 3.8). Replaced with
+   rmtree+copytree pattern.
+
+4. **Spool mode cleanup_manifest path** — in spool mode, merge job outputs end up at
+   the spool root, not in mg_xxx/ subdirectory. Fixed cleanup.sub to reference
+   `cleanup_manifest.json` without the mg_xxx/ prefix in spool mode.
+
+5. **Spool mode metrics path** — dag_monitor and lifecycle_manager now check the spool
+   root as fallback when work_unit_metrics.json isn't found in group subdirectory.
+
+6. **Proc retries increased to 5** — ~20-30% of T2_CH_CERN workers have broken CVMFS.
+   With 3 retries, single-WU DAGs failed too often. 5 retries provides enough headroom.
+
+7. **GLIDEIN_CMSSite in job environment** — passed via `$$([GLIDEIN_CMSSite])` HTCondor
+   syntax so merge/cleanup scripts can find the correct site-specific siteconf at
+   `/cvmfs/cms.cern.ch/SITECONF/<site>/storage.json`.
+
+8. **Merge siteconf resolution** — merge and cleanup scripts now resolve siteconf
+   using GLIDEIN_CMSSite environment variable, falling back to CVMFS paths.
+
+### Known issues
+
+- **Multi-WU spool output conflict** — when multiple WUs run in one DAG (round 1+),
+  their merge jobs all write output files (work_unit_metrics.json, cleanup_manifest.json,
+  merge_output.json) to the spool root, overwriting each other. Needs unique naming
+  per WU. Single-WU case (test_fraction runs) works correctly.
+
+- **Rucio SSL certificate expired** — pileup file queries fall back to AAA prefixes.
+
+### Verification
+
+- Request 00058 round 0: 8 proc jobs + merge + cleanup completed at T2_CH_CERN
+- All three tiers merged and uploaded to EOS via xrdcp
+- Round transition: lifecycle manager advanced to round 1 with 10 WUs
+- Round 1 jobs pinned to multiple sites (T1_US_FNAL, T1_DE_KIT, T1_ES_PIC, etc.)
+
+---
+
 ## 2026-03-04 — Fix adaptive memory to use historical peak across all rounds, improve Round History UI
 
 ### What was done

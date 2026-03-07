@@ -16,6 +16,8 @@ BACKOFF_BASE = 1.0
 class DBSClient(DBSAdapter):
     def __init__(self, base_url: str, cert_file: str, key_file: str, verify=True):
         self._base_url = base_url.rstrip("/")
+        # Write operations (POST/PUT) need the DBSWriter endpoint
+        self._write_url = self._base_url.replace("/DBSReader", "/DBSWriter")
         self._client = httpx.AsyncClient(
             cert=(cert_file, key_file),
             verify=verify,
@@ -68,7 +70,7 @@ class DBSClient(DBSAdapter):
         resp.raise_for_status()
 
     async def invalidate_dataset(self, dataset_name: str, reason: str) -> None:
-        url = f"{self._base_url}/datasets"
+        url = f"{self._write_url}/datasets"
         payload = {
             "dataset": dataset_name,
             "dataset_access_type": "INVALID",
@@ -76,12 +78,13 @@ class DBSClient(DBSAdapter):
         resp = await self._client.put(url, json=payload)
         resp.raise_for_status()
 
-    async def open_block(self, dataset_name: str, block_index: int) -> str:
-        url = f"{self._base_url}/blocks"
+    async def open_block(self, dataset_name: str, block_index: int,
+                         origin_site_name: str = "local") -> str:
+        url = f"{self._write_url}/blocks"
         block_name = f"{dataset_name}#block_{block_index}"
         payload = {
             "block_name": block_name,
-            "origin_site_name": "local",
+            "origin_site_name": origin_site_name,
             "open_for_writing": 1,
         }
         resp = await self._client.post(url, json=payload)
@@ -89,16 +92,29 @@ class DBSClient(DBSAdapter):
         return block_name
 
     async def register_files(self, block_name: str, files: list[dict]) -> None:
-        url = f"{self._base_url}/files"
+        url = f"{self._write_url}/files"
+        # Map WMS2 field names to DBS API field names
+        dbs_files = []
+        for f in files:
+            dbs_files.append({
+                "logical_file_name": f.get("lfn", f.get("logical_file_name", "")),
+                "file_size": f.get("size", f.get("file_size", 0)),
+                "check_sum": f.get("check_sum", "0"),
+                "adler32": f.get("adler32", "NOTSET"),
+                "event_count": f.get("event_count", 0),
+                "file_type": f.get("file_type", "EDM"),
+            })
         payload = {
             "block_name": block_name,
-            "files": files,
+            "files": dbs_files,
         }
         resp = await self._client.post(url, json=payload)
+        if resp.status_code != 200:
+            logger.error("DBS register_files failed (%d): %s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
 
     async def close_block(self, block_name: str) -> None:
-        url = f"{self._base_url}/blocks"
+        url = f"{self._write_url}/blocks"
         payload = {
             "block_name": block_name,
             "open_for_writing": 0,
@@ -107,7 +123,7 @@ class DBSClient(DBSAdapter):
         resp.raise_for_status()
 
     async def invalidate_block(self, block_name: str) -> None:
-        url = f"{self._base_url}/blocks"
+        url = f"{self._write_url}/blocks"
         payload = {
             "block_name": block_name,
             "block_access_type": "INVALID",

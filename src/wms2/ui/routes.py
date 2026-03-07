@@ -52,6 +52,14 @@ async def dag_detail(dag_id: str, request: Request):
     })
 
 
+@ui_router.get("/monitoring")
+async def monitoring_page(request: Request):
+    return templates.TemplateResponse(request, "monitoring.html", {
+        "api_prefix": request.app.state.settings.api_prefix,
+        "active_page": "monitoring",
+    })
+
+
 @ui_router.get("/import")
 async def import_page(request: Request):
     return templates.TemplateResponse(request, "import.html", {

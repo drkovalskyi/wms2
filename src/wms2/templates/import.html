@@ -4,6 +4,12 @@
 <script src="/static/js/components/import-form.js"></script>
 <style>
 @keyframes spin { to { transform: rotate(360deg); } }
+.preview-panel { background: var(--card-bg); padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+.preview-panel dt { font-weight: 600; display: inline; }
+.preview-panel dt::after { content: ': '; }
+.preview-panel dd { display: inline; margin: 0; }
+.preview-panel .preview-row { margin-bottom: 0.25rem; }
+.wu-estimate { background: var(--card-bg); padding: 1rem; border-radius: 4px; }
 </style>
 {% endblock %}
 {% block content %}
@@ -19,10 +25,69 @@
         <form @submit.prevent="submit()">
             <div class="form-group">
                 <label for="request-name">Request Name *</label>
-                <input id="request-name" type="text" x-model="requestName"
-                       placeholder="cmsunified_task_..." required>
-                <div class="form-help">The ReqMgr2 request name to import.</div>
+                <div style="display:flex; gap:0.5rem;">
+                    <input id="request-name" type="text" x-model="requestName"
+                           placeholder="cmsunified_task_..." required style="flex:1"
+                           @keydown.enter.prevent="loadPreview()">
+                    <button type="button" @click="loadPreview()"
+                            :disabled="!requestName.trim() || previewLoading"
+                            style="white-space:nowrap;">
+                        <span x-text="previewLoading ? 'Loading...' : 'Load'"></span>
+                    </button>
+                </div>
+                <div class="form-help">The ReqMgr2 request name to import. Click Load to preview parameters.</div>
             </div>
+
+            <div x-show="previewError" style="color:var(--del-color); margin-bottom:1rem; font-size:0.9rem;" x-text="previewError"></div>
+
+            <!-- ReqMgr2 preview summary -->
+            <template x-if="preview">
+                <div class="preview-panel">
+                    <strong style="display:block; margin-bottom:0.5rem;">ReqMgr2 Parameters</strong>
+                    <div class="preview-row"><dt>RequestType</dt><dd x-text="preview.request_type"></dd>
+                        <template x-if="preview.step_count">
+                            <span x-text="' (' + preview.step_count + ' steps)'"></span>
+                        </template>
+                    </div>
+                    <div class="preview-row"><dt>CMSSWVersion</dt><dd x-text="preview.cmssw_version"></dd></div>
+                    <div class="preview-row"><dt>ScramArch</dt><dd x-text="preview.scram_arch"></dd></div>
+                    <template x-if="preview.campaign">
+                        <div class="preview-row"><dt>Campaign</dt><dd x-text="preview.campaign"></dd></div>
+                    </template>
+                    <template x-if="preview.requestor">
+                        <div class="preview-row"><dt>Requestor</dt><dd x-text="preview.requestor"></dd></div>
+                    </template>
+                    <div class="preview-row"><dt>Memory</dt><dd x-text="preview.memory_mb + ' MB'"></dd></div>
+                    <div class="preview-row"><dt>Multicore</dt><dd x-text="preview.multicore"></dd></div>
+                    <template x-if="preview.time_per_event">
+                        <div class="preview-row"><dt>TimePerEvent</dt><dd x-text="preview.time_per_event + ' s'"></dd></div>
+                    </template>
+                    <template x-if="preview.size_per_event">
+                        <div class="preview-row"><dt>SizePerEvent</dt><dd x-text="preview.size_per_event + ' KB'"></dd></div>
+                    </template>
+                    <template x-if="preview.is_gen">
+                        <div>
+                            <div class="preview-row"><dt>FilterEfficiency</dt><dd x-text="preview.filter_efficiency"></dd></div>
+                        </div>
+                    </template>
+                    <template x-if="!preview.is_gen && preview.input_dataset">
+                        <div>
+                            <div class="preview-row"><dt>InputDataset</dt><dd x-text="preview.input_dataset" style="font-size:0.85rem;"></dd></div>
+                            <div class="preview-row"><dt>SplittingAlgo</dt><dd x-text="preview.splitting_algo"></dd></div>
+                        </div>
+                    </template>
+                    <template x-if="preview.output_datasets && preview.output_datasets.length">
+                        <div class="preview-row">
+                            <dt>OutputDatasets</dt>
+                            <dd>
+                                <template x-for="ds in preview.output_datasets" :key="ds">
+                                    <div x-text="ds" style="font-size:0.85rem; margin-left:0.5rem;"></div>
+                                </template>
+                            </dd>
+                        </div>
+                    </template>
+                </div>
+            </template>
 
             <div class="form-group">
                 <label for="sandbox-mode">Sandbox Mode</label>
@@ -36,8 +101,8 @@
             <div class="form-group">
                 <label for="test-fraction">Test Fraction</label>
                 <input id="test-fraction" type="number" x-model="testFraction"
-                       step="0.001" min="0.001" max="1" placeholder="e.g. 0.01">
-                <div class="form-help">Process only this fraction of events per job (e.g. 0.01 = 1%). Leave empty for full processing.</div>
+                       step="0.001" min="0.001" max="1" placeholder="Empty = full processing">
+                <div class="form-help">Fraction of events per job (e.g. 0.01 = 1%). Empty means each job processes all its events — use this for production.</div>
             </div>
 
             <div class="form-group">
@@ -60,6 +125,38 @@
                        min="0" placeholder="0 = all">
                 <div class="form-help">Limit DBS file query (0 or empty = all files).</div>
             </div>
+
+            <template x-if="preview && preview.is_gen">
+                <div class="form-group">
+                    <label for="request-num-events">Request Num Events</label>
+                    <input id="request-num-events" type="number" x-model="requestNumEvents"
+                           min="1" placeholder="From ReqMgr2">
+                    <div class="form-help">Total number of events to produce. Auto-populated from ReqMgr2; edit to override.</div>
+                </div>
+            </template>
+
+            <div class="form-group">
+                <label for="wu-per-round">Work Units per Round</label>
+                <input id="wu-per-round" type="number" x-model="workUnitsPerRound"
+                       min="1" placeholder="Default: 10">
+                <div class="form-help">Number of work units per production round (Round 1+). Leave empty for global default.</div>
+            </div>
+
+            <!-- WU estimate (GEN workflows) -->
+            <template x-if="preview && preview.is_gen && estimatedTotalWUs !== null">
+                <div class="wu-estimate" style="margin-bottom:1rem;">
+                    <strong>Estimated Work Units</strong>
+                    <div>Total WUs: <span x-text="estimatedTotalWUs"></span></div>
+                    <div>Round 0 (pilot): <span x-text="preview.defaults.first_round_work_units"></span> WU</div>
+                    <div>WUs per round: <span x-text="parseInt(workUnitsPerRound) || preview.defaults.work_units_per_round"></span></div>
+                    <div>Estimated rounds: <span x-text="estimatedRounds"></span></div>
+                </div>
+            </template>
+            <template x-if="preview && !preview.is_gen">
+                <div class="wu-estimate" style="margin-bottom:1rem; opacity:0.7;">
+                    WU estimate requires DBS file query (computed at import time).
+                </div>
+            </template>
 
             <div class="form-group">
                 <label for="processing-version">Processing Version</label>
