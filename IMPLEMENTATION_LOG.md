@@ -6,6 +6,85 @@
 
 ---
 
+## 2026-03-07 — Global pool commissioning: monitoring fixes, merge hardening
+
+### What was done
+
+**Global pool commissioning validated** with two requests (00058, 00060) running
+end-to-end on the CMS global pool with zero failures. 00058 reached round 17
+(94.7% of 60K events), 00060 recovered from rescue chain exhaustion with a fresh
+DAG plan. Merges verified at T2_CH_CERN (prefix storage.json) and T1_US_FNAL
+(rules storage.json).
+
+### Bugs found and fixed
+
+1. **Workflow status stuck at "resubmitting"** — After rescue DAG submission,
+   `transition()` only updated request status (→ ACTIVE) but not workflow status
+   (stayed RESUBMITTING). The lifecycle manager's `_handle_active` then skipped
+   the workflow because it looked like it was still being resubmitted.
+   Fix: added `update_workflow(status=ACTIVE)` in `_handle_queued` after rescue
+   DAG submission (lifecycle_manager.py ~line 580).
+
+2. **nodes_done > total_nodes** — `total_nodes` was set once at DAG creation and
+   never updated. Rescue DAGs inherited stale counts. When inner nodes completed,
+   `nodes_done` grew past the stale total.
+   Fix: compute `live_total` from inner summary counts each poll cycle
+   (dag_monitor.py ~line 136).
+
+3. **Stale status files in spool mode** — The monitor read `dag_file_path + ".status"`
+   which pointed to the old spool directory when rescue DAGs got new submit_dirs.
+   This caused stale data (e.g., reading the completed round's status for the
+   current rescue DAG).
+   Fix: added `_resolve_dag_file()` helper that checks `submit_dir` first, falling
+   back to `dag_file_path` (dag_monitor.py ~line 162).
+
+4. **Merge crash on grid workers** — When `gfal-ls` returned empty results (no ROOT
+   files found), the merge script fell through to the text merge path, then crashed
+   calling `os.makedirs("/mnt/shared")` which is read-only on grid workers.
+   Fix: guard with `if text_files:` check; exit with error if no ROOT and no text
+   files found (dag_planner.py ~line 4266).
+
+5. **Grid listing empty at T1_DE_KIT/T1_PL_NCBJ** — `gfal-ls` on `davs://` URLs
+   returned empty despite files existing. Root cause unknown (possibly auth or
+   WebDAV protocol issue at those sites).
+   Fix: added `proc_node_indices` to output_info.json and probe-based fallback in
+   the merge script that individually downloads each proc output manifest when
+   directory listing fails (dag_planner.py ~line 1071, ~line 3923).
+
+### Error recovery validation
+
+00060 went through the full error recovery path:
+- Original DAG (cluster 164236) → partial (merge failures at KIT/NCBJ)
+- Rescue 1 (165674) → partial (same merge failures)
+- Rescue 2 (165844) → partial (same merge failures)
+- Rescue 3 (165874) → partial (same merge failures, rescue chain exhausted)
+- Error handler returned `action="hold"` (rescue_count >= max_rescue_attempts=3)
+- Request transitioned to HELD
+- Released via `POST /api/v1/requests/.../release` → QUEUED
+- Lifecycle manager planned fresh DAG with updated merge script (cluster 166004)
+- New DAG running with 0 failures — both CERN and FNAL merges successful
+
+### Monitoring consistency
+
+Verified that DB/API monitoring data matches condor reality for all requests:
+- Inner node counts from `.status` files match DB (done, running, queued, total)
+- The DagStatus block's `NodesQueued`/`JobProcsIdle` split correctly distinguishes
+  actually-running vs idle-in-queue jobs
+- `total_nodes` updates dynamically as new merge groups are submitted
+
+### Design validation
+
+No architectural issues found. All bugs were implementation-level:
+- Wrong file paths (spool mode)
+- Missing status updates (workflow status after rescue)
+- Missing guards (empty listing, no-file merge)
+- Stale cached values (total_nodes)
+
+The core design (SUBDAG EXTERNAL, landing nodes, spool submission, grid stageout,
+lifecycle manager autonomy) works correctly in the global pool.
+
+---
+
 ## 2026-03-07 — Global pool site pinning, merge/cleanup on grid
 
 ### What was done
