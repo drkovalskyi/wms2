@@ -439,6 +439,31 @@ class DAGPlanner:
                 logger.warning("Could not fetch site list for DESIRED_Sites")
 
         t_gen = time.monotonic()
+        effective_stageout = _effective_stageout(
+            config.get("stageout_mode", self.settings.stageout_mode)
+        )
+        effective_allowed = (
+            [s.strip() for s in config.get("allowed_sites", "").split(",") if s.strip()]
+            or [s.strip() for s in self.settings.allowed_sites.split(",") if s.strip()]
+            or None
+        )
+
+        # In test stageout mode, restrict to sites with _Temp RSE entries
+        # so that Rucio registration and consolidation can succeed.
+        raw_stageout = config.get("stageout_mode", self.settings.stageout_mode)
+        if raw_stageout == "test" and use_spool:
+            from wms2.core.output_manager import TEMP_RSE_PFN_PREFIXES
+            rucio_sites = {
+                rse.replace("_Temp", "")
+                for rse in TEMP_RSE_PFN_PREFIXES
+            }
+            if rucio_sites:
+                if effective_allowed:
+                    effective_allowed = [s for s in effective_allowed if s in rucio_sites]
+                else:
+                    effective_allowed = sorted(rucio_sites)
+                logger.info("Test mode: restricted to Rucio-enabled sites: %s", effective_allowed)
+
         dag_file_path = _generate_dag_files(
             submit_dir=submit_dir,
             workflow_id=str(workflow.id),
@@ -456,14 +481,10 @@ class DAGPlanner:
             pileup_files=pileup_files or None,
             job_priority=job_priority,
             extra_classads=config.get("extra_classads"),
-            stageout_mode=_effective_stageout(config.get("stageout_mode", self.settings.stageout_mode)),
+            stageout_mode=effective_stageout,
             pileup_remote_read=self.settings.pileup_remote_read,
             spool_mode=use_spool,
-            allowed_sites=(
-                [s.strip() for s in config.get("allowed_sites", "").split(",") if s.strip()]
-                or [s.strip() for s in self.settings.allowed_sites.split(",") if s.strip()]
-                or None
-            ),
+            allowed_sites=effective_allowed,
             all_sites=all_site_names or None,
         )
 
@@ -1162,9 +1183,11 @@ def _generate_group_dag(
     out_dir = mg_name if spool_mode else ""
 
     if not skip_site_pinning:
-        # Trivial landing node: /bin/true job with free site selection.
+        # Landing node: /bin/true job with free site selection.
         # Its POST script (elect_site.sh) extracts MATCH_GLIDEIN_CMSSite
         # so remaining nodes can be pinned to the same site.
+        # Request the same resources as proc jobs so that the landing only
+        # matches at sites that can actually run the heavy processing.
         landing_priority = max(job_priority, 5) + 10
         landing_classads = dict(extra_classads or {})
         landing_classads["WMS2_QuickJob"] = "True"
@@ -1176,6 +1199,9 @@ def _generate_group_dag(
             desired_sites=all_desired,
             banned_sites=banned_sites,
             allowed_sites=allowed_sites,
+            memory_mb=memory_mb,
+            ncpus=ncpus,
+            disk_kb=disk_kb,
             priority=landing_priority,
             extra_classads=landing_classads,
             output_dir=out_dir,
@@ -1952,9 +1978,13 @@ for filename, finfo in file_map.items():
     tier = finfo['tier'] if isinstance(finfo, dict) else finfo
     unmerged_base = tier_to_unmerged.get(tier, '')
     if not unmerged_base:
-        # Try EDM variant: NANOEDMAODSIM files match NANOAODSIM dataset
+        # Try EDM variant + strip numeric suffix:
+        # NANOEDMAODSIM1 -> NANOAODSIM matches NANOAODSIM
+        import re as _re
+        tier_norm = _re.sub(r'(EDM)?(\\d+)$', '', tier.upper())
         for ds_tier, base in tier_to_unmerged.items():
-            if tier.upper().replace(\"EDM\", \"\") == ds_tier.upper():
+            ds_norm = _re.sub(r'\\d+$', '', ds_tier.upper())
+            if tier_norm == ds_norm:
                 unmerged_base = base
                 break
     if not unmerged_base:
@@ -4132,9 +4162,13 @@ if root_files:
         tier_files = tier_to_files.get(ds_tier, [])
         step_idx = tier_to_step.get(ds_tier, -1)
         if not tier_files:
-            # Try EDM variant: NANOEDMAODSIM files match NANOAODSIM dataset
+            # Try EDM variant + strip numeric suffix:
+            # NANOEDMAODSIM1 -> NANOAODSIM matches NANOAODSIM
+            import re as _re
+            ds_norm = _re.sub(r'\\d+$', '', ds_tier.upper())
             for tier, files in tier_to_files.items():
-                if tier.upper().replace("EDM", "") == ds_tier.upper():
+                tier_norm = _re.sub(r'(EDM)?(\\d+)$', '', tier.upper())
+                if tier_norm == ds_norm:
                     tier_files = files
                     step_idx = tier_to_step.get(tier, -1)
                     break

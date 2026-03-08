@@ -6,6 +6,70 @@
 
 ---
 
+## 2026-03-08 — Service resilience: crash detection and auto-recovery
+
+### What was done
+
+Added crash detection and auto-recovery for WMS2 background tasks. The service
+previously had no supervision — if the lifecycle manager or CRIC sync task died
+from an unhandled exception, uvicorn kept serving HTTP but background work stopped
+silently. The `/lifecycle/status` and `/health` endpoints reported everything as
+fine regardless of actual task state.
+
+### Changes
+
+1. **Background task watchdog + auto-restart** (`src/wms2/main.py`)
+   - Added `_make_task_watchdog()` — returns an `asyncio.Task` done callback that
+     logs the exception and schedules a restart via `loop.call_later(10s)`
+   - Attached watchdog callbacks to both `lifecycle_task` and `cric_sync_task`
+   - Added `app.state.task_health` dict tracking per-task: `started_at`,
+     `last_cycle_at`, `cycle_count`, `last_error`, `restarts`
+   - CRIC sync loop updates its health counters after each successful/failed cycle
+   - `on_lifecycle_cycle` callback passed to lifecycle manager for per-cycle updates
+   - Shutdown logic now cancels current tasks from `app.state` (handles
+     watchdog-replaced tasks correctly)
+
+2. **Lifecycle cycle callback** (`src/wms2/core/lifecycle_manager.py`)
+   - Added optional `on_cycle` parameter to `RequestLifecycleManager.__init__`
+   - `main_loop()` calls `on_cycle(None)` on success, `on_cycle(exc)` on error,
+     at the end of each iteration (after sleep)
+
+3. **Fixed `/lifecycle/status`** (`src/wms2/api/lifecycle.py`)
+   - Was: `lm is not None` (attribute existence — always true after first cycle)
+   - Now: `task is not None and not task.done()` (actual task liveness)
+   - Added `cycle_count`, `last_cycle_at`, `last_error`, `restarts` to response
+   - `restart_lifecycle()` now attaches watchdog callback, passes `on_cycle`,
+     resets health counters
+
+4. **Enhanced `/health`** (`src/wms2/api/monitoring.py`)
+   - Was: always returned `{"status": "ok"}`
+   - Now: checks DB connectivity (`SELECT 1` with 5s timeout) and background
+     task liveness (`task.done()`)
+   - Returns `"degraded"` if any check fails, with `"checks"` detail object
+
+5. **Start script** (`scripts/start-service.sh`)
+   - Convenience nohup launcher: clears .pyc, kills old uvicorn, starts fresh,
+     logs to `wms2.log`
+
+### Files changed
+
+| File | What |
+|------|------|
+| `src/wms2/main.py` | Watchdog callbacks, task_health dict, auto-restart |
+| `src/wms2/core/lifecycle_manager.py` | `on_cycle` callback hook |
+| `src/wms2/api/lifecycle.py` | Fix status check, attach watchdog on restart |
+| `src/wms2/api/monitoring.py` | Real health checks (DB + task liveness) |
+| `scripts/start-service.sh` (new) | Convenience nohup launcher |
+
+### Verification
+
+- Service started, `/health` returns `{"status": "ok", "checks": {"database": "ok", "lifecycle": "running", "cric_sync": "running"}}`
+- `/lifecycle/status` returns `{"running": true, "cycle_count": 0, ...}` with new fields
+- UI dashboard loads correctly (HTTP 200)
+- All modules compile without circular import issues
+
+---
+
 ## 2026-03-07 — Global pool commissioning: monitoring fixes, merge hardening
 
 ### What was done

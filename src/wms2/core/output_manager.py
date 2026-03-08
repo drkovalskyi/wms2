@@ -282,6 +282,20 @@ class OutputManager:
         cd = config_data or {}
         consolidation_rse = cd.get("consolidation_rse", "")
         if consolidation_rse:
+            # Skip consolidation if no files were registered in Rucio
+            # (e.g. execution site has no _Temp RSE in test mode)
+            file_sites = {f.get("site", "") for f in (block.output_files or [])}
+            has_rucio_files = any(
+                f"{s}_Temp" in TEMP_RSE_PFN_PREFIXES or s in TEMP_RSE_PFN_PREFIXES
+                for s in file_sites if s
+            )
+            if not has_rucio_files and cd.get("stageout_mode") == "test":
+                logger.info(
+                    "Skipping consolidation for block %s — "
+                    "no files registered in Rucio (execution sites: %s)",
+                    block.id, file_sites,
+                )
+                return
             stageout_mode = cd.get("stageout_mode", "local")
             ds = block.dataset_name
             parts = ds.strip("/").split("/")
@@ -397,6 +411,22 @@ class OutputManager:
         """
         if not self._should_retry(block):
             return
+
+        # Skip if no files are at Rucio-enabled sites (test mode)
+        cd_check = config_data or {}
+        if cd_check.get("stageout_mode") == "test":
+            file_sites = {f.get("site", "") for f in (block.output_files or [])}
+            has_rucio_files = any(
+                f"{s}_Temp" in TEMP_RSE_PFN_PREFIXES or s in TEMP_RSE_PFN_PREFIXES
+                for s in file_sites if s
+            )
+            if not has_rucio_files:
+                logger.info(
+                    "Skipping consolidation retry for block %s — "
+                    "no files at Rucio-enabled sites",
+                    block.id,
+                )
+                return
 
         # Re-register DIDs grouped by site
         if block.output_files:

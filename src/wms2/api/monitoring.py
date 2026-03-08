@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+import sqlalchemy
 from fastapi import APIRouter, Depends, Request as FastAPIRequest
 from fastapi.responses import PlainTextResponse
 
@@ -15,8 +16,40 @@ router = APIRouter(tags=["monitoring"])
 
 
 @router.get("/health")
-async def health():
-    return {"status": "ok", "version": __version__}
+async def health(raw_request: FastAPIRequest):
+    checks = {}
+    degraded = False
+
+    # DB connectivity
+    try:
+        session_factory = getattr(raw_request.app.state, "session_factory", None)
+        if session_factory:
+            async with session_factory() as session:
+                await asyncio.wait_for(
+                    session.execute(sqlalchemy.text("SELECT 1")), timeout=5.0,
+                )
+            checks["database"] = "ok"
+        else:
+            checks["database"] = "unavailable"
+            degraded = True
+    except Exception as exc:
+        checks["database"] = f"error: {exc}"
+        degraded = True
+
+    # Background task liveness
+    for task_name in ("lifecycle", "cric_sync"):
+        task = getattr(raw_request.app.state, f"{task_name}_task", None)
+        if task is not None and not task.done():
+            checks[task_name] = "running"
+        else:
+            checks[task_name] = "dead"
+            degraded = True
+
+    return {
+        "status": "degraded" if degraded else "ok",
+        "version": __version__,
+        "checks": checks,
+    }
 
 
 @router.get("/status")

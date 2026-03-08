@@ -326,6 +326,8 @@ class RequestLifecycleManager:
         dag_monitor=None,
         output_manager=None,
         error_handler=None,
+        # Optional per-cycle callback: called with None on success, exc on failure
+        on_cycle=None,
     ):
         self.condor = condor_adapter
         self.settings = settings
@@ -352,6 +354,7 @@ class RequestLifecycleManager:
         self.dbs = dbs
         self.rucio = rucio
         self.cric = cric
+        self.on_cycle = on_cycle
         self.workflow_manager = workflow_manager
         self.dag_planner = dag_planner
         self.dag_monitor = dag_monitor
@@ -407,6 +410,7 @@ class RequestLifecycleManager:
         """Main loop: create fresh session per cycle, evaluate all requests."""
         logger.info("Lifecycle manager main_loop started")
         while True:
+            cycle_exc = None
             try:
                 logger.debug("Lifecycle cycle starting")
                 async with self.session_factory() as session:
@@ -439,9 +443,16 @@ class RequestLifecycleManager:
             except asyncio.CancelledError:
                 logger.info("Lifecycle manager shutting down")
                 break
-            except Exception:
+            except Exception as exc:
+                cycle_exc = exc
                 logger.exception("Lifecycle manager cycle error")
                 await asyncio.sleep(self.settings.lifecycle_cycle_interval)
+
+            if self.on_cycle:
+                try:
+                    self.on_cycle(cycle_exc)
+                except Exception:
+                    logger.debug("on_cycle callback error", exc_info=True)
 
     async def evaluate_request(self, request):
         """Match on current status, dispatch to the appropriate handler."""

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,6 +24,39 @@ from wms2.db.engine import create_engine, create_session_factory
 from wms2.db.repository import Repository
 
 logger = logging.getLogger(__name__)
+
+WATCHDOG_RESTART_DELAY = 10  # seconds before auto-restarting a dead task
+
+
+def _make_task_watchdog(app, task_name: str, coro_factory):
+    """Return a done callback that logs failures and auto-restarts the task.
+
+    coro_factory is a zero-arg callable returning a coroutine to schedule.
+    """
+    def _on_done(task: asyncio.Task):
+        exc = task.exception() if not task.cancelled() else None
+        health = app.state.task_health[task_name]
+        if exc:
+            health["last_error"] = f"{type(exc).__name__}: {exc}"
+            logger.error("Background task %s died: %s", task_name, exc, exc_info=exc)
+        elif task.cancelled():
+            logger.info("Background task %s cancelled", task_name)
+            return  # don't restart on intentional cancellation
+
+        # Schedule a restart after a short delay
+        loop = asyncio.get_event_loop()
+        def _restart():
+            health["restarts"] += 1
+            health["started_at"] = time.time()
+            logger.info("Auto-restarting background task %s (restart #%d)",
+                        task_name, health["restarts"])
+            new_task = asyncio.create_task(coro_factory())
+            new_task.add_done_callback(_make_task_watchdog(app, task_name, coro_factory))
+            setattr(app.state, f"{task_name}_task", new_task)
+
+        loop.call_later(WATCHDOG_RESTART_DELAY, _restart)
+
+    return _on_done
 
 
 def _build_condor(settings: Settings):
@@ -97,6 +131,19 @@ async def lifespan(app: FastAPI):
     app.state.dbs = dbs
     app.state.rucio = rucio
 
+    # Task health tracking
+    now = time.time()
+    app.state.task_health = {
+        "lifecycle": {
+            "started_at": now, "last_cycle_at": None,
+            "cycle_count": 0, "last_error": None, "restarts": 0,
+        },
+        "cric_sync": {
+            "started_at": now, "last_cycle_at": None,
+            "cycle_count": 0, "last_error": None, "restarts": 0,
+        },
+    }
+
     # Initial CRIC sync (populate sites table at startup)
     try:
         async with session_factory() as session:
@@ -110,6 +157,7 @@ async def lifespan(app: FastAPI):
 
     # Periodic CRIC sync background task
     async def run_cric_sync():
+        health = app.state.task_health["cric_sync"]
         interval = settings.cric_sync_interval
         if interval <= 0:
             return
@@ -122,38 +170,58 @@ async def lifespan(app: FastAPI):
                     stats = await sm.sync_from_cric()
                     await session.commit()
                     logger.info("Periodic CRIC sync: %s", stats)
+                health["last_cycle_at"] = time.time()
+                health["cycle_count"] += 1
+                health["last_error"] = None
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                health["last_error"] = f"{type(exc).__name__}: {exc}"
                 logger.exception("Periodic CRIC sync failed")
 
     cric_sync_task = asyncio.create_task(run_cric_sync())
+    cric_sync_task.add_done_callback(
+        _make_task_watchdog(app, "cric_sync", run_cric_sync))
     app.state.cric_sync_task = cric_sync_task
+
+    # Lifecycle cycle callback — updates task_health from main_loop
+    def on_lifecycle_cycle(exc):
+        health = app.state.task_health["lifecycle"]
+        health["last_cycle_at"] = time.time()
+        health["cycle_count"] += 1
+        if exc:
+            health["last_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            health["last_error"] = None
 
     # Start lifecycle manager
     async def run_lifecycle():
         lm = RequestLifecycleManager(
             session_factory, condor, settings,
             reqmgr=reqmgr, dbs=dbs, rucio=rucio, cric=cric,
+            on_cycle=on_lifecycle_cycle,
         )
         app.state.lifecycle_manager = lm
         await lm.main_loop()
 
     lifecycle_task = asyncio.create_task(run_lifecycle())
+    lifecycle_task.add_done_callback(
+        _make_task_watchdog(app, "lifecycle", run_lifecycle))
     app.state.lifecycle_task = lifecycle_task
 
     logger.info("WMS2 v%s started", __version__)
 
     yield
 
-    # Shutdown
-    cric_sync_task.cancel()
-    lifecycle_task.cancel()
-    for task in (cric_sync_task, lifecycle_task):
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    # Shutdown — cancel current tasks (may differ from originals if watchdog restarted them)
+    for task_attr in ("cric_sync_task", "lifecycle_task"):
+        task = getattr(app.state, task_attr, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     await engine.dispose()
     logger.info("WMS2 shut down")
 

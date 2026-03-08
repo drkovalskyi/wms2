@@ -88,6 +88,19 @@ instances before enabling.
   submit files with site pinning, and exit. This saves ~1-2 min of landing
   overhead while proc_000000 does useful work during site election. Current
   `/bin/true` landing adds ~60s — this is a minor optimization for later.
+  **Concerns:** (1) PRE scripts run on the schedd (vocms047), need to know
+  proc_000000's cluster ID to poll — requires DAGMan variable substitution or
+  a shared file; (2) `condor_chirp` availability varies across grid sites —
+  not all worker node environments expose it; (3) if proc_000000 fails before
+  chirping (e.g. CVMFS unavailable), other PRE scripts need timeout/fallback
+  logic to avoid blocking forever; (4) DAG structure changes fundamentally —
+  all procs become root nodes with PRE scripts instead of children of landing,
+  making rescue DAG behavior less predictable; (5) the real cost of the current
+  landing is not the ~1s `/bin/true` execution but the ~100s wait for an
+  8-core/16GB slot to match (since the landing now requests full proc
+  resources) — chirp doesn't eliminate this wait, it just hides it inside
+  proc_000000's startup; (6) current approach is simple, reliable, and
+  well-tested across multiple sites.
 
 ## After every failure
 

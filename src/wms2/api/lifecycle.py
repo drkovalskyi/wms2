@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -34,10 +35,16 @@ EDITABLE_FIELDS = {
 
 @router.get("/status")
 async def lifecycle_status(request: Request):
-    lm = getattr(request.app.state, "lifecycle_manager", None)
+    task = getattr(request.app.state, "lifecycle_task", None)
+    task_alive = task is not None and not task.done()
+    health = getattr(request.app.state, "task_health", {}).get("lifecycle", {})
     return {
-        "running": lm is not None,
+        "running": task_alive,
         "cycle_interval": request.app.state.settings.lifecycle_cycle_interval,
+        "cycle_count": health.get("cycle_count", 0),
+        "last_cycle_at": health.get("last_cycle_at"),
+        "last_error": health.get("last_error"),
+        "restarts": health.get("restarts", 0),
     }
 
 
@@ -126,15 +133,38 @@ async def restart_lifecycle(request: Request):
     rucio = getattr(app.state, "rucio", None)
     cric = getattr(app.state, "cric", None)
 
+    # Lifecycle cycle callback — updates task_health from main_loop
+    def on_lifecycle_cycle(exc):
+        health = app.state.task_health["lifecycle"]
+        health["last_cycle_at"] = time.time()
+        health["cycle_count"] += 1
+        if exc:
+            health["last_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            health["last_error"] = None
+
     async def run_lifecycle():
         lm = RequestLifecycleManager(
             session_factory, condor, settings,
             reqmgr=reqmgr, dbs=dbs, rucio=rucio, cric=cric,
+            on_cycle=on_lifecycle_cycle,
         )
         app.state.lifecycle_manager = lm
         await lm.main_loop()
 
+    # Reset health counters for the restarted task
+    health = app.state.task_health["lifecycle"]
+    health["started_at"] = time.time()
+    health["last_cycle_at"] = None
+    health["cycle_count"] = 0
+    health["last_error"] = None
+    health["restarts"] += 1
+
+    from wms2.main import _make_task_watchdog
+
     new_task = asyncio.create_task(run_lifecycle())
+    new_task.add_done_callback(
+        _make_task_watchdog(app, "lifecycle", run_lifecycle))
     app.state.lifecycle_task = new_task
     logger.info("Restarted lifecycle manager task")
 
