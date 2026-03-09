@@ -322,8 +322,10 @@ def load_cgroup_metrics(
     """
     cgroup_pattern = re.compile(r"proc_(\d+)_cgroup\.json$")
 
-    # Search same dirs as analyze_wu_metrics
-    search_dirs = [group_dir]
+    # Search same dirs as analyze_wu_metrics — include parent dir
+    # because in spool mode HTCondor transfers proc output to the spool
+    # root (parent of mg_xxx/)
+    search_dirs = [group_dir, group_dir.parent]
     output_info_path = group_dir / "output_info.json"
     if output_info_path.exists():
         try:

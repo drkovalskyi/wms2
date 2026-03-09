@@ -6,6 +6,47 @@
 
 ---
 
+## 2026-03-09 — Fix cgroup memory not reported in spool mode
+
+### What was done
+
+Fixed missing cgroup memory in the workflow detail UI for spool-mode DAGs.
+The "Cgroup (MB)" column showed "—" for all rounds despite cgroup data being
+available on disk.
+
+### Root cause
+
+`load_cgroup_metrics()` in `adaptive.py` searched only `[group_dir]` (the
+`mg_*/` subdirectory) for `proc_*_cgroup.json` files. In spool mode, HTCondor
+transfers proc job output to the spool root (parent of `mg_*/`), not into the
+merge group directory. The sibling function `analyze_wu_metrics()` correctly
+searched `[group_dir, group_dir.parent]` and found `proc_*_metrics.json` at
+the spool root — but `load_cgroup_metrics` was missing the parent fallback.
+
+Without cgroup data, the adaptive optimizer fell through to the FJR RSS branch,
+setting `memory_source = "prior_rss"`. The UI only shows cgroup memory when
+`memory_source.startsWith('cgroup')`.
+
+### Fix
+
+Added `group_dir.parent` to `search_dirs` in `load_cgroup_metrics()`, matching
+the search logic in `analyze_wu_metrics()`. One-line fix.
+
+### Impact
+
+- Future rounds will use cgroup-measured memory (e.g. 11888 MB) instead of
+  FJR RSS (~6700 MB) — more accurate since cgroup captures subprocess memory
+- `memory_source` changes from `"prior_rss"` to `"cgroup"` or `"cgroup_measured"`
+- UI "Cgroup (MB)" column will display actual values
+
+### Verification
+
+- Confirmed `proc_*_cgroup.json` files exist at spool root with valid data
+  (e.g. `peak_nonreclaim_mb: 11888`)
+- Matrix smoke tests: all 5 passed
+
+---
+
 ## 2026-03-09 — Pilot→production WU sizing fix, UUID merge filenames, large-tier skip-merge
 
 ### What was done
