@@ -155,6 +155,7 @@ def _compute_adaptive_params(config, dag, workflow, new_metrics, settings):
             jobs_per_wu=settings.jobs_per_work_unit,
             min_request_cpus=settings.min_request_cpus,
             historical_peak_rss_mb=historical_peak_rss_mb,
+            split_tmpfs=config.get("split_tmpfs", False),
         )
     except Exception:
         logger.exception("Adaptive optimization failed — using defaults")
@@ -264,6 +265,9 @@ async def complete_round(repo, settings, workflow, dag):
         effective_epj = node_counts_rc.get("effective_events_per_job") or \
             (params.get("events_per_job") or params.get("eventsPerJob") or 100_000)
         new_metrics["rounds"][round_key]["effective_events_per_job"] = int(effective_epj)
+        eff_frac = node_counts_rc.get("effective_fraction")
+        if eff_frac is not None:
+            new_metrics["rounds"][round_key]["effective_fraction"] = float(eff_frac)
 
     # ── Adaptive optimization ──
     adaptive_params = _compute_adaptive_params(
@@ -811,8 +815,10 @@ class RequestLifecycleManager:
                 if getattr(request, "adaptive", False):
                     # Re-fetch dag — poll_dag updated DB but our object is stale
                     dag = await self.db.get_dag(workflow.dag_id)
+                    await self._cleanup_condor_dag(dag)
                     await self._handle_round_completion(request, workflow, dag)
                     return
+                await self._cleanup_condor_dag(dag)
                 await self.transition(request, RequestStatus.COMPLETED)
                 return
             elif result.status in (DAGStatus.PARTIAL, DAGStatus.FAILED):
@@ -839,6 +845,7 @@ class RequestLifecycleManager:
             return
 
         if dag.status == DAGStatus.COMPLETED.value:
+            await self._cleanup_condor_dag(dag)
             if self.output_manager:
                 try:
                     if not await self.output_manager.all_blocks_archived(workflow.id):
@@ -872,7 +879,11 @@ class RequestLifecycleManager:
             await self.transition(request, RequestStatus.HELD)
 
     async def _handle_stopping(self, request):
-        """Monitor clean stop progress. Retry condor_rm if DAG is still alive."""
+        """Monitor clean stop progress. Retry condor_rm if DAG is still alive.
+
+        If the DAG's stop_reason starts with "FAIL:", transition to FAILED
+        instead of PAUSED (operator requested fail via /fail endpoint).
+        """
         workflow = await self.db.get_workflow_by_request(request.request_name)
         if not workflow or not workflow.dag_id:
             return
@@ -885,9 +896,25 @@ class RequestLifecycleManager:
             schedd_name=dag.schedd_name, cluster_id=dag.dagman_cluster_id
         )
         if dagman_status is None:
-            # DAGMan process gone — stop complete, park in PAUSED
-            await self.db.update_dag(dag.id, status=DAGStatus.STOPPED.value)
-            await self.transition(request, RequestStatus.PAUSED)
+            # DAGMan process gone — stop complete
+            fail_requested = (dag.stop_reason or "").startswith("FAIL:")
+
+            if fail_requested:
+                # Operator requested fail — mark everything failed
+                await self.db.update_dag(dag.id, status=DAGStatus.FAILED.value)
+                for d in await self.db.list_dags(workflow_id=workflow.id):
+                    if d.status not in (DAGStatus.FAILED.value, DAGStatus.COMPLETED.value):
+                        await self.db.update_dag(d.id, status=DAGStatus.FAILED.value)
+                for block in await self.db.get_processing_blocks(workflow.id):
+                    if block.status == "open":
+                        await self.db.update_processing_block(block.id, status="failed")
+                await self.db.update_workflow(workflow.id, status="failed")
+                await self.transition(request, RequestStatus.FAILED)
+                logger.info("Request %s: stopping -> failed (operator-initiated)", request.request_name)
+            else:
+                # Normal clean stop — park in PAUSED
+                await self.db.update_dag(dag.id, status=DAGStatus.STOPPED.value)
+                await self.transition(request, RequestStatus.PAUSED)
         else:
             # DAGMan still alive — retry condor_rm
             try:
@@ -1346,6 +1373,29 @@ class RequestLifecycleManager:
         if deleted:
             logger.info("Pilot throwaway: deleted %d merged output files for %s",
                         deleted, workflow.request_name)
+
+    # ── Condor Cleanup ─────────────────────────────────────────
+
+    async def _cleanup_condor_dag(self, dag):
+        """Remove a finished DAGMan job from the schedd queue (best-effort).
+
+        Completed DAGMan jobs (status=4) linger on the schedd until
+        MAX_HISTORY_ROTATIONS removes them.  On a shared remote schedd
+        this can take days, so we proactively clean up.
+        """
+        if not dag or not dag.dagman_cluster_id:
+            return
+        try:
+            await self.condor.remove_job(
+                schedd_name=dag.schedd_name,
+                cluster_id=dag.dagman_cluster_id,
+            )
+            logger.debug("Removed finished DAG %s (cluster %s) from %s",
+                         dag.id, dag.dagman_cluster_id, dag.schedd_name)
+        except Exception:
+            # Already gone or auth issue — not critical
+            logger.debug("Could not remove DAG %s from schedd (may already be gone)",
+                         dag.dagman_cluster_id)
 
     # ── Clean Stop ──────────────────────────────────────────────
 
