@@ -142,7 +142,7 @@ async def update_request(
     return Request.model_validate(row)
 
 
-@router.delete("/{request_name}", response_model=Request)
+@router.post("/{request_name}/abort", response_model=Request)
 async def abort_request(
     request_name: str,
     repo: Repository = Depends(get_repository),
@@ -295,26 +295,99 @@ async def fail_request(
     raw_request: FastAPIRequest = None,
     repo: Repository = Depends(get_repository),
 ):
-    """Fail a HELD or PARTIAL request: kill DAG, mark resources failed.
+    """Fail a request: kill DAG and mark as failed.
 
-    Performs all DB work in the API session (auto-committed by get_session)
-    rather than delegating to the lifecycle manager's session.
+    For running requests (active, pilot_running), goes through STOPPING first
+    so condor_rm drains cleanly. The lifecycle manager's _handle_stopping
+    recognises the "FAIL:" stop_reason prefix and transitions to FAILED
+    instead of PAUSED once DAGMan exits.
+
+    For already-stopped requests (held, partial, paused, stopping), marks
+    everything failed immediately.
     """
     existing = await repo.get_request(request_name)
     if not existing:
         raise HTTPException(status_code=404, detail="Request not found")
 
-    allowed = (RequestStatus.HELD.value, RequestStatus.PARTIAL.value, RequestStatus.PAUSED.value)
+    allowed = (
+        RequestStatus.HELD.value, RequestStatus.PARTIAL.value, RequestStatus.PAUSED.value,
+        RequestStatus.ACTIVE.value, RequestStatus.PILOT_RUNNING.value, RequestStatus.STOPPING.value,
+    )
     if existing.status not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Can only fail requests in held, partial, or paused state, "
+            detail=f"Can only fail requests in active, pilot_running, stopping, held, partial, or paused state, "
                    f"current status: {existing.status}",
         )
 
     previous_status = existing.status
 
-    # Kill running DAG via condor_rm
+    # For running requests, go through clean stop first
+    running = (RequestStatus.ACTIVE.value, RequestStatus.PILOT_RUNNING.value)
+    if previous_status in running:
+        workflow = await repo.get_workflow_by_request(request_name)
+        if workflow and workflow.dag_id:
+            now = datetime.now(timezone.utc)
+            dag = await repo.get_dag(workflow.dag_id)
+            if dag and dag.status in (DAGStatus.SUBMITTED.value, DAGStatus.RUNNING.value):
+                condor = getattr(raw_request.app.state, "condor", None)
+                if condor:
+                    try:
+                        await condor.remove_job(
+                            schedd_name=dag.schedd_name,
+                            cluster_id=dag.dagman_cluster_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to condor_rm DAG %s for %s — lifecycle manager will retry",
+                            dag.dagman_cluster_id, request_name, exc_info=True,
+                        )
+            # "FAIL:" prefix tells _handle_stopping to go to FAILED, not PAUSED
+            await repo.update_dag(
+                workflow.dag_id,
+                stop_requested_at=now,
+                stop_reason="FAIL: operator-initiated",
+            )
+
+        # Transition to STOPPING — lifecycle manager will finish the job
+        now = datetime.now(timezone.utc)
+        old_transitions = existing.status_transitions or []
+        new_transition = {
+            "from": previous_status,
+            "to": RequestStatus.STOPPING.value,
+            "timestamp": now.isoformat(),
+        }
+        await repo.update_request(
+            request_name,
+            status=RequestStatus.STOPPING.value,
+            status_transitions=old_transitions + [new_transition],
+            updated_at=now,
+        )
+        logger.info("Request %s: %s -> stopping (fail requested, waiting for DAGMan exit)", request_name, previous_status)
+
+        return {
+            "request_name": request_name,
+            "status": "stopping",
+            "previous_status": previous_status,
+            "message": f"Fail initiated for {request_name} — removing condor jobs, will mark failed when done",
+        }
+
+    # For already-stopped requests (stopping, held, partial, paused):
+    # If STOPPING, update the stop_reason so lifecycle manager transitions to FAILED
+    if previous_status == RequestStatus.STOPPING.value:
+        workflow = await repo.get_workflow_by_request(request_name)
+        if workflow and workflow.dag_id:
+            dag = await repo.get_dag(workflow.dag_id)
+            if dag:
+                await repo.update_dag(workflow.dag_id, stop_reason="FAIL: operator-initiated")
+        return {
+            "request_name": request_name,
+            "status": "stopping",
+            "previous_status": previous_status,
+            "message": f"Request {request_name} already stopping — will mark failed when DAGMan exits",
+        }
+
+    # Immediate fail for held/partial/paused — no running DAG to drain
     workflow = await repo.get_workflow_by_request(request_name)
     if workflow:
         if workflow.dag_id:
@@ -445,10 +518,10 @@ async def clone_request(
     repo: Repository = Depends(get_repository),
     settings=Depends(get_settings),
 ):
-    """Kill, clear, and re-import with incremented processing_version.
+    """Kill, rename old request aside, and re-import with incremented version.
 
-    Equivalent to: stop → fail → delete → import (same parameters, new version).
-    The request name stays the same. All old data is cleaned up.
+    Flow: rename old → {name}_Failed_vN, kill its DAG, import fresh with
+    the original name. Old request is kept for reference (manual delete).
     """
     from wms2.api.import_endpoint import ImportBody, import_request
 
@@ -460,12 +533,18 @@ async def clone_request(
     workflow = await repo.get_workflow_by_request(request_name)
     config_data = (workflow.config_data if workflow else None) or {}
 
-    # Determine new processing version
+    # Determine versions
     current_version = reqdata.get("ProcessingVersion",
                                   reqdata.get("processing_version", 1))
     new_version = current_version + 1
 
-    # 1. Kill running DAG
+    # 1. Rename old request out of the way
+    old_name = f"{request_name}_Failed_v{current_version}"
+    await repo.rename_request(request_name, old_name)
+    await repo.session.flush()
+    logger.info("Clone %s: renamed old request to %s", request_name, old_name)
+
+    # 2. Kill running DAG on the old request
     if workflow and workflow.dag_id:
         dag = await repo.get_dag(workflow.dag_id)
         if dag and dag.status in (DAGStatus.SUBMITTED.value, DAGStatus.RUNNING.value):
@@ -482,24 +561,15 @@ async def clone_request(
                     logger.warning("Clone %s: failed to remove DAG %s",
                                    request_name, dag.dagman_cluster_id, exc_info=True)
 
-    # 2. Delete all old records (DAGs, blocks, workflow, request)
-    if workflow:
-        for d in await repo.list_dags(workflow_id=workflow.id):
-            await repo.delete_dag_history(d.id)
-            await repo.delete_dag(d.id)
-        for block in await repo.get_processing_blocks(workflow.id):
-            await repo.delete_processing_block(block.id)
-        await repo.delete_workflow(workflow.id)
-    await repo.delete_request(request_name)
+    # Mark old request as failed
+    await repo.update_request(old_name, status="failed")
     await repo.session.flush()
-    logger.info("Clone %s: cleared old data (was %s, version %d)",
-                request_name, existing.status, current_version)
 
-    # 3. Re-import with same parameters + incremented version
-    #    Reconstruct ImportBody from the old config_data
+    # 3. Import fresh with original name
     priority_profile = config_data.get("priority_profile", {})
     import_body = ImportBody(
         request_name=request_name,
+        source_request_name=request_name,
         stageout_mode=config_data.get("stageout_mode", "test"),
         condor_pool=config_data.get("condor_pool", "global"),
         test_fraction=config_data.get("test_fraction"),
@@ -509,14 +579,36 @@ async def clone_request(
         high_priority=priority_profile.get("high", 5),
         nominal_priority=priority_profile.get("nominal", 3),
         priority_switch_fraction=priority_profile.get("switch_fraction", 0.5),
-        replace=True,
+        pilot_fraction=config_data.get("pilot_fraction"),
+        pilot_throwaway=config_data.get("pilot_throwaway"),
     )
 
-    result = await import_request(import_body, raw_request, repo, settings)
+    try:
+        result = await import_request(import_body, raw_request, repo, settings)
+    except Exception:
+        # Import failed — rename old request back so nothing is lost
+        logger.warning("Clone %s: import failed, restoring old request", request_name)
+        # Clean up any partial import records
+        partial_wf = await repo.get_workflow_by_request(request_name)
+        if partial_wf:
+            for d in await repo.list_dags(workflow_id=partial_wf.id):
+                await repo.delete_dag_history(d.id)
+                await repo.delete_dag(d.id)
+            for block in await repo.get_processing_blocks(partial_wf.id):
+                await repo.delete_processing_block(block.id)
+            await repo.delete_workflow(partial_wf.id)
+        partial_req = await repo.get_request(request_name)
+        if partial_req:
+            await repo.delete_request(request_name)
+        await repo.rename_request(old_name, request_name)
+        await repo.session.flush()
+        raise
+
     result["cloned_from_version"] = current_version
     result["new_version"] = new_version
-    logger.info("Clone %s: re-imported with version %d → %d",
-                request_name, current_version, new_version)
+    result["old_request_name"] = old_name
+    logger.info("Clone %s: v%d → v%d (old kept as %s)",
+                request_name, current_version, new_version, old_name)
     return result
 
 

@@ -16,13 +16,25 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/dags", tags=["dags"])
 
 
+def _wu_counts(r):
+    """Derive WU-level done/failed from node_counts or completed_work_units."""
+    nc = r.node_counts or {}
+    wus_done = nc.get("wus_done")
+    if wus_done is None:
+        wus_done = len(r.completed_work_units or [])
+    return wus_done, nc.get("wus_failed", 0)
+
+
 def _dag_summary(r):
+    wus_done, wus_failed = _wu_counts(r)
     return {
         "id": str(r.id),
         "workflow_id": str(r.workflow_id) if r.workflow_id else None,
         "status": r.status,
         "total_nodes": r.total_nodes,
         "total_work_units": r.total_work_units,
+        "wus_done": wus_done,
+        "wus_failed": wus_failed,
         "nodes_done": r.nodes_done,
         "nodes_failed": r.nodes_failed,
         "nodes_running": r.nodes_running,
@@ -33,6 +45,7 @@ def _dag_summary(r):
 
 
 def _dag_detail(row):
+    wus_done, wus_failed = _wu_counts(row)
     return {
         "id": str(row.id),
         "workflow_id": str(row.workflow_id) if row.workflow_id else None,
@@ -54,6 +67,8 @@ def _dag_detail(row):
         "nodes_failed": row.nodes_failed,
         "nodes_held": row.nodes_held,
         "total_work_units": row.total_work_units,
+        "wus_done": wus_done,
+        "wus_failed": wus_failed,
         "completed_work_units": row.completed_work_units,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "submitted_at": row.submitted_at.isoformat() if row.submitted_at else None,

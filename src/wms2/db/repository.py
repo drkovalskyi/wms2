@@ -394,3 +394,45 @@ class Repository:
         await self.session.execute(
             delete(ProcessingBlockRow).where(ProcessingBlockRow.id == block_id)
         )
+
+    # ── Rename (for clone) ─────────────────────────────────────
+
+    async def rename_request(self, old_name: str, new_name: str) -> None:
+        """Rename a request and update all foreign-key references.
+
+        FK constraints prevent direct rename in either order, so we
+        collect affected workflow IDs, NULL out the FK, rename, then
+        restore.
+        """
+        # Collect workflow IDs that reference old_name
+        result = await self.session.execute(
+            select(WorkflowRow.id).where(WorkflowRow.request_name == old_name)
+        )
+        wf_ids = [row[0] for row in result.all()]
+
+        # 1. Detach workflows from old name
+        if wf_ids:
+            await self.session.execute(
+                update(WorkflowRow)
+                .where(WorkflowRow.id.in_(wf_ids))
+                .values(request_name=None)
+            )
+        # 2. Rename the request row
+        await self.session.execute(
+            update(RequestRow)
+            .where(RequestRow.request_name == old_name)
+            .values(request_name=new_name)
+        )
+        # 3. Reattach workflows to new name
+        if wf_ids:
+            await self.session.execute(
+                update(WorkflowRow)
+                .where(WorkflowRow.id.in_(wf_ids))
+                .values(request_name=new_name)
+            )
+        # 4. Update superseded_by (plain string, no FK constraint)
+        await self.session.execute(
+            update(RequestRow)
+            .where(RequestRow.superseded_by_request == old_name)
+            .values(superseded_by_request=new_name)
+        )

@@ -238,8 +238,18 @@ async def get_workflow_output_datasets(
                         except OSError:
                             pass
         data_tier = ds.get("data_tier", "")
+        dataset_name = ds.get("dataset_name", "")
+        # In test stageout mode, build the actual Rucio DID name (/USER suffix)
+        stageout_mode = config.get("stageout_mode", "local")
+        rucio_did = None
+        if stageout_mode == "test" and dataset_name:
+            parts = dataset_name.strip("/").split("/")
+            if len(parts) == 3:
+                primary, processing, tier = parts
+                rucio_did = f"/{primary}/{processing}-{tier}/USER"
         results.append({
-            "dataset_name": ds.get("dataset_name", ""),
+            "dataset_name": dataset_name,
+            "rucio_did": rucio_did,
             "data_tier": data_tier,
             "merged_lfn_base": merged_base,
             "output_path": pfn_base,
