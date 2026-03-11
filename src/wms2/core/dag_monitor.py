@@ -116,6 +116,10 @@ class DAGMonitor:
             + inner_summary.done + inner_summary.failed
             + inner_summary.held
         )
+        # Merge WU-level counts from outer summary into node_counts
+        nc = dict(dag.node_counts or {})
+        nc["wus_done"] = summary.done
+        nc["wus_failed"] = summary.failed
         update_kwargs = {
             "nodes_idle": inner_summary.idle,
             "nodes_running": inner_summary.running,
@@ -123,6 +127,7 @@ class DAGMonitor:
             "nodes_failed": inner_summary.failed,
             "nodes_held": inner_summary.held,
             "total_nodes": live_total,
+            "node_counts": nc,
             "status": DAGStatus.RUNNING.value,
         }
         if newly_completed:
@@ -373,10 +378,11 @@ class DAGMonitor:
 
     def _read_merge_manifest(self, dag, group_name: str) -> dict | None:
         """Read the merge output manifest for a completed work unit."""
+        # Primary: WU subdirectory (spool mode with transfer_output_remaps)
         manifest_path = os.path.join(
             dag.submit_dir, group_name, "merge_output.json"
         )
-        # In spool mode, merge output files end up at the spool root
+        # Fallback: spool root (old DAGs without output remaps)
         if not os.path.exists(manifest_path):
             manifest_path = os.path.join(dag.submit_dir, "merge_output.json")
         if not os.path.exists(manifest_path):
@@ -386,8 +392,9 @@ class DAGMonitor:
 
     def _read_work_unit_metrics(self, dag, group_name: str) -> dict | None:
         """Read the work_unit_metrics.json for a completed work unit."""
+        # Primary: WU subdirectory (spool mode with transfer_output_remaps)
         metrics_path = os.path.join(dag.submit_dir, group_name, "work_unit_metrics.json")
-        # In spool mode, merge output files end up at the spool root
+        # Fallback: spool root (old DAGs without output remaps)
         if not os.path.exists(metrics_path):
             metrics_path = os.path.join(dag.submit_dir, "work_unit_metrics.json")
         if not os.path.exists(metrics_path):
@@ -527,8 +534,23 @@ class DAGMonitor:
         elif summary.failed > 0 and summary.done == 0:
             final_status = DAGStatus.FAILED
         else:
-            # No done, no failed — could be removed/halted
-            final_status = DAGStatus.FAILED
+            # No done, no failed — status files likely unreadable (e.g. sshfs
+            # mount down).  Keep DAG as RUNNING so we retry next poll cycle
+            # instead of falsely marking it as FAILED.
+            logger.warning(
+                "DAG %s: DAGMan exited but status files show done=0 failed=0 "
+                "— status files may be unavailable, will retry next cycle",
+                dag.id,
+            )
+            return DAGPollResult(
+                dag_id=str(dag.id),
+                status=DAGStatus.RUNNING,
+                nodes_idle=dag.nodes_idle or 0,
+                nodes_running=dag.nodes_running or 0,
+                nodes_done=dag.nodes_done or 0,
+                nodes_failed=dag.nodes_failed or 0,
+                nodes_held=dag.nodes_held or 0,
+            )
 
         # Try inner SUBDAG counts; fall back to metrics/outer summary
         inner_summary = self._aggregate_inner_status(dag, status_summary)
@@ -537,6 +559,9 @@ class DAGMonitor:
         final_failed = inner_summary.failed if inner_summary.done > 0 else summary.failed
 
         now = datetime.now(timezone.utc)
+        nc = dict(dag.node_counts or {})
+        nc["wus_done"] = summary.done
+        nc["wus_failed"] = summary.failed
         update_kwargs = {
             "status": final_status.value,
             "nodes_done": final_done,
@@ -544,6 +569,7 @@ class DAGMonitor:
             "nodes_running": 0,
             "nodes_idle": 0,
             "nodes_held": 0,
+            "node_counts": nc,
             "completed_at": now,
         }
         if newly_completed:
