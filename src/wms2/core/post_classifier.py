@@ -15,6 +15,8 @@ adapted for WMS2's two-level error handling model (docs/error_handling.md).
 
 from __future__ import annotations
 
+import re
+
 # ── Permanent (UNLESS-EXIT 42): won't fix on retry ──────────────
 PERMANENT_CODES: set[int] = {
     # CMSSW config/software errors
@@ -101,14 +103,24 @@ def _is_infra_by_message(error_message: str) -> bool:
     return any(pat in msg_lower for pat in _INFRA_MESSAGE_PATTERNS)
 
 
+_STAGEOUT_PATTERNS: list[str] = [
+    "Permission refused", "HTTP 403", "gfal-mkdir.*failed",
+    "xrdcp.*failed", "gfal-copy.*failed", "stageout.*failed",
+    "No space left on device", "HTTP 507",
+]
+
+
 def classify_error(
     cmssw_exit_code: int,
     job_exit_code: int,
     error_message: str = "",
+    log_tail: str = "",
 ) -> dict:
     """Classify an error into category + retryable + action.
 
     Uses CMSSW exit code as primary signal, job exit code as fallback.
+    When ``log_tail`` is provided and the initial classification is
+    "transient", stageout failure patterns upgrade it to "infrastructure".
 
     Returns:
         {
@@ -189,13 +201,25 @@ def classify_error(
         }
 
     # Default: transient (unknown codes, signals, stageout timeouts)
-    return {
+    result = {
         "category": "transient",
         "retryable": True,
         "bad_input_files": [],
         "action": "retry",
         "memory_exceeded": False,
     }
+
+    # Upgrade transient → infrastructure when log_tail reveals stageout failure.
+    # Shell exit code 1 from stageout RuntimeError doesn't match any CMSSW code
+    # set, but stageout failures are site-specific infrastructure issues.
+    if log_tail:
+        for pat in _STAGEOUT_PATTERNS:
+            if re.search(pat, log_tail, re.IGNORECASE):
+                result["category"] = "infrastructure"
+                result["action"] = "retry_with_cooloff"
+                break
+
+    return result
 
 
 def generate_collector_script() -> str:
@@ -417,9 +441,12 @@ def parse_condor_log(log_path):
     except OSError:
         return info
 
-    # MATCH_GLIDEIN_CMSSite from job classad
+    # Primary: MATCH_GLIDEIN_CMSSite (local pool / condor_history)
     m = re.search(r'MATCH_GLIDEIN_CMSSite\s*=\s*"?([^"\s]+)"?', content)
-    if m:
+    if not m:
+        # Fallback: JOB_GLIDEIN_CMSSite (global pool job event log)
+        m = re.search(r'JOB_GLIDEIN_CMSSite\s*=\s*"?([^"\s]+)"?', content)
+    if m and m.group(1) != "Unknown":
         info["site"] = m.group(1)
 
     # Memory usage (ResidentSetSize in KB → MB)
@@ -508,12 +535,40 @@ def main():
     # Parse HTCondor log
     condor_log = parse_condor_log(f"{fp}{node_name}.log")
 
+    # Fallback: if site still unknown, try the _elected_site file written by
+    # elect_site.sh (always available for the merge group in spool mode).
+    if condor_log["site"] == "unknown" and group_dir != ".":
+        elected_file = f"{group_dir}_elected_site"
+        if os.path.isfile(elected_file):
+            try:
+                _site = open(elected_file).read().strip()
+                if _site and _site != "local":
+                    condor_log["site"] = _site
+            except OSError:
+                pass
+
     # Read stderr tail
     log_tail = read_err_tail(f"{fp}{node_name}.err")
 
     # Classify
     error_message = cmssw_data.get("error_message", "") if cmssw_data else ""
     classification = classify_error(cmssw_exit_code, job_exit_code, error_message)
+
+    # Upgrade transient -> infrastructure when log_tail reveals stageout failure.
+    # Shell exit code 1 from stageout RuntimeError doesn't match any CMSSW code
+    # set, so classify_error defaults to "transient".  But stageout failures are
+    # site-specific and should count toward auto-ban thresholds.
+    if classification["category"] == "transient" and log_tail:
+        _STAGEOUT_PATTERNS = [
+            "Permission refused", "HTTP 403", "gfal-mkdir.*failed",
+            "xrdcp.*failed", "gfal-copy.*failed", "stageout.*failed",
+            "No space left on device", "HTTP 507",
+        ]
+        for pat in _STAGEOUT_PATTERNS:
+            if re.search(pat, log_tail, re.IGNORECASE):
+                classification["category"] = "infrastructure"
+                classification["action"] = "retry_with_cooloff"
+                break
 
     # For data errors, populate bad_input_files from FJR input files
     if classification["category"] == "data" and cmssw_data:
