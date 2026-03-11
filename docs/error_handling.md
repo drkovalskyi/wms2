@@ -660,6 +660,210 @@ These overrides would be stored in the request's `request_data` JSONB field and 
 
 ---
 
+## 9. Site-Level Job Protection
+
+### 9.1 Problem Statement
+
+WMS2's error handling (Sections 2–3) assumes jobs **complete** — either succeeding or failing — which triggers the POST script and DAGMan RETRY loop. However, several site-level failure modes cause jobs to never complete:
+
+| Failure Mode | Symptom | Duration |
+|---|---|---|
+| Dead glidein | Job shows Running, `RemoteWallClockTime=0` | Indefinite |
+| Runaway processing | Job runs far beyond expected wall time | Hours–days |
+| Stuck idle | Job never matches (site down, resources unavailable) | Hours–days |
+| Permanent hold | Job held for non-transient reason, no auto-release | Indefinite |
+| Disk overflow | Job fills worker node scratch | Until evicted |
+
+These "silent" failures are invisible to the POST script / RETRY model because the job never terminates. The DAG waits forever. Real example: 3 WUs stuck at T2_US_Vanderbilt for 15+ hours — glideins died, jobs showed Running with `RemoteWallClockTime=0`, DAGMan waited indefinitely. No POST script ran.
+
+**Solution**: Submit-level HTCondor classads that enforce timeouts and resource limits directly in the submit file. This fits WMS2's design principle of "no per-job tracking" — enforcement is declarative, not polled.
+
+### 9.2 Enforcement Mechanisms
+
+| # | Mechanism | HTCondor Feature | Default |
+|---|---|---|---|
+| 1 | Job Lease Duration | `+JobLeaseDuration = 1200` | 20 min (existing) |
+| 2 | Wall time kill | `periodic_remove` on `MaxWallTimeMinsRun` | Per-node (3× safety factor) |
+| 3 | Held timeout | `periodic_remove` on held duration | 7 min |
+| 4 | Idle timeout | `periodic_remove` on idle duration | Tiered by priority (4h/12h/48h) |
+| 5 | Disk overflow | `periodic_remove` on `DiskUsage` | 20 GB |
+| 6 | Transient hold release | `periodic_release` for known hold codes | NumJobStarts < 5 |
+| 7 | Landing RETRY | `RETRY landing 3 UNLESS-EXIT 42` | 3 retries |
+| 8 | Merge priority boost | Higher `priority` in merge submit file | +10 over proc |
+| 9 | Tail WU escalation | `condor_qedit` when ≥90% WUs done | Bump remaining to high priority |
+
+### 9.3 Job Lease Duration (Existing)
+
+Already implemented. When the startd (glidein) loses contact with the schedd, the schedd evicts the job after `JobLeaseDuration` seconds (default 1200s = 20 min). Without this, zombie jobs can stay "Running" indefinitely when glideins die without clean shutdown. This is the same value WMAgent uses.
+
+```
++JobLeaseDuration = 1200
+```
+
+### 9.4 Periodic Remove
+
+A single `periodic_remove` expression covers four failure classes. When the expression evaluates to true, HTCondor removes the job (equivalent to `condor_rm`). The job's POST script runs with a non-zero return code, enabling DAGMan RETRY.
+
+```
+periodic_remove = \
+  (JobStatus == 2 && isnt(MaxWallTimeMinsRun, undefined) \
+   && MaxWallTimeMinsRun*60 < time() - EnteredCurrentStatus) || \
+  (JobStatus == 5 && time() - EnteredCurrentStatus > 420) || \
+  (JobStatus == 1 && time() - EnteredCurrentStatus > <idle_timeout>) || \
+  (DiskUsage > 20971520)
+```
+
+**Clause breakdown:**
+
+| Clause | Condition | Purpose |
+|---|---|---|
+| Wall time | `JobStatus==2 && MaxWallTimeMinsRun*60 < time()-EnteredCurrentStatus` | Kill runaway/zombie Running jobs |
+| Held | `JobStatus==5 && time()-EnteredCurrentStatus > 420` | Kill jobs stuck in Hold for >7 min |
+| Idle | `JobStatus==1 && time()-EnteredCurrentStatus > N` | Kill jobs that can't match (dead site) |
+| Disk | `DiskUsage > 20971520` | Kill jobs overflowing scratch (20 GB) |
+
+**Diagnostic reason**: Each submit file includes `+PeriodicRemoveReason` with a human-readable string identifying which clause fired. HTCondor logs this in the job event log, aiding debugging:
+
+```
++PeriodicRemoveReason = strcat("WMS2: ",
+  ifThenElse(wall_time_clause, "wall time exceeded (N min limit)",
+  ifThenElse(held_clause, "held for M min",
+  ifThenElse(idle_clause, "idle for H hours",
+  "disk usage exceeded"))))
+```
+
+### 9.5 MaxWallTimeMinsRun
+
+Per-node wall time limit, computed by the DAG Planner based on node type and expected execution time:
+
+| Node Type | Computation | Minimum | Fallback |
+|---|---|---|---|
+| Landing | Fixed | 30 min | 30 min |
+| Processing | `time_per_event × events_per_job / ncpus × safety_factor` | 120 min | 1440 min (24h) |
+| Merge | `max(merge_min, proc_estimate × 2)` | 240 min (4h) | 240 min |
+| Cleanup | Fixed | 60 min | 60 min |
+
+**Safety factor**: Default 3× (`WMS2_WALL_TIME_SAFETY_FACTOR`). The goal is to catch runaways and zombies, not to kill slow-but-legitimate jobs. A 3× margin accommodates:
+- Natural variance in processing time across events
+- Slow sites with degraded I/O or CPU
+- Pileup mixing variability
+
+**time_per_event source**:
+- Round 0: `config_data["time_per_event"]` from the ReqMgr2 request spec (a performance hint)
+- Round 1+: measured `time_per_event_sec` from the previous round's `step_metrics`
+
+When no performance data is available (round 0 without a request hint), the fallback is 1440 min (24h) — deliberately generous to avoid killing jobs before any measurement exists.
+
+### 9.6 Periodic Release
+
+Auto-releases jobs held for transient reasons that typically self-resolve on retry:
+
+```
+periodic_release = (NumJobStarts < 5) && \
+  (HoldReasonCode == 28 || HoldReasonCode == 30 || \
+   HoldReasonCode == 13 || HoldReasonCode == 6)
+```
+
+| HoldReasonCode | Meaning | Why Auto-Release |
+|---|---|---|
+| 6 | SIGKILL (preemption, cgroup) | Common in shared pools; retry usually succeeds |
+| 13 | Submit error (transient) | Temporary schedd/shadow issues |
+| 28 | Memory exceeded | Job may be retried at a site with more memory, or DAG Monitor's OOM handler may bump `request_memory` |
+| 30 | Network/communication error | Transient network issues |
+
+**NumJobStarts guard**: The `NumJobStarts < 5` condition prevents infinite release-hold loops. After 5 release attempts, the job stays held and the held timeout (Section 9.4) removes it.
+
+**No memory in periodic_remove**: OOM recovery is handled by the DAG Monitor's `_handle_held_oom_jobs()` method (which bumps `request_memory` via `condor_qedit` before releasing). The `periodic_release` here is a simpler fallback that releases without modification — the DAG Monitor's handler runs first if the lifecycle manager cycle fires in time.
+
+### 9.7 Interaction with DAGMan RETRY
+
+When `periodic_remove` kills a job:
+1. HTCondor removes the job and writes a termination event to the job log
+2. DAGMan detects the termination and runs the POST script
+3. POST script sees a non-zero return code and classifies the error
+4. DAGMan consults the `RETRY` directive for this node
+5. If retries remain and POST didn't exit with UNLESS-EXIT (42), the job is resubmitted
+
+This is the standard Level 1 error flow (Section 2). The periodic_remove simply ensures the flow starts — without it, zombie jobs prevent the POST script from ever running.
+
+**Landing node RETRY**: The landing node is a trivial `/bin/true` job whose only purpose is site election. It previously had no RETRY directive, meaning a single idle timeout would kill the entire work unit. Now:
+
+```
+RETRY landing 3 UNLESS-EXIT 42
+```
+
+This gives the landing 3 chances to match. If the landing times out 3 times (e.g., because all glideins at the requested site are down), the work unit fails through normal DAG error handling.
+
+### 9.8 Priority Management
+
+#### 9.8.1 Merge Priority Boost
+
+Merge jobs are always higher priority than processing jobs by a configurable boost (default +10). This ensures merges run promptly once their processing dependencies complete, rather than competing with the next round's proc jobs:
+
+```
+# In merge.sub:
+priority = <job_priority> + 10
+```
+
+Cleanup nodes also get the boosted priority since they depend on merge completion.
+
+#### 9.8.2 Tiered Idle Timeout
+
+Jobs get different idle timeouts based on their priority level, reflecting urgency:
+
+| Priority Level | Idle Timeout | Use Case |
+|---|---|---|
+| High (priority ≥ 5) | 4 hours | Urgent requests, pilots |
+| Normal (priority 3–4) | 12 hours | Standard production |
+| Low (priority < 3) | 48 hours | Background/low-priority |
+
+Merge and cleanup nodes always use the high-priority idle timeout (4h) since they are needed to complete the work unit and have boosted priority.
+
+**Per-request override**: Operators can set `idle_timeout_sec` in `config_data` to override the tier-based default for a specific request.
+
+#### 9.8.3 Tail WU Escalation
+
+When ≥90% (configurable) of work units in a DAG have completed, the lifecycle manager bumps the priority of remaining jobs via `condor_qedit`. This prevents the last few WUs from blocking round completion for hours:
+
+1. Each lifecycle poll cycle checks `wus_done / total_work_units`
+2. When the ratio crosses the threshold (default 0.9):
+   - `condor_qedit` sets `Priority` on all remaining payload jobs
+   - Escalation is marked in `node_counts["_tail_escalated"]` to prevent repeat
+3. Higher priority causes the schedd to negotiate these jobs first
+
+This is a one-time operation per DAG. The escalation flag is stored in the DAG's `node_counts` JSONB to survive service restarts.
+
+### 9.9 Configuration
+
+| Parameter | Env Var | Default | Description |
+|---|---|---|---|
+| `wall_time_safety_factor` | `WMS2_WALL_TIME_SAFETY_FACTOR` | 3.0 | Multiplier on estimated wall time |
+| `landing_wall_time_mins` | `WMS2_LANDING_WALL_TIME_MINS` | 30 | Fixed wall time for landing nodes |
+| `merge_wall_time_mins_min` | `WMS2_MERGE_WALL_TIME_MINS_MIN` | 240 | Minimum wall time for merge nodes |
+| `cleanup_wall_time_mins` | `WMS2_CLEANUP_WALL_TIME_MINS` | 60 | Fixed wall time for cleanup nodes |
+| `periodic_remove_held_timeout_sec` | `WMS2_PERIODIC_REMOVE_HELD_TIMEOUT_SEC` | 420 | Kill jobs stuck in held state (7 min) |
+| `periodic_remove_disk_limit_kb` | `WMS2_PERIODIC_REMOVE_DISK_LIMIT_KB` | 20971520 | Disk usage limit (20 GB) |
+| `idle_timeout_high_sec` | `WMS2_IDLE_TIMEOUT_HIGH_SEC` | 14400 | Idle timeout for high-priority jobs (4h) |
+| `idle_timeout_normal_sec` | `WMS2_IDLE_TIMEOUT_NORMAL_SEC` | 43200 | Idle timeout for normal-priority jobs (12h) |
+| `idle_timeout_low_sec` | `WMS2_IDLE_TIMEOUT_LOW_SEC` | 172800 | Idle timeout for low-priority jobs (48h) |
+| `merge_priority_boost` | `WMS2_MERGE_PRIORITY_BOOST` | 10 | Priority boost for merge/cleanup over proc |
+| `tail_escalation_threshold` | `WMS2_TAIL_ESCALATION_THRESHOLD` | 0.9 | Fraction of WUs done before tail escalation |
+| `tail_escalation_priority` | `WMS2_TAIL_ESCALATION_PRIORITY` | 10 | Priority value set on remaining jobs |
+
+### 9.10 Design Decisions
+
+| # | Decision | Rationale |
+|---|---|---|
+| EH-11 | Submit-level enforcement, not WMS2 polling | Fits "no per-job tracking" principle. HTCondor evaluates periodic expressions autonomously. WMS2 doesn't need to poll individual jobs. |
+| EH-12 | No memory limit in periodic_remove | OOM recovery is handled by DAG Monitor's `_handle_held_oom_jobs()` which bumps `request_memory` before releasing. A periodic_remove on memory would kill the job before the intelligent recovery can act. |
+| EH-13 | 3× safety factor on wall time | Must catch runaways but not slow-but-legitimate jobs. Processing time varies significantly across events and sites. 3× accommodates this while still catching true zombies within hours instead of days. |
+| EH-14 | Landing node gets RETRY 3 | Without retries, one idle timeout kills the entire work unit. Landing is trivial (`/bin/true`), so retries are cheap. Three attempts cover transient site unavailability. |
+| EH-15 | Idle timeout tiered by priority | High-priority requests should fail fast on dead sites, not wait 48 hours. Low-priority requests can afford to wait longer for scarce resources. |
+| EH-16 | Tail escalation via condor_qedit, not submit-level | Submit-time priority can't predict which WUs will be last. Dynamic escalation targets only the jobs that actually need it, after observing completion patterns. |
+| EH-17 | Merge priority boost is static (+10) | Merge jobs should always complete before new proc jobs are considered. A fixed boost is simpler than dynamic priority and achieves the goal. |
+
+---
+
 ## Appendix: Design Decisions Summary
 
 This appendix summarizes the key design decisions in this document and their rationale. These complement the design decisions in the main spec (Section 16).
@@ -676,3 +880,10 @@ This appendix summarizes the key design decisions in this document and their rat
 | EH-8 | Per-file state tracking for input workflows | Four states (not yet processed / attempted / processed / excluded). Deferred retry of attempted files maximizes throughput. |
 | EH-9 | Site banning is two-level (per-workflow + system-wide) | Per-workflow catches workflow-specific issues. Promotion to system-wide catches infrastructure problems. Time-limited with operator override. |
 | EH-10 | Stop-rescues don't count against max rescue attempts | Operator-initiated stops are not errors. Rescue DAGs from stops preserve progress, not recover from failure. |
+| EH-11 | Submit-level enforcement, not WMS2 polling | Fits "no per-job tracking" principle. HTCondor evaluates periodic expressions autonomously. |
+| EH-12 | No memory limit in periodic_remove | OOM recovery handled by DAG Monitor's intelligent handler. periodic_remove would kill before recovery. |
+| EH-13 | 3× safety factor on wall time | Catches runaways but not slow-but-legitimate jobs. Accommodates processing time variance across events and sites. |
+| EH-14 | Landing node gets RETRY 3 | One idle timeout shouldn't kill entire WU. Landing is `/bin/true`, retries are cheap. |
+| EH-15 | Idle timeout tiered by priority | High-priority requests fail fast on dead sites. Low-priority can wait longer for resources. |
+| EH-16 | Tail escalation via condor_qedit, not submit-level | Can't predict which WUs will be last at submit time. Dynamic escalation targets observed bottlenecks. |
+| EH-17 | Merge priority boost is static (+10) | Merges should always complete before new proc jobs. Fixed boost is simpler than dynamic priority. |

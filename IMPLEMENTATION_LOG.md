@@ -6,6 +6,142 @@
 
 ---
 
+## 2026-03-11 — Fix site detection + stageout error classification for auto-ban
+
+### What was done
+
+Three bugs prevented the error handler's auto-ban mechanism from working in
+global pool mode. All six T2_US_Nebraska WU failures in request 00002 round 1
+went undetected because (A) site was always "unknown" and (B) stageout errors
+were classified as "transient" instead of "infrastructure".
+
+**Bug A — Site detection broken in global pool (3 fixes):**
+
+1. **A1: `+JOB_GLIDEIN_CMSSite` classad in submit files** (`dag_planner.py`) —
+   Added `+JOB_GLIDEIN_CMSSite = "$$(GLIDEIN_CMSSite:Unknown)"` to all submit
+   files via `_write_submit_file()`. This captures the CMS site name at match
+   time into the job classad, which then appears in the event log (event 028).
+   Previously only `MATCH_GLIDEIN_CMSSite` was searched, but `MATCH_` prefix
+   classads are schedd-internal and never appear in `.log` files.
+
+2. **A2: Regex fallback in POST collector** (`post_classifier.py`) — Updated
+   `parse_condor_log()` (both embedded and module-level) to try
+   `JOB_GLIDEIN_CMSSite` when `MATCH_GLIDEIN_CMSSite` is not found, with
+   `!= "Unknown"` guard.
+
+3. **A3: Elected site file as ultimate fallback** (`post_classifier.py`) — After
+   condor log parsing, if site is still "unknown" and running in spool mode
+   (group_dir != "."), reads `{group_dir}_elected_site` written by
+   elect_site.sh. Belt-and-suspenders for cases where the job log doesn't
+   contain any site classad.
+
+**Bug B — Stageout errors misclassified (`post_classifier.py`):**
+
+Shell exit code 1 from stageout `RuntimeError` (e.g. gfal-mkdir HTTP 403)
+didn't match any CMSSW/WMCore exit code set, so `classify_error()` defaulted to
+"transient". Only "infrastructure"/"data" categories count toward auto-ban
+thresholds in `analyze_site_failures()`.
+
+Fix: After classification, pattern-match `log_tail` for stageout failure
+indicators (`HTTP 403`, `gfal-mkdir.*failed`, `xrdcp.*failed`, etc.) and upgrade
+"transient" → "infrastructure" with `retry_with_cooloff` action. Applied in both
+the embedded collector script and the module-level `classify_error()` (via new
+`log_tail` parameter).
+
+**Bug C — elect_site.sh: retry + pool-aware failure (`dag_planner.py`):**
+
+In global pool, `condor_history` may not immediately return results after a
+landing job completes (history daemon lag). The old script tried once and fell
+back to "local", creating permanently stuck WUs that couldn't resolve storage
+endpoints.
+
+Fix: Rewritten to retry `condor_history` 5× with 10s delays (50s total). On
+failure, local pool still falls back to "local"; global pool exits 1 so DAGMan
+retries the landing node (up to 3 retries via `RETRY landing 3 UNLESS-EXIT 42`).
+The `condor_pool` value is threaded from `plan_production_dag()` →
+`_generate_dag_files()` → `_generate_group_dag()` → DAG POST script line.
+
+### Files modified
+
+- `src/wms2/core/dag_planner.py` — A1 (classad), C (elect_site.sh rewrite +
+  condor_pool parameter threading)
+- `src/wms2/core/post_classifier.py` — A2 (regex fallback), A3 (elected_site
+  file fallback), B (stageout error upgrade)
+
+### Verification
+
+- Module imports clean (both files)
+- Unit tests pass (23/23, pre-existing failures unrelated)
+- `classify_error()` correctly upgrades stageout errors to "infrastructure"
+- Service restarts and runs cleanly
+
+### Design decisions
+
+- The `+JOB_GLIDEIN_CMSSite` classad uses `$$()` match-time substitution, same
+  pattern as existing `+JOB_GLIDEIN_Site`. This is the standard HTCondor
+  mechanism for capturing slot attributes into the job classad.
+- Stageout pattern matching uses regex (not exact string) to handle variations
+  in error messages across storage backends (XRootD, WebDAV, gfal).
+- The elected_site fallback is intentionally conservative: only used in spool
+  mode (group_dir != ".") and only when condor log parsing fails completely.
+- elect_site.sh retry count (5) × delay (10s) = 50s max, well within DAGMan's
+  POST script timeout. Combined with landing RETRY 3, worst case is ~200s
+  before the WU fails permanently.
+
+---
+
+## 2026-03-10 — Memory estimation: FJR RSS + unified effective_fraction
+
+### What was done
+
+Three related changes to the adaptive optimization system:
+
+1. **Memory estimation policy: FJR RSS replaces cgroup** — `tune_adaptive()` now
+   uses FJR peak RSS (PeakValueRss) with a configurable safety margin (default
+   20%) instead of cgroup `peak_nonreclaim_mb`. Cgroup data is still collected
+   and logged for diagnostics. Rationale: FJR RSS shows 2% variation across 18
+   rounds of request 00058, while cgroup peak shows 2× variation due to
+   transient pileup mixing peaks. The POST script OOM retry mechanism (50%
+   memory bump) provides a safety net for the rare cases where FJR RSS
+   underestimates.
+
+   In `compute_job_split()`, the non-tmpfs cgroup branch was removed — cgroup is
+   now only used for tmpfs workloads (gridpack extraction) where it captures real
+   additional memory.
+
+2. **Multi-instance memory model** — Added step 4b in `tune_adaptive()` to
+   adjust `tuned_memory_mb` for internal parallelism (N parallel cmsRun instances
+   in one slot). Formula: `SANDBOX_OVERHEAD (3000 MB) + N × per_instance_RSS ×
+   margin`. Previously, per-step `n_parallel` was computed but not fed back into
+   the memory request.
+
+3. **Unified effective_fraction** — Replaced confusing pilot_fraction /
+   test_fraction interaction with a single `effective_fraction` concept. The DAG
+   planner is the sole owner of events_per_job scaling:
+   - Round 0: `effective_fraction = min(pilot_fraction, test_fraction)`
+   - Round 1+: `effective_fraction = test_fraction`
+   The proc wrapper no longer applies `--test-fraction` scaling (was a no-op
+   `shift 2`). This fixed a double-fraction-application bug where planner scaled
+   by pilot_fraction AND wrapper scaled again by test_fraction, producing ~35
+   events per job instead of ~3580 for GEN requests with test_fraction=0.01.
+
+### Files changed
+
+- `src/wms2/core/adaptive.py` — tune_adaptive(), compute_job_split()
+- `src/wms2/core/dag_planner.py` — _effective_fraction(), _plan_gen_nodes(),
+  proc wrapper, resource_params
+- `src/wms2/core/lifecycle_manager.py` — stores effective_fraction per round
+- `docs/spec.md` — Sections 5.3 (effective_fraction), 5.5 (memory estimation
+  rewrite with empirical data), DD-18 (new design decision)
+
+### Verification
+
+- Unit tests pass (test_models, fraction tests)
+- Service restarts cleanly with updated code
+- Active requests continue processing
+
+---
+
 ## 2026-03-09 — Fix cgroup memory not reported in spool mode
 
 ### What was done

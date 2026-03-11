@@ -4,9 +4,9 @@
 
 | Field | Value |
 |---|---|
-| **Spec Version** | 2.12.0 |
+| **Spec Version** | 2.13.0 |
 | **Status** | DRAFT |
-| **Date** | 2026-03-07 |
+| **Date** | 2026-03-10 |
 | **Authors** | CMS Computing |
 | **Supersedes** | WMCore / WMAgent |
 
@@ -1487,7 +1487,7 @@ class MergeGroup(BaseModel):
     # ── Pileup File Resolution ────────────────────────────────────
 
     async def _resolve_pileup(self, workflow) -> dict[str, list[str]]:
-        """Query Rucio for on-disk pileup files, with 24-hour caching.
+        """Query Rucio for on-disk pileup files, with 7-day disk-backed cache.
 
         Steps with MCPileup or DataPileup reference pileup datasets whose
         files may be only partially available on disk (many replicas are
@@ -1498,21 +1498,30 @@ class MergeGroup(BaseModel):
         process.mix.input.fileNames), replacing the ConfigCache defaults.
         This ensures jobs only attempt to read accessible files.
 
-        Results are cached in-memory for 24 hours (module-level dict keyed
-        by dataset name). Pileup datasets are large and stable — replica
+        Results are cached for 7 days (module-level dict backed by a JSON
+        file on disk). Pileup datasets are large and stable — replica
         availability changes slowly, while the Rucio list_replicas query
-        can take minutes due to dataset size and server load. The 24-hour
-        TTL balances freshness against the cost of repeated queries across
-        rounds and re-imports. The cache is per-process and resets on
-        service restart.
+        can take minutes due to dataset size and server load. The 7-day
+        TTL eliminates repeated cost across rounds and re-imports. The
+        disk-backed cache survives service restarts.
+
+        If the query fails, retries up to 3 times. If all attempts fail,
+        raises PileupResolutionError — pileup resolution is mandatory for
+        DRPremix workflows; a DAG must not be submitted without it.
         """
         pileup_files: dict[str, list[str]] = {}
         for step in workflow.manifest_steps:
             for field in ("mc_pileup", "data_pileup"):
                 ds = getattr(step, field, "") or ""
                 if ds and ds not in pileup_files:
-                    files = await self.rucio_adapter.get_available_pileup_files(ds)
-                    pileup_files[ds] = files
+                    for attempt in range(1, 4):
+                        try:
+                            files = await self.rucio_adapter.get_available_pileup_files(ds)
+                            pileup_files[ds] = files
+                            break
+                        except Exception as exc:
+                            if attempt == 3:
+                                raise PileupResolutionError(ds, exc)
         return pileup_files
 
     # ── DAG File Generation ──────────────────────────────────────
@@ -2450,8 +2459,25 @@ else:
 The adaptive lifecycle uses multiple processing rounds, each as a separate
 DAG. See `docs/processing.md` §6.2–6.5 for the complete specification.
 
+**Effective fraction.** Each round has an `effective_fraction` that scales
+`events_per_job` relative to its nominal value. The planner is the single
+owner of this scaling — the wrapper executes exactly the events it is given.
+
+| Round | `effective_fraction` | Purpose |
+|-------|---------------------|---------|
+| 0 (pilot) | `min(pilot_fraction, test_fraction)` | Whichever requests fewer events per job wins |
+| 1+ | `test_fraction` (1.0 if unset) | Production at test scale |
+
+Default `pilot_fraction=0.01`, default `test_fraction=1.0`. The effective
+fraction is stored in `node_counts["effective_fraction"]` and persisted per
+round in `step_metrics` so that adaptive optimization can correctly scale
+pilot-round measurements to production events_per_job.
+
 **Round 0** (pilot, `current_round=0`, `adaptive=true`):
 - Uses request resource defaults (Memory, TimePerEvent)
+- `events_per_job` scaled by `effective_fraction` (see above). This prevents
+  a small test run (`test_fraction=0.01`) from getting a disproportionately
+  large pilot (`pilot_fraction=0.5 × 2000 = 1000` events/job), or vice versa.
 - Fixed `jobs_per_work_unit` (default 8) for merge group sizing
 - Produces `first_round_work_units` work units (default 1) — small pilot
   to validate the pipeline quickly before committing more resources
@@ -2461,10 +2487,12 @@ DAG. See `docs/processing.md` §6.2–6.5 for the complete specification.
   round 1+ uses CPU and memory parameters optimized from measured data
 
 **Round 1+** (production, `current_round>=1`, `adaptive=true`):
+- `events_per_job` scaled by `effective_fraction` (= `test_fraction`; no-op
+  when `test_fraction=1.0`)
 - `events_per_job` tuned to target wall time (default 8h)
 - `jobs_per_group` sized from measured per-tier output to target
   `min_merge_size..max_merge_size`
-- Memory sized to measured peak + 20% safety margin
+- Memory sized to FJR peak RSS + 20% safety margin (see Section 5.5)
 - Each round builds only its share of work units
 - On completion: metrics refined, request returns to queue if work remains
 
@@ -2489,7 +2517,7 @@ Round K: Remaining work (≤10 WUs) → final DAG → COMPLETED
 
 The adaptive optimization composes independent dimensions rather than selecting one exclusive mode:
 
-1. **Memory sizing**: Unified source hierarchy (cgroup → FJR RSS → default) with safety margin
+1. **Memory sizing**: FJR peak RSS + safety margin (cgroup used only for tmpfs workloads; see Section 5.5)
 2. **Job splitting**: When CPU efficiency is low, reduce `request_cpus` (e.g., 8→4) and multiply jobs. This is the real CPU knob — `request_cpus` determines scheduler resource allocation. A configurable `min_request_cpus` floor (default 4) prevents pool fragmentation.
 3. **Internal parallelism (step 0 splitting)**: Split CPU-inefficient step 0 into N parallel `cmsRun` processes within a single slot, using `skipEvents`/`maxEvents` partitioning. This is a sandbox-owned optimization invisible to the scheduler.
 4. **Internal parallelism (all-step pipeline split)**: Fork N complete StepChain pipelines within one sandbox — appropriate for workflows most efficient at 1 thread where submitting 1-core jobs would fragment the pool.
@@ -2502,28 +2530,65 @@ Job splitting and internal parallelism compose: when job splitting reduces `requ
 
 ### 5.5 Memory Sizing
 
-The adaptive algorithm sizes `request_memory` for Round 1+ based on measured data from Round 0 (and earlier rounds). All measured values include a **20% safety margin** (default, configurable) to account for:
+The adaptive algorithm sizes `request_memory` for Round 1+ based on measured data from Round 0 (and earlier rounds). All measured values include a **20% safety margin** (default, configurable via `safety_margin` setting) to account for:
 - Memory leak accumulation over longer production runs (round 0 processes fewer events)
 - Event-to-event variation in RSS across different input data
 - Page cache pressure under concurrent load
 
-**Data sources** (unified hierarchy, in order of preference):
+**Primary source: FJR peak RSS.** The Framework Job Report's `PeakValueRss` (max across all steps and jobs) is used as the measured memory value. FJR RSS is a stable, reproducible measurement — across 18 rounds of a 5-step StepChain with DRPremix pileup mixing (request 00058, 60,000 events), FJR peak RSS ranged 5,347–5,461 MB (2% variation).
 
-1. **Cgroup peak**: HTCondor's cgroup accounting captures the full memory footprint — process RSS, tmpfs (e.g., gridpack extraction), page cache, and subprocess memory. This is the most accurate measurement because it reflects what the cgroup OOM killer actually enforces.
-2. **FJR peak RSS**: The Framework Job Report's `PeakValueRss` measures process RSS only — it misses tmpfs, page cache, and subprocess memory. Peak across all steps and jobs.
-3. **Default**: `default_memory_per_core × cores` when no measurements are available.
+**Why not cgroup peak?** HTCondor's cgroup `peak_nonreclaim_mb` (anon RSS + tmpfs + slab, sampled every 2 seconds by `memory_monitor.log`) captures the full memory footprint including transient peaks. However, for workloads with pileup mixing, cgroup peak exhibits high variance that makes it unreliable for memory sizing:
 
-**Sizing formula**:
+- **Observed**: On 8 identical DRPremix jobs in the same round, cgroup `peak_nonreclaim_mb` ranged 5,929–12,165 MB — a 2× spread. FJR RSS for the same jobs was 5,347–5,461 MB.
+- **Root cause**: The variance is a genuine transient peak during step 2 (pileup mixing) lasting ~24 seconds. Different random selections of pileup events create different peak heights. The inter-step baseline is stable at ~3,300 MB — the spike is real but unpredictable.
+- **Neither measurement captures the true peak reliably**: FJR RSS samples only at event boundaries and misses intra-event peaks. Cgroup anon (2-second sampling) catches some peaks and misses others, producing random scatter. In 3 of 8 sampled jobs, cgroup peak was actually *below* FJR RSS, meaning the 2-second sampling missed the peak entirely.
+- **Consequence**: Using cgroup MAX as `request_memory` over-allocates by 50–100% on most jobs (the typical peak is closer to FJR RSS), wastes slot resources, and still doesn't guarantee catching the true maximum on the next round.
+
+**Policy**: Use FJR RSS as a stable lower bound. The 20% safety margin covers most transient peaks. If a job does hit an unusually high pileup peak and gets OOM-killed by a site's hard cgroup limit (`memory.max`), the existing POST script retry mechanism detects OOM exit codes (50660, 50661, 8004, 8030, 8031) and bumps `request_memory` by 50% on retry. This reactive approach is more resource-efficient than pre-emptively requesting 2× memory for all jobs.
+
+**Exception — tmpfs workloads**: When `split_tmpfs=true` (gridpack extraction into tmpfs), cgroup data *is* used for memory sizing because tmpfs pages are charged to the cgroup but invisible to FJR RSS. The cgroup branch measures either the actual tmpfs peak (`tmpfs_peak_nonreclaim_mb`) or estimates it from `peak_anon_mb + gridpack_disk_mb`.
+
+**Data source hierarchy**:
+
+1. **FJR peak RSS**: `PeakValueRss` from the Framework Job Report, max across all steps and jobs. Stable, reproducible, and sufficient for non-tmpfs workloads.
+2. **Cgroup peak** (tmpfs only): Used when `split_tmpfs=true` to account for tmpfs memory not visible in FJR RSS.
+3. **Default**: `default_memory_per_core × cores` when no measurements are available (round 0).
+
+Cgroup data is still collected and logged for diagnostics on all workloads — it remains valuable for understanding memory behavior, just not for sizing `request_memory`.
+
+**Sizing formula** (single-instance jobs):
 
 ```
-measured_memory = best available measurement (cgroup or FJR RSS)
-request_memory  = measured_memory × 1.20
+measured_memory = FJR peak RSS (or cgroup peak if split_tmpfs)
+request_memory  = measured_memory × (1 + safety_margin)    # default safety_margin = 0.20
 request_memory  = clamp(request_memory, MIN_MEMORY_MB, max_memory_per_core × cores)
 ```
 
 Where `MIN_MEMORY_MB` = 4000 MB is a hard floor preventing pathologically small allocations.
 
 If the clamped value at `max_memory_per_core × cores` is still below what the measured data requires, the adaptive algorithm must reduce the number of parallel instances (fewer splits) rather than exceed the memory ceiling.
+
+**Multi-instance memory model**: When internal parallelism splits a step into N parallel cmsRun processes within one slot (see Section 5.4), `request_memory` must cover all N concurrent instances. Steps within a StepChain execute sequentially, so only the peak step's memory matters — but within a split step, all N instances run concurrently and their memory adds up.
+
+```
+For each step i:
+    if step i runs N_i parallel instances:
+        effective_i = SANDBOX_OVERHEAD + N_i × per_instance_RSS_i × (1 + margin)
+    else:
+        effective_i = step_i_peak_RSS × (1 + margin)
+
+request_memory = max(effective_i for all steps i)
+request_memory = clamp(request_memory, MIN_MEMORY_MB, max_memory_per_core × cores)
+```
+
+Where `SANDBOX_OVERHEAD` (3000 MB) accounts for the container environment, framework initialization, and wrapper processes shared across instances. The `per_instance_RSS` is the FJR peak RSS for the split step (typically step 0), which measures the per-process memory of one cmsRun instance. The same model applies to pipeline split mode (N complete StepChain pipelines within one slot), where every step runs N concurrent instances.
+
+The adaptive algorithm first computes single-instance `request_memory`, then checks whether internal parallelism requires more. If the multi-instance memory exceeds the per-core ceiling, the algorithm reduces N (fewer parallel instances) rather than exceeding the ceiling — preferring correct execution over maximum parallelism.
+
+**Safety net layers** (defense in depth):
+1. **20% margin** on FJR RSS covers normal variation and moderate transient peaks.
+2. **POST script OOM retry** bumps `request_memory` by 50% per retry for jobs killed by hard cgroup limits. This is adaptive — only jobs that actually hit limits get more memory.
+3. **Historical peak tracking**: The algorithm uses `max(current_round_peak, historical_peak)` to prevent memory regression across rounds.
 
 With only one round of data (common case), the 20% safety margin absorbs extrapolation uncertainty — a percentage scales naturally with job size (unlike a fixed MB buffer).
 
@@ -3443,7 +3508,7 @@ measured data for the bulk of its processing.
 
 ### DD-13: Memory-per-core window with 20% safety margin
 
-**Decision**: The adaptive algorithm operates within a `[default_memory_per_core, max_memory_per_core]` window. Round 0 uses request defaults, Round 1+ sizes memory to measured data + 20% safety margin, clamped within the window with a 4 GB hard minimum. This replaces the previous fixed 512 MB headroom buffer.
+**Decision**: The adaptive algorithm operates within a `[default_memory_per_core, max_memory_per_core]` window. Round 0 uses request defaults, Round 1+ sizes memory to FJR peak RSS + 20% safety margin, clamped within the window with a 4 GB hard minimum. This replaces the previous fixed 512 MB headroom buffer.
 
 **Why**: CMS sites advertise resources as memory per core with a practical minimum. Requesting more than the minimum narrows the pool of matching sites, creating a tradeoff between accurate memory sizing and scheduling breadth. The two-knob window makes this tradeoff explicit and tunable. The 20% percentage-based margin (rather than fixed MB) scales naturally with job size — it provides proportionally more headroom for memory-heavy jobs and avoids being either too generous for small jobs (512 MB on a 2 GB job is 25%) or too thin for large jobs (512 MB on a 20 GB job is 2.5%). The margin accounts for memory leak accumulation (round 0 processes fewer events than production), event-to-event RSS variation, and page cache pressure under concurrent load.
 
@@ -3481,13 +3546,30 @@ measured data for the bulk of its processing.
 - *Run cmsDriver.py at sandbox creation time*: Requires a full CMSSW environment on the WMS2 host. Heavyweight and slow for a step that only needs to produce a Python config file.
 - *Embed PSets in the request spec*: PSets can be hundreds of KB. ReqMgr2 request documents are not designed for large binary payloads.
 
-### DD-17: In-memory pileup file cache with 24-hour TTL
+### DD-17: Pileup file cache with 7-day TTL and mandatory resolution
 
-**Decision**: Cache the results of Rucio `list_replicas` queries for pileup datasets in a module-level dict, keyed by dataset name, with a 24-hour time-to-live. Subsequent DAG planning rounds and re-imports reuse cached results instead of re-querying Rucio.
+**Decision**: Cache the results of Rucio `list_replicas` queries for pileup datasets in a module-level dict (backed by a JSON file on disk), keyed by dataset name, with a 7-day time-to-live. Subsequent DAG planning rounds and re-imports reuse cached results instead of re-querying Rucio. If a pileup dataset requires resolution and the query fails, retry up to 3 times; if all attempts fail, the import fails with a clear error. Pileup resolution is mandatory — DAGs must not be submitted without a resolved pileup file list.
 
-**Why**: Pileup datasets (e.g., PREMIX with millions of files) are large and stable — replica availability changes slowly (hours to days), but the Rucio `list_replicas` query can take 30–120+ seconds per dataset, and sometimes hits 502 errors with exponential backoff retries in the native Rucio client. A single request with 3751 work units goes through hundreds of rounds, each re-querying the same pileup dataset. The 24-hour TTL eliminates this repeated cost while still picking up significant replica changes within a day.
+**Why**: Pileup datasets (e.g., PREMIX with millions of files) are large and stable — replica availability changes slowly (days to weeks), but the Rucio `list_replicas` query can take 30–300+ seconds per dataset, and sometimes hits 502 errors with exponential backoff retries in the native Rucio client. A single request with 3751 work units goes through hundreds of rounds, each re-querying the same pileup dataset. The 7-day TTL eliminates this repeated cost while still picking up significant replica changes. The disk-backed cache survives service restarts, preventing cold-start re-queries.
 
-**Trade-offs**: If a major pileup redistribution happens mid-request, jobs may see a stale file list for up to 24 hours. This is acceptable because CMSSW pileup mixing uses random file selection from the list — a slightly outdated list only means occasional AAA remote reads for files that moved, not job failures. The cache resets on service restart for immediate freshness if needed.
+**Trade-offs**: If a major pileup redistribution happens mid-request, jobs may see a stale file list for up to 7 days. This is acceptable because CMSSW pileup mixing uses random file selection from the list — a slightly outdated list only means occasional AAA remote reads for files that moved, not job failures. The cache resets on service restart if the cache file is deleted for immediate freshness when needed. The 300-second per-attempt timeout (configurable via `WMS2_PILEUP_QUERY_TIMEOUT`) means worst-case import time for a cold pileup query is ~15 minutes (3 × 300s), but this only happens once per dataset per 7 days.
+
+### DD-18: FJR RSS for memory sizing instead of cgroup peak
+
+**Decision**: Use FJR peak RSS (+ 20% safety margin) as the primary memory measurement for `request_memory` sizing. Cgroup `peak_nonreclaim_mb` is no longer used for non-tmpfs workloads — it is collected and logged for diagnostics only. Cgroup data is still used for tmpfs workloads (gridpack extraction) where tmpfs pages are invisible to FJR RSS.
+
+**Why**: Empirical data from 18 rounds of a 5-step StepChain with DRPremix pileup mixing (request 00058, 60,000 events) showed that cgroup peak is too variable for reliable memory sizing:
+
+- FJR peak RSS: 5,347–5,461 MB across 18 rounds (2% variation) — stable and reproducible.
+- Cgroup `peak_nonreclaim_mb`: 5,929–12,165 MB across 8 identical jobs in one round (2× spread).
+
+The variation is a genuine transient peak during pileup mixing (~24 seconds), not measurement noise. Different random selections of pileup events create different peak heights. The cgroup 2-second sampling catches some peaks and misses others — in 3 of 8 jobs, cgroup peak was *below* FJR RSS, meaning the sampler missed the true peak entirely. Using the MAX of a random scatter as `request_memory` over-allocates for most jobs and still doesn't guarantee catching the maximum next time.
+
+FJR RSS, while it only samples at event boundaries and misses intra-event peaks, provides a stable lower bound. The 20% margin covers most transient peaks. For the rare job that exceeds this and hits a site's hard cgroup limit, the POST script OOM retry mechanism bumps `request_memory` by 50% — adapting reactively rather than pre-emptively wasting resources.
+
+**Rejected alternative**: *Cgroup peak as primary source* (the previous design). Produces wildly variable `request_memory` across rounds (oscillating between 7 GB and 14 GB for the same workload), over-allocates slot resources on most jobs, and narrows the pool of matching sites unnecessarily.
+
+**Rejected alternative**: *P90 or median of cgroup peaks across jobs*. More stable than MAX, but still higher than necessary for most jobs and still subject to sampling artifacts. The fundamental problem is that 2-second sampling of a 24-second transient creates a biased estimator — no percentile choice fixes this.
 
 ---
 
