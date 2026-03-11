@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ class HTCondorAdapter(CondorAdapter):
         self._schedds: dict[str, htcondor2.Schedd] = {
             default_name: htcondor2.Schedd(schedd_ad)
         }
+        self._schedd_lock = threading.Lock()
         logger.info("Default schedd: %s via %s", default_name, condor_host)
 
         # Full proxy delegation (following CRABServer approach)
@@ -64,32 +66,36 @@ class HTCondorAdapter(CondorAdapter):
         Note: htcondor2 Collector.locate() returns None (not an exception)
         when a daemon is not found, and Schedd(None) silently connects to
         the local schedd. We must check for None explicitly.
+
+        Thread-safe: htcondor2 Collector/Schedd objects are not thread-safe,
+        and asyncio.to_thread dispatches calls to a thread pool.
         """
         name = name or self._default_schedd_name
-        if name not in self._schedds:
-            schedd_ad = None
-            try:
-                schedd_ad = self._collector.locate(
-                    htcondor2.DaemonType.Schedd, name
-                )
-            except Exception:
-                pass
-            if schedd_ad is None:
-                # Schedd not in primary collector — try extra collectors
-                for coll in self._extra_collectors:
-                    try:
-                        schedd_ad = coll.locate(
-                            htcondor2.DaemonType.Schedd, name
-                        )
-                    except Exception:
-                        continue
-                    if schedd_ad is not None:
-                        break
-            if schedd_ad is None:
-                raise RuntimeError(f"Schedd {name!r} not found in any collector")
-            self._schedds[name] = htcondor2.Schedd(schedd_ad)
-            logger.info("Connected to schedd %s", name)
-        return self._schedds[name]
+        with self._schedd_lock:
+            if name not in self._schedds:
+                schedd_ad = None
+                try:
+                    schedd_ad = self._collector.locate(
+                        htcondor2.DaemonType.Schedd, name
+                    )
+                except Exception:
+                    pass
+                if schedd_ad is None:
+                    # Schedd not in primary collector — try extra collectors
+                    for coll in self._extra_collectors:
+                        try:
+                            schedd_ad = coll.locate(
+                                htcondor2.DaemonType.Schedd, name
+                            )
+                        except Exception:
+                            continue
+                        if schedd_ad is not None:
+                            break
+                if schedd_ad is None:
+                    raise RuntimeError(f"Schedd {name!r} not found in any collector")
+                self._schedds[name] = htcondor2.Schedd(schedd_ad)
+                logger.info("Connected to schedd %s", name)
+            return self._schedds[name]
 
     @staticmethod
     def _set_proxy(sub: htcondor2.Submit) -> None:
@@ -147,7 +153,11 @@ class HTCondorAdapter(CondorAdapter):
                 # Spool mode: use relative DAG path so from_dag() generates
                 # relative arguments. DAGMan's CWD = spool subdir on schedd.
                 dag_submit = htcondor2.Submit.from_dag(dag_basename, options=options)
-                self._set_proxy(dag_submit)
+                # Don't set x509userproxy on the DAGMan job in spool mode.
+                # x509userproxy triggers GSI proxy delegation which can break
+                # after schedd restarts. DAGMan runs on the schedd and doesn't
+                # need its own proxy. Inner jobs get the proxy via _x509up in
+                # their transfer_input_files.
 
                 # Don't transfer our condor_dagman binary — use the
                 # remote schedd's own /usr/bin/condor_dagman.
@@ -471,7 +481,12 @@ class HTCondorAdapter(CondorAdapter):
     def _query_dag_site_summary_sync(
         self, cluster_id: str, schedd_name: str | None = None,
     ) -> dict[str, dict[str, int]]:
-        """Per-site job status counts for payload jobs under a DAGMan hierarchy."""
+        """Per-site job status counts for payload jobs under a DAGMan hierarchy.
+
+        For DAGs with SUBDAG EXTERNAL (work units), finds sub-DAGMan clusters
+        then queries payload jobs under each.  Remote schedds reject large OR
+        constraints, so we query per sub-DAG individually.
+        """
         schedd = self._get_schedd(schedd_name)
         sub_dagman_ads = schedd.query(
             constraint=f"DAGManJobId == {cluster_id} && JobUniverse == 7",
@@ -480,39 +495,42 @@ class HTCondorAdapter(CondorAdapter):
         if not sub_dagman_ads:
             return {}
 
-        sub_ids = [str(int(ad["ClusterId"])) for ad in sub_dagman_ads]
-        parts = " || ".join(f"DAGManJobId == {sid}" for sid in sub_ids)
-        constraint = f"({parts}) && JobUniverse =!= 7"
-
-        ads = schedd.query(
-            constraint=constraint,
-            projection=["JobStatus", "MATCH_GLIDEIN_CMSSite", "DESIRED_Sites"],
-        )
-
         is_local = schedd_name in (None, "localhost", self._default_schedd_name)
-
         result: dict[str, dict[str, int]] = {}
-        for ad in ads:
-            status_int = int(ad.get("JobStatus", 0))
-            site = ad.get("MATCH_GLIDEIN_CMSSite") or ""
-            if not site:
-                if is_local:
-                    site = "local"
-                else:
-                    # Use DESIRED_Sites for pinned idle/held jobs
-                    desired = ad.get("DESIRED_Sites") or ""
-                    if desired:
-                        site = desired
-                    elif status_int == 1:
-                        site = "pending"
+
+        def _add(site: str, status_key: str):
             if site not in result:
                 result[site] = {"running": 0, "idle": 0, "held": 0}
-            if status_int == 1:
-                result[site]["idle"] += 1
-            elif status_int == 2:
-                result[site]["running"] += 1
-            elif status_int == 5:
-                result[site]["held"] += 1
+            result[site][status_key] += 1
+
+        # Query payload jobs per sub-DAG to avoid large OR constraints
+        for sub_ad in sub_dagman_ads:
+            sub_id = int(sub_ad["ClusterId"])
+            try:
+                ads = schedd.query(
+                    constraint=f"DAGManJobId == {sub_id} && JobUniverse != 7",
+                    projection=["JobStatus", "MATCH_GLIDEIN_CMSSite"],
+                )
+            except Exception:
+                logger.debug("Failed to query sub-DAG %d on %s", sub_id, schedd_name)
+                continue
+
+            for ad in ads:
+                status_int = int(ad.get("JobStatus", 0))
+                status_key = {1: "idle", 2: "running", 5: "held"}.get(status_int)
+                if not status_key:
+                    continue
+                # Only trust MATCH_GLIDEIN_CMSSite for running jobs.
+                # Idle/held jobs may have a stale value from a previous match.
+                site = ""
+                if status_key == "running":
+                    site = ad.get("MATCH_GLIDEIN_CMSSite") or ""
+                if site:
+                    _add(site, status_key)
+                elif is_local:
+                    _add("local", status_key)
+                else:
+                    _add("unmatched", status_key)
         return result
 
     async def query_dag_site_summary(
