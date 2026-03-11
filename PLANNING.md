@@ -22,6 +22,16 @@ debugging.
 
 - pilot concept needs to be clarified. there should be no "pilot",
   round 0 in a request processing is the pilot.
+- `work_units_per_round` semantics are confusing. The user sets it at
+  import time expecting N work units per round, but adaptive optimization
+  can change `jobs_per_work_unit` (e.g. job_multiplier=2 when CPU efficiency
+  is low), so the actual WU count differs (e.g. 250 instead of 500). The
+  parameter currently controls *processing jobs per round* (WUs × jobs/WU),
+  not actual WU count. Options to make this consistent:
+  - specify number of processing jobs per round (what we preserve now)
+  - specify actual number of work units per round (divide by adaptive jobs/WU)
+  - specify amount of work in CPU-hours per round
+  - specify number of processing rounds (total jobs / per-round budget)
 
 ### Service mode
 
@@ -68,6 +78,37 @@ instances before enabling.
   representing each task.
 - Add configuration control to enable tmpfs for gridpacks in UI.
 - We hardcoded some site restrictions. This needs to be revised and handled properly
+- **Add `periodic_remove` to submit files** — detect and kill zombie/stuck jobs.
+  Without this, jobs matched to dead glideins stay "Running" with zero wall clock
+  time indefinitely, blocking DAG completion. Reference implementations:
+  - **CRABServer** (`DagmanCreator.py`): bakes enforcement into submit files:
+    ```
+    periodic_remove = (JobStatus==2) && (MaxWallTimeMinsRun*60 < time()-EnteredCurrentStatus)
+                   || (JobStatus==5) && (time()-EnteredCurrentStatus > 7*60)
+                   || (JobStatus==1) && (time()-EnteredCurrentStatus > 7*24*60*60)
+                   || (MemoryUsage > RequestMemory)
+                   || (DiskUsage > 20GB)
+    ```
+    Sets `MaxWallTimeMinsRun` per job (default 21.5h). Also `periodic_release` for
+    transient hold codes (28, 30, 13, 6). Uses `PeriodicRemoveReason` for diagnostics.
+  - **WMAgent** (`SimpleCondorPlugin.py`): application-side polling via StatusPoller
+    every ~3 min. Kills Running>48h, Idle>72h. Also sets `PeriodicRemove` for
+    held jobs >10 min and `JobLeaseDuration=1200` (20 min lease → HTCondor evicts
+    if startd loses contact).
+  - **For WMS2**: CRABServer's submit-level approach fits better since we don't
+    track individual jobs. Need to set `MaxWallTimeMinsRun` based on estimated
+    wall time from request spec, plus a safety margin. Also add `JobLeaseDuration`
+    like WMAgent does.
+
+## Security (future)
+
+- **API authentication** — No auth on `/api/v1/` endpoints. Acceptable for
+  single-user dev VM, required before multi-user or production deployment.
+- **Rate limiting** — No rate limiting on any endpoints. Add before exposing
+  to wider network.
+- **Request name validation** — Request names are used in filesystem paths
+  (`submit_base_dir/{request_name}/`). No path traversal validation. Add
+  allowlist regex (e.g. `^[a-zA-Z0-9_-]+$`) before accepting untrusted input.
 
 ## Future improvements (not fixing now)
 
@@ -172,6 +213,35 @@ spec. DBS writes remain disabled.
   handle, causing SIGBUS (bus error) in memory-heavy steps like DRPremix
   (pileup mixing). Fix: set `MEMORY = 128000` (or actual physical RAM) in
   HTCondor config so the partitionable slot doesn't overcommit.
+- **Pileup Rucio query timeout (120s per DAG plan)** — `get_available_pileup_files()`
+  times out after 60s per pileup dataset (two attempts = 120s). Affects every
+  import/replan for DRPremix workflows. Pileup works at runtime via CVMFS so
+  processing is unaffected, but planning is slow. Root cause: Rucio
+  `list_replicas()` for large PREMIX datasets (millions of files) exceeds 60s
+  timeout. Files: `src/wms2/adapters/rucio.py:209`, `src/wms2/core/dag_planner.py:458`.
+- **Consolidation block retry log spam** — Blocks with no files at Rucio-enabled
+  sites (e.g. pilot round NANOAODSIM) are retried every lifecycle cycle (30s),
+  producing INFO-level log noise. Fix: downgrade to DEBUG.
+  File: `src/wms2/core/output_manager.py:466`.
+- **Lifecycle manager lacks per-request INFO logging** — Each cycle only logs
+  "N non-terminal request(s)" at INFO level. DAG polling details are DEBUG-only.
+  Fix: add one-line per-request progress summary at INFO level.
+  File: `src/wms2/core/lifecycle_manager.py:719`.
+- **SyntaxWarnings in dag_planner.py** — Invalid escape sequences `\s`, `\d` in
+  embedded bash script at line ~1941 and regex at line ~4560. Will become errors
+  in future Python versions. Fix: escape backslashes in the Python string.
+- **~~`num_proc_jobs` NameError in merge script~~ (FIXED)** — Merge script crashes
+  at metrics aggregation: `num_proc_jobs` used as a variable but only assigned as
+  a dict key. The merge itself succeeds (ROOT files uploaded to EOS) but the WU
+  is marked failed because the script exits non-zero. Fix: assign
+  `num_proc_jobs = len(all_proc_metrics)` before the dict literal.
+  File: `src/wms2/core/dag_planner.py:4749`.
+- **~~NANOEDMAODSIM1 tier not staged out~~ (FIXED)** — Proc jobs produce
+  `NANOEDMAODSIM1` output tier (EDM NanoAOD format), but the stageout tier
+  matching regex `(EDM)?(\d+)$` fails to strip `EDM` from `NANOEDMAODSIM1`
+  because `EDM` isn't adjacent to the trailing digit. Result: NanoAOD ROOT files
+  are silently discarded. Fix: strip `EDM` and trailing digits separately.
+  File: `src/wms2/core/dag_planner.py:2360,4618`.
 
 ## Technical debt
 
@@ -189,19 +259,27 @@ spec. DBS writes remain disabled.
 
 ### Current status
 
-**Global pool commissioning validated.** Two requests running in the CMS global
-pool (00058 at 94.7%, 00060 at 29.0%) with zero failures. The full pipeline
-works end-to-end: spool-mode DAG submission to remote schedd, grid stageout,
-multi-round adaptive optimization, error recovery (rescue chain + HELD + fresh
-replan). Merges verified at T2_CH_CERN (prefix storage.json) and T1_US_FNAL
-(rules storage.json). No architectural issues found — all bugs were
-implementation-level fixes.
+**Global pool commissioning — debugging merge failures.** Two bugs found
+and fixed in source: (1) `num_proc_jobs` NameError in merge script metrics
+aggregation crashes all WUs after successful merge; (2) NANOEDMAODSIM1 tier
+not matched by stageout regex, so NanoAOD outputs silently discarded.
+Both fixes applied to `dag_planner.py` but existing deployed DAGs on
+read-only spool cannot be updated — affected rounds will fail and need
+fresh replan.
 
-Four active requests:
-- **00058**: round 17, 56840/60000 events (94.7%) — global pool, near completion
-- **00060**: round 1, 17400/60000 events (29.0%) — global pool, fresh DAG after rescue exhaustion
-- **00057**: round 7, 19960/30000 events (66.5%) — local pool
-- **00059**: completed, 12000/12000 events (100%)
+Active requests:
+- **00002**: active, round 1, 250 WUs — global pool (GS+DRPremix 5-step
+  StepChain). All WUs failing at merge metrics aggregation (`num_proc_jobs`
+  bug). AODSIM+MINIAODSIM merged and uploaded to EOS, but WUs marked failed.
+  66/300,000 events. Will need fresh replan after DAG failure.
+  Sites: T2_CH_CERN (112), T1_US_FNAL (28), T2_IT_Pisa (21), others.
+- **00057**: active, round 1, 31 WUs — global pool (LHEGen+DRPremix).
+  Early stage: landing nodes done, proc jobs running. Will hit same
+  merge bugs when merges start. 0/3,000,000 events.
+  Sites: T2_CH_CERN (26), T1_DE_KIT (2), others.
+- **00058**: completed — global pool
+- **00059**: completed — local pool
+- **00060**: paused (HELD), round 2, 32910/60,000 events — global pool
 
 ### Global pool commissioning
 
@@ -306,3 +384,5 @@ python -m tests.matrix -l smoke
 22. Stale status files in spool mode — `dag_file_path + ".status"` pointed to old spool dir; fixed with `_resolve_dag_file()` that checks `submit_dir` first
 23. Merge crash on grid workers when gfal-ls returns empty — fell to text merge path, crashed on `os.makedirs("/mnt/shared")` (read-only); fixed with guard to exit with error if no ROOT and no text files
 24. Grid listing empty at T1_DE_KIT/T1_PL_NCBJ — `gfal-ls` on `davs://` returned empty; added `proc_node_indices` probe fallback in merge script
+25. `num_proc_jobs` NameError in merge metrics aggregation — variable used but only assigned as dict key; merge succeeds but script crashes post-merge
+26. NANOEDMAODSIM1 tier not staged out — stageout regex `(EDM)?(\d+)$` failed to strip `EDM` from middle of tier name; NanoAOD ROOT files silently discarded

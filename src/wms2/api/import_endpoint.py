@@ -11,7 +11,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request as FastAPIRequest
 from pydantic import BaseModel
 
-from wms2.core.dag_planner import DAGPlanner
+from wms2.core.dag_planner import DAGPlanner, PileupResolutionError
 from wms2.core.output_lfn import derive_merged_lfn_bases, determine_merged_lfn_base
 from wms2.core.sandbox import create_sandbox
 from wms2.db.repository import Repository
@@ -42,6 +42,9 @@ class ImportBody(BaseModel):
     condor_pool: str = "global"  # "local" or "global" (which schedd to use)
     stageout_mode: str = "test"  # "local", "test", or "production"
     allowed_sites: str = ""    # comma-separated CMS site names (for global pool)
+    pilot_fraction: float | None = None    # fraction of events_per_job for round 0 (0 = skip)
+    pilot_throwaway: bool | None = None    # discard round 0 output after metrics
+    source_request_name: str | None = None  # ReqMgr2 name (when request_name differs, e.g. clone)
 
 
 def _normalize_request(reqdata: dict) -> dict:
@@ -132,7 +135,7 @@ async def preview_request(
     try:
         reqdata = await reqmgr.get_request(request_name)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch from ReqMgr2: {exc}")
+        raise HTTPException(status_code=502, detail="Failed to fetch request from ReqMgr2")
 
     reqdata = _normalize_request(reqdata)
 
@@ -197,7 +200,7 @@ async def import_request(
 
     # Check if request already exists
     existing = await repo.get_request(body.request_name)
-    reimportable = ("failed", "aborted")
+    reimportable = ("failed", "aborted", "completed")
     if existing:
         logger.info("Import %s: request exists (status=%s)", body.request_name, existing.status)
         if existing.status not in reimportable:
@@ -228,12 +231,13 @@ async def import_request(
 
     # 1. Fetch from ReqMgr2
     t1 = time.monotonic()
+    reqmgr_name = body.source_request_name or body.request_name
     try:
-        reqdata = await reqmgr.get_request(body.request_name)
+        reqdata = await reqmgr.get_request(reqmgr_name)
     except Exception as exc:
         logger.error("Import %s: ReqMgr2 fetch failed after %.1fs: %s",
                      body.request_name, time.monotonic() - t1, exc)
-        raise HTTPException(status_code=502, detail=f"Failed to fetch from ReqMgr2: {exc}")
+        raise HTTPException(status_code=502, detail="Failed to fetch request from ReqMgr2")
     logger.info("Import %s: fetched from ReqMgr2 in %.1fs (type=%s)",
                 body.request_name, time.monotonic() - t1, reqdata.get("RequestType"))
 
@@ -292,9 +296,14 @@ async def import_request(
     #   test:  /store/temp/user/... (grid stageout, _Temp RSEs, user scope)
     #   production: auto-determined from request (grid stageout, real RSEs, cms scope)
     if body.stageout_mode == "test":
-        merged_lfn_base = "/store/temp/user/dmytro.wms2.merged"
+        if not settings.test_lfn_user:
+            raise HTTPException(
+                status_code=400,
+                detail="WMS2_TEST_LFN_USER must be set for test stageout mode",
+            )
+        merged_lfn_base = f"/store/temp/user/{settings.test_lfn_user}.merged"
         reqdata["MergedLFNBase"] = merged_lfn_base
-        reqdata["UnmergedLFNBase"] = "/store/temp/user/dmytro.wms2.unmerged"
+        reqdata["UnmergedLFNBase"] = f"/store/temp/user/{settings.test_lfn_user}.unmerged"
     else:
         merged_lfn_base = await determine_merged_lfn_base(reqdata, dbs_adapter=dbs)
         reqdata["MergedLFNBase"] = merged_lfn_base
@@ -327,10 +336,15 @@ async def import_request(
     config_data["stageout_mode"] = body.stageout_mode
     if body.stageout_mode == "test":
         config_data["consolidation_rse"] = "T2_CH_CERN_Temp"
+        config_data["rucio_test_account"] = settings.rucio_test_account
     if body.allowed_sites:
         config_data["allowed_sites"] = body.allowed_sites
     if body.work_units_per_round is not None:
         config_data["work_units_per_round"] = body.work_units_per_round
+    if body.pilot_fraction is not None:
+        config_data["pilot_fraction"] = body.pilot_fraction
+    if body.pilot_throwaway is not None:
+        config_data["pilot_throwaway"] = body.pilot_throwaway
 
     # Priority profile
     config_data["priority_profile"] = {
@@ -371,7 +385,7 @@ async def import_request(
     except Exception as exc:
         logger.error("Import %s: sandbox creation failed after %.1fs: %s",
                      body.request_name, time.monotonic() - t_sandbox, exc)
-        raise HTTPException(status_code=500, detail=f"Failed to create sandbox: {exc}")
+        raise HTTPException(status_code=500, detail="Sandbox creation failed")
     logger.info("Import %s: sandbox created in %.1fs", body.request_name, time.monotonic() - t_sandbox)
     config_data["sandbox_path"] = sandbox_path
 
@@ -440,6 +454,13 @@ async def import_request(
                 status_transitions=old_transitions + [new_transition],
             )
             message += f", DAG submitted (cluster {dag.dagman_cluster_id})"
+        except PileupResolutionError as exc:
+            logger.error("Import %s: pileup resolution failed after %.1fs — %s",
+                         body.request_name, time.monotonic() - t_dag, exc)
+            raise HTTPException(
+                status_code=502,
+                detail="Pileup file resolution failed",
+            )
         except Exception as exc:
             logger.exception("Import %s: DAG planning/submission failed after %.1fs",
                              body.request_name, time.monotonic() - t_dag)

@@ -387,8 +387,11 @@ async def run_import(args: argparse.Namespace) -> None:
                 merged_lfn_base = args.merged_lfn_base
                 print(f"      lfn_base:    {merged_lfn_base} (CLI override)")
             elif stageout_mode == "test":
-                merged_lfn_base = "/store/temp/user/dmytro.wms2.merged"
-                reqdata["UnmergedLFNBase"] = "/store/temp/user/dmytro.wms2.unmerged"
+                if not settings.test_lfn_user:
+                    print("ERROR: WMS2_TEST_LFN_USER must be set for test stageout mode")
+                    sys.exit(1)
+                merged_lfn_base = f"/store/temp/user/{settings.test_lfn_user}.merged"
+                reqdata["UnmergedLFNBase"] = f"/store/temp/user/{settings.test_lfn_user}.unmerged"
                 print(f"      lfn_base:    {merged_lfn_base} (test mode)")
             else:
                 merged_lfn_base = await determine_merged_lfn_base(reqdata, dbs_adapter=dbs)
@@ -425,6 +428,7 @@ async def run_import(args: argparse.Namespace) -> None:
             config_data["condor_pool"] = "local" if stageout_mode == "local" else "global"
             if stageout_mode == "test":
                 config_data["consolidation_rse"] = "T2_CH_CERN_Temp"
+                config_data["rucio_test_account"] = settings.rucio_test_account
             if args.processing_version is not None:
                 config_data["processing_version"] = args.processing_version
             if args.work_units_per_round is not None:

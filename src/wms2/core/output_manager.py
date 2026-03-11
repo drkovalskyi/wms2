@@ -152,7 +152,7 @@ class OutputManager:
         """Register merged output files as Rucio DIDs at the site RSE.
 
         Stageout mode determines naming conventions:
-        - test:  scope=user.dmytro, RSE=<site>_Temp, /USER DID tier
+        - test:  scope=user.<rucio_test_account>, RSE=<site>_Temp, /USER DID tier
         - production: scope=cms, RSE=<site>, standard DID naming
 
         Rucio derives PFN from RSE protocol config (deterministic naming).
@@ -165,7 +165,12 @@ class OutputManager:
 
         # Determine scope and RSE based on stageout mode
         if stageout_mode == "test":
-            scope = "user.dmytro"
+            rucio_account = cd.get("rucio_test_account", "")
+            if not rucio_account:
+                raise RucioRegistrationError(
+                    "rucio_test_account not set in config_data for test stageout mode"
+                )
+            scope = f"user.{rucio_account}"
             if self.site_manager:
                 rse = self.site_manager.get_temp_rse_name(site)
                 if not rse:
@@ -312,7 +317,8 @@ class OutputManager:
                 rule_did = f"/{primary}/{processing}-{tier}/USER"
             else:
                 rule_did = ds
-            scope = "user.dmytro" if stageout_mode == "test" else "cms"
+            rucio_account = cd.get("rucio_test_account", "")
+            scope = f"user.{rucio_account}" if stageout_mode == "test" else "cms"
             try:
                 rule_id = await self.rucio.create_rule(
                     dataset=rule_did,
@@ -492,7 +498,8 @@ class OutputManager:
             rule_did = f"/{primary}/{processing}-{tier}/USER"
         else:
             rule_did = ds
-        scope = "user.dmytro" if stageout_mode == "test" else "cms"
+        rucio_account = cd.get("rucio_test_account", "")
+        scope = f"user.{rucio_account}" if stageout_mode == "test" else "cms"
         try:
             rule_id = await self.rucio.create_rule(
                 dataset=rule_did,

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Disk-backed cache for pileup file lists (survives service restarts).
 # Key: dataset name, Value: (timestamp, file_list)
 _pileup_cache: dict[str, tuple[float, list[str]]] = {}
-PILEUP_CACHE_TTL = 24 * 3600  # 24 hours
+PILEUP_CACHE_TTL = 7 * 24 * 3600  # 7 days
 PILEUP_CACHE_FILE = "/mnt/shared/tmp/wms2/pileup_cache.json"
 _pileup_cache_loaded = False
 
@@ -58,6 +58,10 @@ def _save_pileup_cache() -> None:
             json.dump({ds: [ts, files] for ds, (ts, files) in _pileup_cache.items()}, f)
     except Exception:
         logger.debug("Could not save pileup cache to disk", exc_info=True)
+
+
+class PileupResolutionError(Exception):
+    """Raised when pileup file resolution fails after all retry attempts."""
 
 
 def _effective_stageout(mode: str) -> str:
@@ -323,11 +327,10 @@ class DAGPlanner:
         ncpus = config.get("multicore", 0)
         if ncpus:
             resource_params["ncpus"] = int(ncpus)
-        test_fraction = config.get("test_fraction")
-        if test_fraction:
-            resource_params["test_fraction"] = float(test_fraction)
-        # filter_efficiency is used at planning time (inflating total_events in
-        # _plan_gen_nodes) but not passed to the processing wrapper.
+        # test_fraction is handled at planning time via effective_fraction
+        # (scaling events_per_job) — not passed to the processing wrapper.
+        # filter_efficiency is also handled at planning time (inflating
+        # total_events in _plan_gen_nodes).
 
         # Wall time computation needs time_per_event and events_per_job.
         # Round 0: use request hint; round 1+: use measured value from step_metrics.
@@ -431,10 +434,12 @@ class DAGPlanner:
                 workflow_id=workflow.id
             )
 
-        # Resolve pileup file availability via Rucio (with 24h disk-backed cache)
+        # Resolve pileup file availability via Rucio (with 7-day disk-backed cache)
         t_pileup = time.monotonic()
         pileup_files: dict[str, list[str]] = {}
         manifest_steps = config.get("manifest_steps", [])
+        max_pileup_attempts = 3
+        pileup_timeout = self.settings.pileup_query_timeout
         if self.rucio and manifest_steps:
             _load_pileup_cache()
             now_ts = time.time()
@@ -449,25 +454,45 @@ class DAGPlanner:
                             pileup_files[ds] = cached[1]
                             logger.info("Pileup %s: %d files (cached)", ds, len(cached[1]))
                             continue
-                        t_pu = time.monotonic()
-                        try:
-                            preferred = [
-                                r.strip()
-                                for r in (self.settings.pileup_preferred_rses or "").split(",")
-                                if r.strip()
-                            ] or None
-                            files = await self.rucio.get_available_pileup_files(ds, preferred_rses=preferred)
-                            pileup_files[ds] = files
-                            _pileup_cache[ds] = (now_ts, files)
-                            cache_updated = True
-                            logger.info("Pileup %s: %d files in %.1fs%s",
-                                        ds, len(files), time.monotonic() - t_pu,
-                                        f" (preferred RSEs {preferred})" if preferred else "")
-                        except Exception:
-                            logger.warning(
-                                "Pileup %s: Rucio query failed after %.1fs",
-                                ds, time.monotonic() - t_pu, exc_info=True,
-                            )
+                        preferred = [
+                            r.strip()
+                            for r in (self.settings.pileup_preferred_rses or "").split(",")
+                            if r.strip()
+                        ] or None
+                        last_err: Exception | None = None
+                        for attempt in range(1, max_pileup_attempts + 1):
+                            t_pu = time.monotonic()
+                            try:
+                                files = await self.rucio.get_available_pileup_files(
+                                    ds, preferred_rses=preferred,
+                                    timeout=float(pileup_timeout),
+                                )
+                                pileup_files[ds] = files
+                                _pileup_cache[ds] = (now_ts, files)
+                                cache_updated = True
+                                logger.info("Pileup %s: %d files in %.1fs (attempt %d)%s",
+                                            ds, len(files), time.monotonic() - t_pu, attempt,
+                                            f" (preferred RSEs {preferred})" if preferred else "")
+                                last_err = None
+                                break
+                            except Exception as exc:
+                                last_err = exc
+                                elapsed = time.monotonic() - t_pu
+                                if attempt < max_pileup_attempts:
+                                    logger.warning(
+                                        "Pileup %s: attempt %d/%d failed after %.1fs — retrying",
+                                        ds, attempt, max_pileup_attempts, elapsed,
+                                    )
+                                else:
+                                    logger.error(
+                                        "Pileup %s: all %d attempts failed (last after %.1fs)",
+                                        ds, max_pileup_attempts, elapsed, exc_info=True,
+                                    )
+                        if last_err is not None:
+                            raise PileupResolutionError(
+                                f"Failed to resolve pileup files for {ds} after "
+                                f"{max_pileup_attempts} attempts: {last_err}"
+                            ) from last_err
             if cache_updated:
                 _save_pileup_cache()
         pileup_elapsed = time.monotonic() - t_pileup
@@ -561,6 +586,7 @@ class DAGPlanner:
             allowed_sites=effective_allowed,
             all_sites=all_site_names or None,
             settings=self.settings,
+            condor_pool=condor_pool,
         )
 
         logger.info("Plan %s: DAG files generated in %.1fs (%d WUs, %s)",
@@ -590,16 +616,20 @@ class DAGPlanner:
         }
         if not skip_site_pinning:
             node_counts["landing"] = len(merge_groups)
-        # Store effective events_per_job for round 0 pilot scaling — used by
-        # complete_round() to compute correct offset advancement.
-        if is_gen and current_round == 0:
-            pilot_fraction = config.get("pilot_fraction", self.settings.pilot_fraction)
+        # Store effective_fraction and effective_events_per_job — used by
+        # complete_round() for offset advancement and by adaptive optimization
+        # for scaling measurements back to production values.
+        if is_gen:
+            eff_frac = self._effective_fraction(
+                current_round, config, self.settings.pilot_fraction,
+            )
             nominal_epj = (workflow.splitting_params or {}).get("events_per_job") or \
                           (workflow.splitting_params or {}).get("eventsPerJob") or 100_000
-            if 0 < pilot_fraction < 1.0:
-                node_counts["effective_events_per_job"] = max(1, int(nominal_epj * pilot_fraction))
+            if 0 < eff_frac < 1.0:
+                node_counts["effective_events_per_job"] = max(1, int(nominal_epj * eff_frac))
             else:
                 node_counts["effective_events_per_job"] = int(nominal_epj)
+            node_counts["effective_fraction"] = eff_frac
         dag = await self.db.create_dag(
             workflow_id=workflow.id,
             dag_file_path=dag_file_path,
@@ -748,6 +778,27 @@ class DAGPlanner:
         )
         return splitter.split(input_files)
 
+    @staticmethod
+    def _effective_fraction(current_round: int, config: dict,
+                            default_pilot: float = 0.01) -> float:
+        """Compute effective fraction for events_per_job scaling.
+
+        Round 0: min(pilot_fraction, test_fraction) — pilot with test cap.
+        Round 1+: test_fraction — production at test scale.
+        """
+        pilot_fraction = config.get("pilot_fraction", default_pilot)
+        test_fraction = float(config.get("test_fraction", 1.0))
+
+        if current_round == 0:
+            candidates = []
+            if 0 < pilot_fraction < 1.0:
+                candidates.append(pilot_fraction)
+            if 0 < test_fraction < 1.0:
+                candidates.append(test_fraction)
+            return min(candidates) if candidates else 1.0
+        else:
+            return test_fraction if 0 < test_fraction < 1.0 else 1.0
+
     def _plan_gen_nodes(
         self, workflow, config: dict, *, max_jobs: int = 0,
     ) -> list[DAGNodeSpec]:
@@ -768,14 +819,18 @@ class DAGPlanner:
         params = workflow.splitting_params or {}
         events_per_job = params.get("events_per_job") or params.get("eventsPerJob") or 100_000
 
-        # Apply pilot_fraction for round 0 — scale events_per_job
+        # Apply effective_fraction to events_per_job.
+        # Round 0: min(pilot_fraction, test_fraction) — pilot with test cap.
+        # Round 1+: test_fraction — production at test scale.
+        # The planner is the single owner of events_per_job scaling.
         current_round = getattr(workflow, "current_round", 0) or 0
-        if current_round == 0:
-            pilot_fraction = config.get("pilot_fraction", 0.01)
-            if 0 < pilot_fraction < 1.0:
-                events_per_job = max(1, int(events_per_job * pilot_fraction))
-                logger.info("Pilot round: events_per_job scaled to %d (fraction=%.4f)",
-                            events_per_job, pilot_fraction)
+        eff_frac = self._effective_fraction(
+            current_round, config, self.settings.pilot_fraction,
+        )
+        if 0 < eff_frac < 1.0:
+            events_per_job = max(1, int(events_per_job * eff_frac))
+            logger.info("Round %d: events_per_job scaled to %d (effective_fraction=%.4f)",
+                        current_round, events_per_job, eff_frac)
 
         total_events = int(config.get("request_num_events") or 0)
 
@@ -912,13 +967,26 @@ def _compute_jobs_per_wu_from_write_mb(
         return None
 
     # Fallback: if effective_events_per_job was not stored (old round data),
-    # infer it for round 0 using pilot_fraction
-    if round_epj == 0 and source_round == 0 and current_events_per_job > 0:
-        if 0 < pilot_fraction < 1.0:
-            round_epj = max(1, int(current_events_per_job * pilot_fraction))
+    # infer it using effective_fraction (stored) or min(pilot, test) for round 0
+    if round_epj == 0 and source_round is not None and current_events_per_job > 0:
+        round_data = rounds.get(str(source_round), {})
+        eff_frac = round_data.get("effective_fraction", 0)
+        if eff_frac == 0:
+            # Legacy fallback: compute from pilot/test fractions
+            if source_round == 0:
+                candidates = []
+                if 0 < pilot_fraction < 1.0:
+                    candidates.append(pilot_fraction)
+                if 0 < test_fraction < 1.0:
+                    candidates.append(test_fraction)
+                eff_frac = min(candidates) if candidates else 1.0
+            else:
+                eff_frac = test_fraction if 0 < test_fraction < 1.0 else 1.0
+        if 0 < eff_frac < 1.0:
+            round_epj = max(1, int(current_events_per_job * eff_frac))
             logger.info(
-                "Inferred round 0 effective_epj=%d from pilot_fraction=%.4f",
-                round_epj, pilot_fraction,
+                "Inferred effective_epj=%d from effective_fraction=%.4f (round %d)",
+                round_epj, eff_frac, source_round,
             )
 
     # Scale write_mb if the round used a different events_per_job than current
@@ -1018,6 +1086,7 @@ def _generate_dag_files(
     allowed_sites: list[str] | None = None,
     all_sites: list[str] | None = None,
     settings: Settings | None = None,
+    condor_pool: str = "local",
 ) -> str:
     """Generate all DAG files on disk. Returns path to outer workflow.dag."""
     submit_path = Path(submit_dir)
@@ -1118,6 +1187,7 @@ def _generate_dag_files(
             spool_mode=spool_mode,
             all_sites=all_sites,
             settings=settings,
+            condor_pool=condor_pool,
         )
 
         if spool_mode:
@@ -1206,6 +1276,7 @@ def _generate_group_dag(
     spool_mode: bool = False,
     all_sites: list[str] | None = None,
     settings: Settings | None = None,
+    condor_pool: str = "local",
 ) -> None:
     """Generate a single merge group sub-DAG (group.dag) + submit files."""
     exe = executables or {}
@@ -1444,7 +1515,7 @@ def _generate_group_dag(
         lines.append(f"JOB landing {fp}landing.sub")
         landing_log = f"{fp}landing.log"
         lines.append(
-            f"SCRIPT POST landing elect_site.sh {elected_site} {landing_log}"
+            f"SCRIPT POST landing elect_site.sh {elected_site} {landing_log} {condor_pool}"
         )
         lines.append("RETRY landing 3 UNLESS-EXIT 42")
         lines.append("")
@@ -1469,10 +1540,9 @@ def _generate_group_dag(
             proc_args += f" --events-per-job {node.events_per_job}"
         if ncpus > 0:
             proc_args += f" --ncpus {ncpus}"
-        if rp.get("test_fraction"):
-            proc_args += f" --test-fraction {rp['test_fraction']}"
-        # filter_efficiency is handled at planning time (inflating total_events),
-        # not at execution time. No --filter-eff arg needed.
+        # test_fraction is handled at planning time via effective_fraction
+        # (events_per_job already scaled). Not passed to the wrapper.
+        # filter_efficiency is also handled at planning time.
         if pileup_remote_read:
             proc_args += " --pileup-remote-read"
 
@@ -1717,12 +1787,23 @@ def _write_submit_file(
     # CMS accounting group: the global pool has three groups:
     # highprio, production, analysis. Use "production" to match Tier-0 jobs.
     lines.append("accounting_group = production")
-    lines.append("accounting_group_user = dmytro")
+    if not self.settings.accounting_group_user:
+        raise ValueError(
+            "WMS2_ACCOUNTING_GROUP_USER must be set for global pool submission"
+        )
+    lines.append(f"accounting_group_user = {self.settings.accounting_group_user}")
     # Job lease: if the startd (glidein) loses contact, the schedd evicts
     # the job after this many seconds. Without this, zombie jobs can stay
     # "Running" indefinitely when glideins die without clean shutdown.
     # WMAgent uses 1200s (20 min). We use the same.
     lines.append("+JobLeaseDuration = 1200")
+    # Capture CMS site name at match time into the job classad.
+    # GLIDEIN_CMSSite is a slot attribute (e.g. "T2_US_Nebraska"); $$() is
+    # HTCondor's match-time substitution.  The resulting JOB_GLIDEIN_CMSSite
+    # appears in the job event log (event 028), where the POST collector
+    # reads it for site attribution.  MATCH_GLIDEIN_CMSSite (schedd-internal)
+    # only appears in condor_history, not in .log files.
+    lines.append('+JOB_GLIDEIN_CMSSite = "$$(GLIDEIN_CMSSite:Unknown)"')
     # Wall time enforcement — periodic_remove kills zombie/runaway jobs.
     # MaxWallTimeMinsRun is per-node (computed by caller based on node type).
     if max_wall_time_mins_run > 0:
@@ -1829,21 +1910,36 @@ def _write_elect_site_script(path: str) -> None:
 #!/bin/bash
 # elect_site.sh — POST script for landing node
 # Extracts GLIDEIN_CMSSite from the completed landing job.
-# Falls back to "local" for dev environments without glidein infrastructure.
+# In global pool mode, retries condor_history with delays (history may lag).
+# On failure: local pool falls back to "local"; global pool exits 1 so
+# DAGMan retries the landing node (RETRY landing 3 UNLESS-EXIT 42).
 ELECTED_SITE_FILE=$1
 LOG_FILE=$2
+POOL=${3:-local}
 # Extract the cluster ID from the landing node's HTCondor log.
 # The log contains "Job submitted from host" with (cluster.proc.subproc) pattern.
 CLUSTER_ID=$(grep -o '([0-9]*\\.' "$LOG_FILE" 2>/dev/null | tail -1 | tr -d '(.')
+SITE=""
 if [ -n "$CLUSTER_ID" ]; then
-    SITE=$(condor_history "${CLUSTER_ID}.0" -limit 1 -af MATCH_GLIDEIN_CMSSite 2>/dev/null)
+    for attempt in 1 2 3 4 5; do
+        SITE=$(condor_history "${CLUSTER_ID}.0" -limit 1 -af MATCH_GLIDEIN_CMSSite 2>/dev/null)
+        if [ -n "$SITE" ] && [ "$SITE" != "undefined" ]; then
+            break
+        fi
+        SITE=""
+        sleep 10
+    done
 fi
 if [ -n "$SITE" ] && [ "$SITE" != "undefined" ]; then
     echo "$SITE" > "$ELECTED_SITE_FILE"
-else
+    exit 0
+elif [ "$POOL" = "local" ]; then
     echo "local" > "$ELECTED_SITE_FILE"
+    exit 0
+else
+    echo "ERROR: Failed to elect site for cluster $CLUSTER_ID after 5 attempts" >&2
+    exit 1
 fi
-exit 0
 """)
     os.chmod(path, 0o755)
 
@@ -2000,7 +2096,6 @@ NODE_INDEX=0
 PILOT_MODE=false
 OUTPUT_INFO=""
 OVERRIDE_NCPUS=0
-TEST_FRACTION=0
 FILTER_EFF=1.0  # kept for backward compat; no longer used in PSet injection
 PILEUP_REMOTE_READ=false
 
@@ -2015,19 +2110,15 @@ while [[ $# -gt 0 ]]; do
         --output-info) OUTPUT_INFO="$2";   shift 2 ;;
         --pilot)      PILOT_MODE=true;     shift   ;;
         --ncpus)      OVERRIDE_NCPUS="$2"; shift 2 ;;
-        --test-fraction) TEST_FRACTION="$2"; shift 2 ;;
+        --test-fraction) shift 2 ;;  # deprecated: planner handles via effective_fraction
         --filter-eff)  FILTER_EFF="$2";    shift 2 ;;
         --pileup-remote-read) PILEUP_REMOTE_READ=true; shift ;;
         *)            echo "Unknown arg: $1" >&2; shift ;;
     esac
 done
 
-# ── Test fraction: reduce events per job for fast testing ─────
-if [[ "$TEST_FRACTION" != "0" && "$EVENTS_PER_JOB" -gt 0 ]]; then
-    ORIG_EVENTS=$EVENTS_PER_JOB
-    EVENTS_PER_JOB=$(python3 -c "print(max(1, int($EVENTS_PER_JOB * $TEST_FRACTION)))")
-    echo "TEST MODE: events_per_job reduced from $ORIG_EVENTS to $EVENTS_PER_JOB (fraction=$TEST_FRACTION)"
-fi
+# events_per_job scaling (test_fraction, pilot_fraction) is handled by the
+# planner via effective_fraction — the value passed here is already final.
 
 START_TIME=$(date +%s)
 echo "=== WMS2 Processing Wrapper ==="
@@ -2294,9 +2385,9 @@ for filename, finfo in file_map.items():
     unmerged_base = tier_to_unmerged.get(tier, '')
     if not unmerged_base:
         # Try EDM variant + strip numeric suffix:
-        # NANOEDMAODSIM1 -> NANOAODSIM matches NANOAODSIM
+        # NANOEDMAODSIM1 -> strip EDM -> NANOAODSIM1 -> strip digits -> NANOAODSIM
         import re as _re
-        tier_norm = _re.sub(r'(EDM)?(\d+)$', '', tier.upper())
+        tier_norm = _re.sub(r'\d+$', '', _re.sub(r'EDM', '', tier.upper()))
         for ds_tier, base in tier_to_unmerged.items():
             ds_norm = _re.sub(r'\d+$', '', ds_tier.upper())
             if tier_norm == ds_norm:
@@ -4550,11 +4641,11 @@ if root_files:
         step_idx = tier_to_step.get(ds_tier, -1)
         if not tier_files:
             # Try EDM variant + strip numeric suffix:
-            # NANOEDMAODSIM1 -> NANOAODSIM matches NANOAODSIM
+            # NANOEDMAODSIM1 -> strip EDM -> NANOAODSIM1 -> strip digits -> NANOAODSIM
             import re as _re
             ds_norm = _re.sub(r'\d+$', '', ds_tier.upper())
             for tier, files in tier_to_files.items():
-                tier_norm = _re.sub(r'(EDM)?(\d+)$', '', tier.upper())
+                tier_norm = _re.sub(r'\d+$', '', _re.sub(r'EDM', '', tier.upper()))
                 if tier_norm == ds_norm:
                     tier_files = files
                     step_idx = tier_to_step.get(tier, -1)
@@ -4685,11 +4776,40 @@ if root_files:
                         }
                 per_step[str(step_num)] = agg
 
+            num_proc_jobs = len(all_proc_metrics)
             work_unit = {
                 "group_index": group_index,
-                "num_proc_jobs": len(all_proc_metrics),
+                "num_proc_jobs": num_proc_jobs,
                 "per_step": per_step,
             }
+
+            # Aggregate cgroup data from proc_*_cgroup.json files
+            cgroup_agg = {}
+            cgroup_keys = [
+                "peak_anon_mb", "peak_shmem_mb", "peak_nonreclaim_mb",
+                "tmpfs_peak_nonreclaim_mb", "no_tmpfs_peak_anon_mb",
+                "gridpack_disk_mb",
+            ]
+            cgroup_count = 0
+            for ci in range(num_proc_jobs):
+                cf = os.path.join(group_dir, f"proc_{ci:06d}_cgroup.json")
+                if not os.path.isfile(cf):
+                    continue
+                try:
+                    with open(cf) as f:
+                        cd = json.load(f)
+                    cgroup_count += 1
+                    for ck in cgroup_keys:
+                        cv = cd.get(ck, 0)
+                        if cv > cgroup_agg.get(ck, 0):
+                            cgroup_agg[ck] = cv
+                except Exception:
+                    pass
+            if cgroup_count > 0:
+                cgroup_agg["num_jobs"] = cgroup_count
+                work_unit["cgroup"] = cgroup_agg
+                print(f"  Cgroup data from {cgroup_count} jobs: peak_nonreclaim={cgroup_agg.get('peak_nonreclaim_mb', 0):.0f} MB")
+
             wu_path = os.path.join(group_dir, "work_unit_metrics.json")
             with open(wu_path, "w") as f:
                 json.dump(work_unit, f, indent=2)

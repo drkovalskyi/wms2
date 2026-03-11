@@ -4,10 +4,15 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "WMS2_"}
+    model_config = {
+        "env_prefix": "WMS2_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
     # Database
-    database_url: str = "postgresql+asyncpg://wms2:wms2dev@localhost:5432/wms2"
+    database_url: str = ""  # Set via WMS2_DATABASE_URL env var or .env file
     db_pool_size: int = 10
 
     # Lifecycle Manager
@@ -41,6 +46,11 @@ class Settings(BaseSettings):
     # Agent identity
     agent_name: str = "wms2-agent"
 
+    # User identity (for test/commissioning mode)
+    accounting_group_user: str = ""     # HTCondor accounting_group_user
+    test_lfn_user: str = ""            # LFN path component (e.g. "username.wms2")
+    rucio_test_account: str = ""       # Rucio account for test mode
+
     # HTCondor
     condor_host: str = ""  # collector address (e.g. "localhost:9618")
     schedd_name: str | None = None  # explicit schedd; auto-discovered if None
@@ -73,6 +83,10 @@ class Settings(BaseSettings):
     # Example: "T2_CH_CERN,T1_US_FNAL_Disk"
     pileup_preferred_rses: str = ""
 
+    # Pileup Rucio query timeout (seconds). Large PREMIX datasets can take
+    # minutes to enumerate via list_replicas.
+    pileup_query_timeout: int = 300
+
     # Pileup remote read — when True (default), pileup file LFNs are prefixed
     # with root://cms-xrd-global.cern.ch/ so CMSSW reads them via the global
     # redirector (AAA).  When False, LFNs are left bare and resolved through
@@ -104,7 +118,12 @@ class Settings(BaseSettings):
     stageout_mode: str = "local"
     local_pfn_prefix: str = "/mnt/shared"
 
-    # Pilot profiling (optional functional test)
+    # Pilot (round 0) — controls round 0 behavior
+    # pilot_fraction: fraction of events_per_job for round 0 (0 = skip pilot, round 0 is normal)
+    pilot_fraction: float = 0.01
+    # pilot_throwaway: discard round 0 output after metrics extraction (events not counted)
+    pilot_throwaway: bool = False
+    # Legacy pilot runner settings (used by submit_pilot / _compute_pilot_config)
     pilot_initial_events: int = 200
     pilot_step_timeout: int = 900       # 15 minutes per step
 
@@ -120,6 +139,26 @@ class Settings(BaseSettings):
 
     # Priority
     default_pilot_priority: int = 5  # HTCondor job priority for round 0 (pilot)
+    merge_priority_boost: int = 10   # merge jobs get this much higher priority than proc
+
+    # Tail WU escalation — bump remaining job priorities when most WUs are done
+    tail_escalation_threshold: float = 0.9   # fraction of WUs done before escalating
+    tail_escalation_priority: int = 10       # priority boost for remaining jobs
+
+    # Wall time enforcement (periodic_remove)
+    wall_time_safety_factor: float = 3.0     # multiplier on estimated wall time
+    landing_wall_time_mins: int = 30         # fixed wall time for landing nodes
+    merge_wall_time_mins_min: int = 240      # minimum wall time for merge nodes
+    cleanup_wall_time_mins: int = 60         # fixed wall time for cleanup nodes
+
+    # Periodic remove thresholds
+    periodic_remove_held_timeout_sec: int = 420     # 7 min — kill jobs stuck in held
+    periodic_remove_disk_limit_kb: int = 20971520   # 20 GB
+
+    # Idle timeout tiers (seconds) — selected by job priority level
+    idle_timeout_high_sec: int = 14400       # 4h for high-priority jobs
+    idle_timeout_normal_sec: int = 43200     # 12h for normal-priority jobs
+    idle_timeout_low_sec: int = 172800       # 48h for low-priority jobs
 
     # Adaptive execution
     default_memory_per_core: int = 2000    # MB, floor for request_memory

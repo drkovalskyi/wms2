@@ -29,10 +29,16 @@ const STATUS_LABELS = {
     archived: 'done',
 };
 
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(str));
+    return div.innerHTML;
+}
+
 function statusBadge(status) {
     const cls = STATUS_COLORS[status] || 'secondary';
     const label = STATUS_LABELS[status] || status;
-    return `<mark class="badge badge--${cls}">${label}</mark>`;
+    return `<mark class="badge badge--${cls}">${escapeHtml(label)}</mark>`;
 }
 
 function fmtAge(isoStr) {
@@ -68,10 +74,11 @@ function fmtDateTime(isoStr) {
  * Parse step_metrics JSON (structure: {rounds: {"0": {wu_metrics: [{per_step: {"1": {...}}}]}}})
  * into a flat array suitable for display: [{step, avg_cpu_efficiency, avg_peak_rss, ...}]
  */
-function parseStepMetrics(sm) {
+function parseStepMetrics(sm, stepNameFn) {
     if (!sm || typeof sm !== 'object') return [];
     // Already a flat array (legacy format)
     if (Array.isArray(sm)) return sm;
+    const nameFn = stepNameFn || ((idx) => 'Step ' + idx);
 
     const rounds = sm.rounds;
     if (!rounds || typeof rounds !== 'object') return [];
@@ -111,7 +118,7 @@ function parseStepMetrics(sm) {
     return Object.entries(stepAccum)
         .sort(([a], [b]) => Number(a) - Number(b))
         .map(([stepNum, acc]) => ({
-            step: 'Step ' + stepNum,
+            step: nameFn(stepNum),
             avg_cpu_efficiency: acc.count ? (acc.cpu_sum / acc.count) * 100 : null,
             avg_peak_rss: acc.count ? acc.rss_sum / acc.count : null,
             avg_time_per_event: acc.count ? acc.tpe_sum / acc.count : null,
