@@ -200,11 +200,11 @@ class RucioClient(RucioAdapter):
 
     async def get_available_pileup_files(self, dataset: str,
                                          preferred_rses: list[str] | None = None,
-                                         timeout: float = 60.0) -> list[str]:
+                                         timeout: float = 300.0) -> list[str]:
         """Get LFNs with on-disk replicas using rucio-clients Python API.
 
         Args:
-            timeout: Maximum seconds to wait for the Rucio query (default 60s).
+            timeout: Maximum seconds to wait for the Rucio query (default 300s).
         """
         return await asyncio.wait_for(
             asyncio.to_thread(self._get_pileup_sync, dataset, preferred_rses),
@@ -228,6 +228,21 @@ class RucioClient(RucioAdapter):
                 if not rse.endswith("_Disk"):
                     rse_filter.add(rse + "_Disk")
 
+        # Check DID type — containers need block-level approach
+        try:
+            did_info = c.get_did(scope="cms", name=dataset)
+            did_type = did_info.get("type", "").upper()
+        except Exception:
+            did_type = "UNKNOWN"
+
+        if did_type == "CONTAINER":
+            return self._get_pileup_container(c, dataset, rse_filter)
+        else:
+            return self._get_pileup_replicas(c, dataset, rse_filter)
+
+    def _get_pileup_replicas(self, c, dataset: str,
+                              rse_filter: set[str] | None) -> list[str]:
+        """Get pileup files via list_replicas — for single blocks / small datasets."""
         available = []
         for replica in c.list_replicas(
             [{"scope": "cms", "name": dataset}],
@@ -241,4 +256,66 @@ class RucioClient(RucioAdapter):
             else:
                 if disk_rses:
                     available.append(replica["name"])
+        return available
+
+    def _get_pileup_container(self, c, dataset: str,
+                               rse_filter: set[str] | None) -> list[str]:
+        """Get pileup files from a container using block-level replica check.
+
+        For large containers (e.g. PREMIX with 2000+ blocks, 500K files),
+        list_replicas on the full container overwhelms the Rucio server (HTTP 502).
+        Instead:
+        1. list_content → get block names (~instant)
+        2. list_dataset_replicas_bulk → check which blocks have disk replicas (~3s)
+        3. list_files on disk blocks → get file LFNs (~15s)
+        CMS blocks are replicated atomically so block-level check is sufficient.
+        """
+        import time as _time
+
+        # Get all blocks in container
+        t0 = _time.monotonic()
+        blocks = [item["name"] for item in c.list_content(scope="cms", name=dataset)]
+        logger.info("Pileup container %s: %d blocks (%.1fs)",
+                     dataset, len(blocks), _time.monotonic() - t0)
+
+        if not blocks:
+            return []
+
+        # Block-level disk replica check (batched)
+        t1 = _time.monotonic()
+        disk_blocks: set[str] = set()
+        BATCH = 500
+        for i in range(0, len(blocks), BATCH):
+            batch_dids = [{"scope": "cms", "name": b} for b in blocks[i:i + BATCH]]
+            for r in c.list_dataset_replicas_bulk(dids=batch_dids):
+                rse = r.get("rse", "")
+                if rse.endswith("_Tape"):
+                    continue
+                if rse_filter and not any(rse_name in rse for rse_name in rse_filter):
+                    continue
+                block_name = r.get("name", "")
+                if block_name:
+                    disk_blocks.add(block_name)
+
+        logger.info("Pileup container %s: %d/%d blocks on disk (%.1fs)",
+                     dataset, len(disk_blocks), len(blocks), _time.monotonic() - t1)
+
+        if not disk_blocks:
+            return []
+
+        # Get file names from disk blocks
+        t2 = _time.monotonic()
+        if len(disk_blocks) == len(blocks):
+            # All blocks on disk — list_files on full container (most efficient)
+            available = [f["name"] for f in c.list_files(scope="cms", name=dataset)]
+        else:
+            # Partial — list_files per disk block
+            available = []
+            for block in sorted(disk_blocks):
+                for f in c.list_files(scope="cms", name=block):
+                    available.append(f["name"])
+
+        logger.info("Pileup container %s: %d files listed (%.1fs)",
+                     dataset, len(available), _time.monotonic() - t2)
+
         return available
