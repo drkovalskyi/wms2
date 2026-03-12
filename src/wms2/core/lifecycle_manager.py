@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from wms2.adapters.base import CondorAdapter
 from wms2.config import Settings
 from wms2.db.repository import Repository
+from wms2.models.dag import wu_names
 from wms2.models.enums import DAGStatus, RequestStatus, WorkflowStatus
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ def _count_events_from_disk(submit_dir, completed_wus):
     units having completed (session timing / commit ordering issue).
     """
     total = 0
-    for wu_name in (completed_wus or []):
+    for wu_name in wu_names(completed_wus):
         metrics_path = os.path.join(submit_dir, wu_name, "work_unit_metrics.json")
         # In spool mode, merge output files end up at the spool root
         if not os.path.exists(metrics_path):
@@ -145,7 +146,7 @@ def _compute_adaptive_params(config, dag, workflow, new_metrics, settings):
     try:
         return compute_round_optimization(
             submit_dir=dag.submit_dir,
-            completed_wus=list(dag.completed_work_units),
+            completed_wus=wu_names(dag.completed_work_units),
             original_nthreads=original_nthreads,
             request_cpus=original_nthreads,
             default_memory_per_core=settings.default_memory_per_core,
@@ -205,25 +206,23 @@ async def complete_round(repo, settings, workflow, dag):
                 workflow.id, events_produced=events_from_wus
             )
 
-    # ── Collect WU metrics from disk ──
+    # ── Collect WU metrics from DB (enriched completed_work_units) ──
     wu_metrics_list = []
-    seen_metrics_paths: set[str] = set()
-    if dag.submit_dir and completed_wus:
-        for wu_name in completed_wus:
+    for item in completed_wus:
+        if isinstance(item, dict) and item.get("metrics"):
+            wu_metrics_list.append(item["metrics"])
+
+    # Fall back to disk if no metrics in DB (old format or pre-enrichment data)
+    if not wu_metrics_list and dag.submit_dir:
+        seen_metrics_paths: set[str] = set()
+        for wu_name in wu_names(completed_wus):
             metrics_path = os.path.join(
                 dag.submit_dir, wu_name, "work_unit_metrics.json"
             )
-            # In spool mode, merge output files may be at the spool root
-            # (old DAGs without transfer_output_remaps) or in mg_XXX/ subdirs
-            # (new DAGs with the remap fix).
             if not os.path.exists(metrics_path):
                 metrics_path = os.path.join(
                     dag.submit_dir, "work_unit_metrics.json"
                 )
-            # Deduplicate: don't read the same spool-root file 50 times.
-            # When all WUs fall back to the same file, we read it once and
-            # store it once — the adaptive optimizer sees 1 WU of data,
-            # not 50 identical copies.
             real_path = os.path.realpath(metrics_path)
             if real_path in seen_metrics_paths:
                 continue
@@ -1330,7 +1329,7 @@ class RequestLifecycleManager:
             return
 
         deleted = 0
-        for wu_name in completed_wus:
+        for wu_name in wu_names(completed_wus):
             # Find merge_output.json
             merge_path = os.path.join(dag.submit_dir, wu_name, "merge_output.json")
             if not os.path.exists(merge_path):

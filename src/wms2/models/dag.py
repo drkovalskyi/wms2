@@ -58,6 +58,18 @@ class DAGNodeSpec(BaseModel):
     child_nodes: list[str] = []
 
 
+def wu_names(completed_work_units: list | None) -> list[str]:
+    """Extract work unit names from completed_work_units.
+
+    Handles both old format (list of strings) and new enriched format
+    (list of dicts with 'name' key).
+    """
+    return [
+        item if isinstance(item, str) else item["name"]
+        for item in (completed_work_units or [])
+    ]
+
+
 class DAG(BaseModel):
     model_config = {"from_attributes": True}
 
@@ -80,7 +92,7 @@ class DAG(BaseModel):
     nodes_failed: int = 0
     nodes_held: int = 0
     total_work_units: int = 0
-    completed_work_units: list[str] = []
+    completed_work_units: list = []
     status: DAGStatus = DAGStatus.PLANNING
     created_at: datetime
     submitted_at: Optional[datetime] = None

@@ -117,9 +117,8 @@ find src -name "*.pyc" -delete
 # 2. Kill old uvicorn
 pkill -9 -f "uvicorn wms2" 2>/dev/null; sleep 2
 
-# 3. Start fresh (background)
+# 3. Start fresh (background) — .env has all WMS2_* settings
 source .venv/bin/activate && \
-  WMS2_CONDOR_HOST="localhost:9618" WMS2_LIFECYCLE_CYCLE_INTERVAL=30 \
   uvicorn wms2.main:create_app --factory --host 0.0.0.0 --port 8080
 ```
 

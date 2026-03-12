@@ -230,6 +230,15 @@ spec. DBS writes remain disabled.
   are silently discarded. Fix: strip `EDM` and trailing digits separately.
   File: `src/wms2/core/dag_planner.py:2360,4618`.
 
+- **~~Spool cleanup race loses WU metrics~~ (FIXED)** — `complete_round()`
+  reads `work_unit_metrics.json` from disk, but in spool mode the schedd
+  cleans up after DAGMan exits. Fixed by enriching `completed_work_units`
+  from `["mg_000000"]` to `[{"name": "mg_000000", "metrics": {...}}]`.
+  DAG monitor stores metrics at detection time (when spool is alive).
+  `complete_round()` reads from enriched DB data, falls back to disk.
+  `wu_names()` helper handles both old (str) and new (dict) formats.
+  Files: `models/dag.py`, `dag_monitor.py`, `lifecycle_manager.py`.
+
 ## Technical debt
 
 - **"Workflow" naming confusion** — WMS2 internally uses "workflow" for the

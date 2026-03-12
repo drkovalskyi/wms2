@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from wms2.adapters.base import CondorAdapter
 from wms2.db.repository import Repository
+from wms2.models.dag import wu_names
 from wms2.models.enums import DAGStatus
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,9 @@ class DAGMonitor:
         if newly_completed:
             existing = dag.completed_work_units or []
             update_kwargs["completed_work_units"] = existing + [
-                wu["group_name"] for wu in newly_completed
+                {"name": wu["group_name"], "metrics": wu.get("metrics"),
+                 "output_events": wu.get("output_events")}
+                for wu in newly_completed
             ]
         await self.db.update_dag(dag.id, **update_kwargs)
 
@@ -357,7 +360,7 @@ class DAGMonitor:
         self, dag, summary: NodeSummary
     ) -> list[dict]:
         """Detect merge group SUBDAGs that have newly completed."""
-        already_completed = set(dag.completed_work_units or [])
+        already_completed = set(wu_names(dag.completed_work_units))
         newly_completed = []
 
         for node_name, status in summary.node_statuses.items():
@@ -575,7 +578,9 @@ class DAGMonitor:
         if newly_completed:
             existing = dag.completed_work_units or []
             update_kwargs["completed_work_units"] = existing + [
-                wu["group_name"] for wu in newly_completed
+                {"name": wu["group_name"], "metrics": wu.get("metrics"),
+                 "output_events": wu.get("output_events")}
+                for wu in newly_completed
             ]
 
         await self.db.update_dag(dag.id, **update_kwargs)
